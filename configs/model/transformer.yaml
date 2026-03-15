@@ -1,0 +1,15 @@
+# Meta-DT style transformer (in-context DT)
+state_dim: 27
+act_dim: 8
+context_dim: 16
+hidden_size: 128
+max_length: 20
+max_ep_len: 200
+n_layer: 3
+n_head: 1
+n_inner: null
+activation_function: relu
+resid_pdrop: 0.1
+attn_pdrop: 0.1
+n_positions: 1024
+action_tanh: true

@@ -1,0 +1,109 @@
+"""Typed config schema (OmegaConf structured configs / dataclasses)."""
+from dataclasses import dataclass, field
+from typing import Optional, List
+
+
+@dataclass
+class ModelConfig:
+    """Decision transformer / in-context model."""
+    state_dim: int = 27
+    act_dim: int = 8
+    context_dim: int = 16
+    hidden_size: int = 128
+    max_length: Optional[int] = 20
+    max_ep_len: int = 200
+    n_layer: int = 3
+    n_head: int = 1
+    n_inner: Optional[int] = None  # 4 * hidden_size if None
+    activation_function: str = "relu"
+    resid_pdrop: float = 0.1
+    attn_pdrop: float = 0.1
+    n_positions: int = 1024
+    action_tanh: bool = True
+
+
+@dataclass
+class DataConfig:
+    """Dataset and dataloader."""
+    env_name: str = "AntDir-v0"
+    data_quality: str = "medium"
+    data_dir: str = "datasets"
+    horizon: int = 20
+    prompt_length: int = 5
+    return_scale: float = 500.0
+    batch_size: int = 128
+    num_workers: int = 0
+    # tasks
+    num_tasks: int = 50
+    num_train_tasks: int = 45
+    max_episode_steps: int = 200
+    # context (in-context trajectories)
+    context_horizon: int = 4
+    context_dim: int = 16
+    context_hidden_dim: int = 128
+    num_context_trajectories: int = 1
+    context_sort_ascending: bool = True
+    context_sampling: str = "random"
+    max_total_prompt_length: Optional[int] = None
+
+
+@dataclass
+class OptimConfig:
+    """Optimizer and scheduler."""
+    lr: float = 5e-5
+    weight_decay: float = 1e-4
+    warmup_steps: int = 10000
+    grad_clip_norm: float = 0.25
+    scheduler: str = "linear_warmup"  # linear_warmup | cosine | none
+
+
+@dataclass
+class SystemConfig:
+    """Runtime: device, seed, distributed, logging."""
+    device: str = "cuda:0"
+    seed: int = 412
+    deterministic: bool = True
+    # checkpoint dirs
+    output_dir: str = "outputs"
+    save_dir: str = "outputs/checkpoints"
+    # distributed (rank 0 saves)
+    world_size: int = 1
+    rank: int = 0
+    # W&B (override with --wandb or system.use_wandb=true)
+    use_wandb: bool = False
+    wandb_project: str = "icl_adaptation"
+    wandb_entity: str = "clvr"
+
+
+@dataclass
+class ExperimentConfig:
+    """Training loop: steps, eval, checkpoint policy."""
+    max_steps: int = 500_000
+    eval_every_steps: int = 1000
+    num_eval_episodes: int = 5
+    warm_train_steps: int = 70_000
+    zero_shot: bool = False
+    # checkpoint types
+    save_latest_every_steps: Optional[int] = 5000
+    save_best: bool = True
+    save_periodic_every_steps: Optional[int] = 25000
+    # metric for best
+    best_metric_name: str = "eval/return_mean"
+    best_metric_mode: str = "max"  # max or min
+    # export
+    export_final: bool = True
+
+
+@dataclass
+class AppConfig:
+    """Top-level composed config."""
+    model: ModelConfig = field(default_factory=ModelConfig)
+    data: DataConfig = field(default_factory=DataConfig)
+    optim: OptimConfig = field(default_factory=OptimConfig)
+    system: SystemConfig = field(default_factory=SystemConfig)
+    experiment: ExperimentConfig = field(default_factory=ExperimentConfig)
+    # run metadata (set at runtime)
+    run_name: Optional[str] = None
+    resume: Optional[str] = None
+    eval_only: bool = False
+    export_only: Optional[str] = None

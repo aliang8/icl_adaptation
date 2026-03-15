@@ -1,0 +1,11 @@
+device: cuda:0
+seed: 412
+deterministic: true
+output_dir: outputs
+save_dir: outputs/checkpoints
+world_size: 1
+rank: 0
+# W&B: set use_wandb: true or pass --wandb
+use_wandb: false
+wandb_project: icl_adaptation
+wandb_entity: clvr

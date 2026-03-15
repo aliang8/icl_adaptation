@@ -1,0 +1,15 @@
+# Top-level config: composes model, data, optim, system, experiment.
+# Override from CLI: python -m src.train model=transformer data=ant_dir ...
+defaults:
+  - model: transformer
+  - data: ant_dir
+  - optim: adamw
+  - system: single_gpu
+  - experiment: base
+  - _self_
+
+# Optional run overrides (CLI)
+run_name: null
+resume: null
+eval_only: false
+export_only: null

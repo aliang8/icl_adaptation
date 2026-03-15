@@ -1,0 +1,11 @@
+max_steps: 500000
+eval_every_steps: 1000
+num_eval_episodes: 5
+warm_train_steps: 70000
+zero_shot: false
+save_latest_every_steps: 5000
+save_best: true
+save_periodic_every_steps: 25000
+best_metric_name: eval/return_mean
+best_metric_mode: max
+export_final: true

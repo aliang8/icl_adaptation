@@ -1,0 +1,196 @@
+"""
+Training loop: forward, loss, backward, grad clip, optimizer step, scheduler step,
+log metrics, checkpoint (latest/best/periodic), eval hook.
+"""
+import os
+from typing import Any, Callable, Dict, Optional, Tuple
+
+import torch
+from torch.utils.data import DataLoader
+from loguru import logger as loguru_logger
+
+from src.engine.checkpointing import save_checkpoint, load_checkpoint, save_inference_artifact
+from src.engine.logging import Logger, log_metrics
+
+
+class Trainer:
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
+        scheduler: Optional[torch.optim.lr_scheduler._LRScheduler],
+        device: torch.device,
+        cfg: Any,
+        logger: Logger,
+        scaler: Optional[Any] = None,
+        grad_clip_norm: float = 0.25,
+    ):
+        self.model = model
+        self.optimizer = optimizer
+        self.scheduler = scheduler
+        self.device = device
+        self.cfg = cfg
+        self.logger = logger
+        self.scaler = scaler
+        self.grad_clip_norm = grad_clip_norm
+        self.exp_cfg = getattr(cfg, "experiment", None) or getattr(cfg, "experiment", cfg)
+        self.sys_cfg = getattr(cfg, "system", None) or getattr(cfg, "system", cfg)
+        self.optim_cfg = getattr(cfg, "optim", None) or getattr(cfg, "optim", cfg)
+        self.save_dir = getattr(self.sys_cfg, "save_dir", "outputs/checkpoints")
+        self.rank = getattr(self.sys_cfg, "rank", 0)
+        self.best_metric_name = getattr(self.exp_cfg, "best_metric_name", "eval/return_mean")
+        self.best_metric_mode = getattr(self.exp_cfg, "best_metric_mode", "max")
+        self._is_better = (max if self.best_metric_mode == "max" else min)
+
+    def train_step(
+        self,
+        batch: Tuple[Any, ...],
+        step_fn: Callable[[torch.nn.Module, Tuple[Any, ...]], Tuple[torch.Tensor, Optional[torch.Tensor]]],
+    ) -> Tuple[float, Optional[float]]:
+        """Single step: forward, loss, backward, grad clip, step. Returns (loss, grad_norm)."""
+        self.model.train()
+        self.optimizer.zero_grad()
+        loss, grad_norm = step_fn(self.model, batch)
+        if self.scaler is not None:
+            self.scaler.scale(loss).backward()
+            if self.grad_clip_norm > 0:
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_norm)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            loss.backward()
+            if self.grad_clip_norm > 0:
+                grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_norm)
+            self.optimizer.step()
+        if self.scheduler is not None:
+            self.scheduler.step()
+        loss_val = loss.detach().cpu().item()
+        grad_norm_val = grad_norm.detach().cpu().item() if isinstance(grad_norm, torch.Tensor) else grad_norm
+        return loss_val, grad_norm_val
+
+    def run_training(
+        self,
+        train_loader: DataLoader,
+        global_step_start: int,
+        best_metric_start: float,
+        step_fn: Callable[[torch.nn.Module, Tuple[Any, ...]], Tuple[torch.Tensor, Optional[torch.Tensor]]],
+        eval_fn: Optional[Callable[[int], Dict[str, float]]] = None,
+        state_mean: Optional[Any] = None,
+        state_std: Optional[Any] = None,
+    ) -> Tuple[int, float]:
+        """
+        Run training until max_steps. Saves latest/best/periodic checkpoints.
+        step_fn(model, batch) -> (loss, grad_norm).
+        eval_fn(step) -> dict of metrics (e.g. eval/return_mean).
+        Returns (final_global_step, best_metric).
+        """
+        max_steps = getattr(self.exp_cfg, "max_steps", 500_000)
+        eval_every = getattr(self.exp_cfg, "eval_every_steps", 1000)
+        save_latest_every = getattr(self.exp_cfg, "save_latest_every_steps", 5000)
+        save_periodic_every = getattr(self.exp_cfg, "save_periodic_every_steps", 25000)
+        save_best = getattr(self.exp_cfg, "save_best", True)
+        export_final = getattr(self.exp_cfg, "export_final", True)
+
+        global_step = global_step_start
+        best_metric = best_metric_start
+        epoch = 0
+        iter_loader = iter(train_loader)
+        loguru_logger.info("Training started: max_steps={}, eval_every={}, save_latest_every={}", max_steps, eval_every, save_latest_every)
+
+        while global_step <= max_steps:
+            try:
+                batch = next(iter_loader)
+            except StopIteration:
+                epoch += 1
+                loguru_logger.debug("Epoch {} | global_step {}", epoch, global_step)
+                iter_loader = iter(train_loader)
+                batch = next(iter_loader)
+            batch = tuple(
+                x.to(self.device) if isinstance(x, torch.Tensor) else x for x in batch
+            )
+            loss_val, grad_norm_val = self.train_step(batch, step_fn)
+            lr = self.optimizer.param_groups[0]["lr"]
+            gpu_mem = torch.cuda.max_memory_allocated(self.device) / 1e6 if torch.cuda.is_available() else None
+            log_metrics(
+                self.logger,
+                global_step,
+                train_loss=loss_val,
+                lr=lr,
+                grad_norm=grad_norm_val,
+                gpu_mem_mb=gpu_mem,
+            )
+
+            # Eval
+            eval_metrics = None
+            if eval_fn and global_step % eval_every == 0 and global_step > 0:
+                loguru_logger.info("Evaluating at step {}...", global_step)
+                eval_metrics = eval_fn(global_step)
+                log_metrics(self.logger, global_step, loss_val, lr, eval_metrics=eval_metrics)
+                current = eval_metrics.get(self.best_metric_name)
+                if current is not None:
+                    loguru_logger.info("Step {} | loss={:.4f} | lr={:.2e} | {}={:.4f}", global_step, loss_val, lr, self.best_metric_name, current)
+                    if self._is_better(current, best_metric):
+                        best_metric = current
+                        if save_best and self.rank == 0:
+                            save_checkpoint(
+                                self.save_dir,
+                                self.model,
+                                self.optimizer,
+                                epoch,
+                                global_step,
+                                best_metric,
+                                self.cfg,
+                                scheduler=self.scheduler,
+                                scaler=self.scaler,
+                                kind="best",
+                                rank=self.rank,
+                            )
+                            loguru_logger.info("Saved best checkpoint ({}={:.4f})", self.best_metric_name, best_metric)
+
+            # Checkpoints
+            if self.rank == 0:
+                if save_latest_every and global_step % save_latest_every == 0:
+                    save_checkpoint(
+                        self.save_dir,
+                        self.model,
+                        self.optimizer,
+                        epoch,
+                        global_step,
+                        best_metric,
+                        self.cfg,
+                        scheduler=self.scheduler,
+                        scaler=self.scaler,
+                        kind="latest",
+                        rank=self.rank,
+                    )
+                if save_periodic_every and global_step % save_periodic_every == 0:
+                    save_checkpoint(
+                        self.save_dir,
+                        self.model,
+                        self.optimizer,
+                        epoch,
+                        global_step,
+                        best_metric,
+                        self.cfg,
+                        scheduler=self.scheduler,
+                        scaler=self.scaler,
+                        kind=f"periodic_{global_step}",
+                        rank=self.rank,
+                    )
+
+            global_step += 1
+            if global_step > max_steps:
+                break
+
+        if export_final and self.rank == 0:
+            save_inference_artifact(
+                self.save_dir,
+                self.model,
+                self.cfg,
+                state_mean=state_mean,
+                state_std=state_std,
+                filename="model_export.pt",
+                rank=self.rank,
+            )
+        return global_step, best_metric

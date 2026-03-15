@@ -1,0 +1,35 @@
+[project]
+name = "icl_adaptation"
+version = "0.1.0"
+description = "In-context learning for robot trajectories (context sorted by returns; zero-shot adaptation with previous rollouts sorted ascending)"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "torch>=2.0.0",
+    "numpy>=1.21",
+    "omegaconf>=2.3.0",
+    "hydra-core>=1.3.0",
+    "tensorboard>=2.13",
+    "wandb>=0.15.0",
+    "loguru>=0.7.0",
+    "rich>=13.0.0",
+    "tqdm",
+    "gym>=0.17",
+    "transformers>=4.20.0",
+]
+
+[project.optional-dependencies]
+# Minari: offline RL datasets (Gymnasium + MuJoCo 2, no mujoco_py / no Cython).
+d4rl = ["minari[all]"]
+dev = ["pytest", "ruff"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
