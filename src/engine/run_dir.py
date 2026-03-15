@@ -13,6 +13,7 @@ Standard layout:
     code/git.txt, diff.patch
     README.md
 """
+
 from __future__ import annotations
 
 import os
@@ -115,7 +116,9 @@ def create_run_dir(
     # Code snapshot
     commit = get_git_commit()
     if commit:
-        (run_dir / "code" / "git.txt").write_text(f"commit: {commit}\nshort: {short_hash or 'n/a'}\n")
+        (run_dir / "code" / "git.txt").write_text(
+            f"commit: {commit}\nshort: {short_hash or 'n/a'}\n"
+        )
     diff = get_git_diff_patch()
     if diff:
         (run_dir / "code" / "diff.patch").write_text(diff)
@@ -157,6 +160,7 @@ def write_hydra_config(run_dir: Path, cfg: Any, overrides: Optional[List[str]] =
 def append_metrics_history(run_dir: Path, step: int, metrics: Dict[str, float]) -> None:
     """Append one line to metrics/history.jsonl."""
     import json
+
     path = run_dir / "metrics" / "history.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a") as f:
@@ -166,6 +170,7 @@ def append_metrics_history(run_dir: Path, step: int, metrics: Dict[str, float]) 
 def write_metrics_summary(run_dir: Path, summary: Dict[str, Any]) -> None:
     """Write metrics/summary.json at end of run."""
     import json
+
     path = run_dir / "metrics" / "summary.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:

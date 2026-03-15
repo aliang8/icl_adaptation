@@ -1,4 +1,5 @@
 """Load D4RL-style or pre-downloaded HalfCheetah trajectories (mixed returns)."""
+
 import pickle
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
@@ -27,7 +28,7 @@ def load_halfcheetah_trajectories(
     with open(path, "rb") as f:
         trajectories = pickle.load(f)
     if max_trajectories:
-        trajectories = trajectories[: max_trajectories]
+        trajectories = trajectories[:max_trajectories]
     # Single task: use all trajectories as context pool, sorted by return (best first)
     sorted_pool = sort_trajectories_by_return(trajectories, ascending=False)
     prompt_per_task = [sorted_pool]

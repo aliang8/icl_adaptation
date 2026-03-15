@@ -2,6 +2,7 @@
 Evaluation: load checkpoint or inference artifact, run env episodes, report metrics.
 Use for eval-only runs and for validating exported models.
 """
+
 import os
 import argparse
 from pathlib import Path
@@ -11,13 +12,16 @@ import torch
 
 # Add project root
 import sys
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.models import MetaDecisionTransformer, RNNContextEncoder
 from src.data.trajectories import sort_trajectories_by_return, discount_cumsum
 
 
-def load_model_for_eval(checkpoint_path: str, device: torch.device, inference_artifact: bool = False):
+def load_model_for_eval(
+    checkpoint_path: str, device: torch.device, inference_artifact: bool = False
+):
     """Load model from training checkpoint or inference artifact."""
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=inference_artifact)
     state_dim = ckpt.get("config", {}).get("model", {}).get("state_dim", 27)
@@ -142,11 +146,15 @@ def run_eval_episodes(
             ep_return += reward
             actions = torch.cat([actions, action.unsqueeze(0)], dim=0)
             rewards = torch.cat([rewards, torch.tensor([reward], device=device)])
-            states = torch.cat([states, torch.from_numpy(next_state).float().reshape(1, -1).to(device)], dim=0)
+            states = torch.cat(
+                [states, torch.from_numpy(next_state).float().reshape(1, -1).to(device)], dim=0
+            )
             if context_encoder is not None:
                 # Update context from recent (s,a,r) segment
                 pass  # Stub: compute context from last context_horizon steps
-            returns_to_go = torch.cat([returns_to_go, (returns_to_go[0, -1] - reward / scale).reshape(1, 1)], dim=1)
+            returns_to_go = torch.cat(
+                [returns_to_go, (returns_to_go[0, -1] - reward / scale).reshape(1, 1)], dim=1
+            )
             timesteps = torch.cat([timesteps, torch.tensor([[t + 1]], device=device)], dim=1)
             if done:
                 break
@@ -163,7 +171,9 @@ def main():
     parser.add_argument("--device", type=str, default="cuda:0")
     args = parser.parse_args()
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    model, state_mean, state_std = load_model_for_eval(args.checkpoint, device, inference_artifact=args.inference_artifact)
+    model, state_mean, state_std = load_model_for_eval(
+        args.checkpoint, device, inference_artifact=args.inference_artifact
+    )
     os.makedirs(args.output_dir, exist_ok=True)
     # Without a real env we only load and optionally save metrics placeholder
     print("Model loaded. Run with a real env (e.g. AntDir) to compute returns.")

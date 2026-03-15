@@ -1,4 +1,5 @@
 """Trajectory utilities: convert data to trajectories, sort by return (for context)."""
+
 import random
 import numpy as np
 from collections import OrderedDict
@@ -66,9 +67,7 @@ def sample_context_trajectories(
             k = min(per_bucket, len(idx), n - len(chosen_idx))
             if k <= 0:
                 break
-            chosen_idx.extend(
-                np.random.choice(idx, size=k, replace=False).tolist()
-            )
+            chosen_idx.extend(np.random.choice(idx, size=k, replace=False).tolist())
         chosen_idx = chosen_idx[:n]
         chosen = [pool[i] for i in chosen_idx]
         return sort_trajectories_by_return(chosen, ascending=ascending)
@@ -93,7 +92,14 @@ def convert_data_to_trajectories(
     for i in range(n):
         if (i + 1) % max_episode_steps == 0 or (i + 1 < n and data[term_key][i]):
             traj = OrderedDict()
-            for key in ["observations", "actions", "rewards", "next_observations", "terminals", "masks"]:
+            for key in [
+                "observations",
+                "actions",
+                "rewards",
+                "next_observations",
+                "terminals",
+                "masks",
+            ]:
                 if key in data:
                     traj[key] = data[key][start : i + 1]
             if "terminals" not in traj and "dones" in data:

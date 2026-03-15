@@ -4,15 +4,23 @@ Context trajectories (same task) sorted by returns during training;
 at inference, zero-shot adaptation with previous rollouts sorted ascending.
 Based on Meta-DT (NJU-RL/Meta-DT); uses transformers.GPT2Model with inputs_embeds.
 """
+
+from __future__ import annotations
+
+from typing import Optional, Tuple
+
 import torch
 import torch.nn as nn
+from torch import Tensor
 from transformers import GPT2Config, GPT2Model
+
+from src.models.types import DTBatch, DTOutput
 
 
 class MetaDecisionTransformer(nn.Module):
     """
     Models (Return_t, state_t, action_t, ...) with optional prompt (context) sequences.
-    State is encoded with context (e.g. from RNN context encoder) then fed as state_dim*2 -> hidden.
+    State is encoded with context then fed as state_dim*2 -> hidden.
     """
 
     def __init__(
@@ -26,7 +34,7 @@ class MetaDecisionTransformer(nn.Module):
         action_tanh: bool = True,
         n_layer: int = 3,
         n_head: int = 1,
-        n_inner: int = None,
+        n_inner: Optional[int] = None,
         activation_function: str = "relu",
         resid_pdrop: float = 0.1,
         attn_pdrop: float = 0.1,
@@ -73,98 +81,140 @@ class MetaDecisionTransformer(nn.Module):
         )
         self.predict_return = nn.Linear(hidden_size, 1)
 
-    def forward(
+    def forward(self, batch: DTBatch) -> DTOutput:
+        B, T = batch.states.shape[0], batch.states.shape[1]
+        mask = batch.attention_mask
+        if mask is None:
+            mask = torch.ones((B, T), dtype=torch.long, device=batch.states.device)
+
+        state_emb = self.encode_state(batch)
+        return_emb = self.embed_return(batch.returns_to_go) + self.embed_timestep(
+            batch.timesteps.long()
+        )
+        action_emb = self.embed_action(batch.actions) + self.embed_timestep(batch.timesteps.long())
+
+        stacked, stacked_mask = self._stack_with_prompt(
+            return_emb, state_emb, action_emb, mask, batch.prompt, T
+        )
+        hidden = self._run_backbone(stacked, stacked_mask)
+        pred_returns = self.predict_return(hidden[:, 2])[:, -T:, :]
+        pred_states = self.predict_state(hidden[:, 2])[:, -T:, :]
+        pred_actions = self.predict_action(hidden[:, 1])[:, -T:, :]
+
+        loss = self.compute_loss(pred_actions, batch.actions, mask)
+        return DTOutput(
+            loss=loss,
+            pred_actions=pred_actions,
+            pred_states=pred_states,
+            pred_returns=pred_returns,
+            hidden_states=hidden,
+        )
+
+    def encode_state(self, batch: DTBatch) -> Tensor:
+        """Fuse state + context and add timestep embedding. [B, T, D] -> [B, T, H]."""
+        ts = batch.timesteps.long()
+        enc = self.state_encoder(batch.states)
+        state_emb = self.embed_state(torch.cat((enc, batch.contexts), dim=-1))
+        return state_emb + self.embed_timestep(ts)
+
+    def _stack_with_prompt(
         self,
-        states,
-        contexts,
-        actions,
-        rewards,
-        returns_to_go,
-        timesteps,
-        attention_mask=None,
-        prompt=None,
-    ):
-        batch_size, seq_length = states.shape[0], states.shape[1]
-        if attention_mask is None:
-            attention_mask = torch.ones((batch_size, seq_length), dtype=torch.long, device=states.device)
-
-        timesteps = timesteps.long()
-
-        state_encoding = self.state_encoder(states)
-        state_embeddings = self.embed_state(torch.cat((state_encoding, contexts), dim=-1))
-        action_embeddings = self.embed_action(actions)
-        returns_embeddings = self.embed_return(returns_to_go)
-        time_embeddings = self.embed_timestep(timesteps)
-
-        state_embeddings = state_embeddings + time_embeddings
-        action_embeddings = action_embeddings + time_embeddings
-        returns_embeddings = returns_embeddings + time_embeddings
-
-        stacked_inputs = torch.stack(
-            (returns_embeddings, state_embeddings, action_embeddings), dim=1
-        ).permute(0, 2, 1, 3).reshape(batch_size, 3 * seq_length, self.hidden_size)
-        stacked_inputs = self.embed_ln(stacked_inputs)
-        stacked_attention_mask = torch.stack(
-            (attention_mask, attention_mask, attention_mask), dim=1
-        ).permute(0, 2, 1).reshape(batch_size, 3 * seq_length)
+        return_emb: Tensor,
+        state_emb: Tensor,
+        action_emb: Tensor,
+        mask: Tensor,
+        prompt: Optional[Tuple[Tensor, ...]],
+        seq_length: int,
+    ) -> Tuple[Tensor, Tensor]:
+        B = state_emb.shape[0]
+        stacked = (
+            torch.stack((return_emb, state_emb, action_emb), dim=1)
+            .permute(0, 2, 1, 3)
+            .reshape(B, 3 * seq_length, self.hidden_size)
+        )
+        stacked = self.embed_ln(stacked)
+        stacked_mask = (
+            torch.stack((mask, mask, mask), dim=1).permute(0, 2, 1).reshape(B, 3 * seq_length)
+        )
 
         if prompt is not None:
-            prompt_states, prompt_actions, prompt_rewards, prompt_returns_to_go, prompt_timesteps, prompt_attention_mask = prompt
-            prompt_timesteps = prompt_timesteps.long()
-            prompt_seq_length = prompt_states.shape[1]
+            (
+                prompt_states,
+                prompt_actions,
+                _,
+                prompt_returns_to_go,
+                prompt_timesteps,
+                prompt_attention_mask,
+            ) = prompt
+            prompt_ts = prompt_timesteps.long()
+            prompt_T = prompt_states.shape[1]
             if prompt_returns_to_go.shape[1] % 10 == 1:
-                prompt_returns_embeddings = self.prompt_embed_return(prompt_returns_to_go[:, :-1])
+                prtg = self.prompt_embed_return(prompt_returns_to_go[:, :-1])
             else:
-                prompt_returns_embeddings = self.prompt_embed_return(prompt_returns_to_go)
-            prompt_state_embeddings = self.prompt_embed_state(prompt_states)
-            prompt_action_embeddings = self.prompt_embed_action(prompt_actions)
-            prompt_time_embeddings = self.prompt_embed_timestep(prompt_timesteps)
-            prompt_state_embeddings = prompt_state_embeddings + prompt_time_embeddings
-            prompt_action_embeddings = prompt_action_embeddings + prompt_time_embeddings
-            prompt_returns_embeddings = prompt_returns_embeddings + prompt_time_embeddings
-            prompt_stacked_inputs = torch.stack(
-                (prompt_returns_embeddings, prompt_state_embeddings, prompt_action_embeddings), dim=1
-            ).permute(0, 2, 1, 3).reshape(prompt_states.shape[0], 3 * prompt_seq_length, self.hidden_size)
-            prompt_stacked_attention_mask = torch.stack(
-                (prompt_attention_mask, prompt_attention_mask, prompt_attention_mask), dim=1
-            ).permute(0, 2, 1).reshape(prompt_states.shape[0], 3 * prompt_seq_length)
-            if prompt_stacked_inputs.shape[1] == 3 * seq_length:
-                prompt_stacked_inputs = prompt_stacked_inputs.reshape(1, -1, self.hidden_size)
-                prompt_stacked_attention_mask = prompt_stacked_attention_mask.reshape(1, -1)
-                stacked_inputs = torch.cat((prompt_stacked_inputs.repeat(batch_size, 1, 1), stacked_inputs), dim=1)
-                stacked_attention_mask = torch.cat((prompt_stacked_attention_mask.repeat(batch_size, 1), stacked_attention_mask), dim=1)
+                prtg = self.prompt_embed_return(prompt_returns_to_go)
+            ps_emb = self.prompt_embed_state(prompt_states) + self.prompt_embed_timestep(prompt_ts)
+            pa_emb = self.prompt_embed_action(prompt_actions) + self.prompt_embed_timestep(
+                prompt_ts
+            )
+            prtg_emb = prtg + self.prompt_embed_timestep(prompt_ts)
+            prompt_stacked = (
+                torch.stack((prtg_emb, ps_emb, pa_emb), dim=1)
+                .permute(0, 2, 1, 3)
+                .reshape(prompt_states.shape[0], 3 * prompt_T, self.hidden_size)
+            )
+            prompt_stacked_mask = (
+                torch.stack(
+                    (prompt_attention_mask, prompt_attention_mask, prompt_attention_mask),
+                    dim=1,
+                )
+                .permute(0, 2, 1)
+                .reshape(prompt_states.shape[0], 3 * prompt_T)
+            )
+            if prompt_stacked.shape[1] == 3 * seq_length:
+                prompt_stacked = prompt_stacked.reshape(1, -1, self.hidden_size)
+                prompt_stacked_mask = prompt_stacked_mask.reshape(1, -1)
+                stacked = torch.cat((prompt_stacked.repeat(B, 1, 1), stacked), dim=1)
+                stacked_mask = torch.cat((prompt_stacked_mask.repeat(B, 1), stacked_mask), dim=1)
             else:
-                stacked_inputs = torch.cat((prompt_stacked_inputs, stacked_inputs), dim=1)
-                stacked_attention_mask = torch.cat((prompt_stacked_attention_mask, stacked_attention_mask), dim=1)
+                stacked = torch.cat((prompt_stacked, stacked), dim=1)
+                stacked_mask = torch.cat((prompt_stacked_mask, stacked_mask), dim=1)
 
-        transformer_outputs = self.transformer(
-            inputs_embeds=stacked_inputs,
-            attention_mask=stacked_attention_mask,
-        )
-        x = transformer_outputs.last_hidden_state
-        if prompt is None:
-            x = x.reshape(batch_size, seq_length, 3, self.hidden_size).permute(0, 2, 1, 3)
-        else:
-            x = x.reshape(batch_size, -1, 3, self.hidden_size).permute(0, 2, 1, 3)
+        return stacked, stacked_mask
 
-        return_preds = self.predict_return(x[:, 2])[:, -seq_length:, :]
-        state_preds = self.predict_state(x[:, 2])[:, -seq_length:, :]
-        action_preds = self.predict_action(x[:, 1])[:, -seq_length:, :]
-        return state_preds, action_preds, return_preds
+    def _run_backbone(self, stacked: Tensor, mask: Tensor) -> Tensor:
+        """Transformer forward; return last_hidden_state reshaped to [B, 3, seq, H]."""
+        out = self.transformer(inputs_embeds=stacked, attention_mask=mask)
+        x = out.last_hidden_state
+        B = stacked.shape[0]
+        seq_total = x.shape[1]
+        x = x.reshape(B, seq_total // 3, 3, self.hidden_size).permute(0, 2, 1, 3)
+        return x
+
+    def compute_loss(self, pred_actions: Tensor, actions: Tensor, mask: Tensor) -> Optional[Tensor]:
+        """MSE on actions at valid (masked) positions."""
+        if pred_actions is None or actions is None:
+            return None
+        act_dim = pred_actions.shape[-1]
+        pred_flat = pred_actions.reshape(-1, act_dim)[mask.reshape(-1) > 0]
+        target_flat = actions.reshape(-1, act_dim)[mask.reshape(-1) > 0]
+        if pred_flat.numel() == 0:
+            return None
+        return torch.nn.functional.mse_loss(pred_flat, target_flat)
 
     def get_action(
         self,
-        states,
-        contexts,
-        actions,
-        rewards,
-        returns_to_go,
-        timesteps,
-        prompt,
+        states: Tensor,
+        contexts: Tensor,
+        actions: Tensor,
+        rewards: Tensor,
+        returns_to_go: Tensor,
+        timesteps: Tensor,
+        prompt: Optional[Tuple[Tensor, ...]],
         warm_train_steps: int,
         current_step: int,
         **kwargs,
-    ):
+    ) -> Tensor:
+        """Single-step action for inference; pads to max_length and calls forward."""
         states = states.reshape(1, -1, self.state_dim)
         contexts = contexts.reshape(1, -1, self.context_dim)
         actions = actions.reshape(1, -1, self.act_dim)
@@ -172,40 +222,46 @@ class MetaDecisionTransformer(nn.Module):
         timesteps = timesteps.reshape(1, -1)
 
         if self.max_length is not None:
-            states = states[:, -self.max_length:]
-            contexts = contexts[:, -self.max_length:]
-            actions = actions[:, -self.max_length:]
-            returns_to_go = returns_to_go[:, -self.max_length:]
-            timesteps = timesteps[:, -self.max_length:]
+            states = states[:, -self.max_length :]
+            contexts = contexts[:, -self.max_length :]
+            actions = actions[:, -self.max_length :]
+            returns_to_go = returns_to_go[:, -self.max_length :]
+            timesteps = timesteps[:, -self.max_length :]
 
-        attention_mask = torch.cat([
-            torch.zeros(self.max_length - states.shape[1], device=states.device, dtype=torch.long),
-            torch.ones(states.shape[1], device=states.device, dtype=torch.long),
-        ]).reshape(1, -1)
-        states = torch.cat([
-            torch.zeros((1, self.max_length - states.shape[1], self.state_dim), device=states.device),
-            states,
-        ], dim=1).float()
-        contexts = torch.cat([
-            torch.zeros((1, self.max_length - contexts.shape[1], self.context_dim), device=contexts.device),
-            contexts,
-        ], dim=1).float()
-        actions = torch.cat([
-            torch.ones((1, self.max_length - actions.shape[1], self.act_dim), device=actions.device) * -10.0,
-            actions,
-        ], dim=1).float()
-        returns_to_go = torch.cat([
-            torch.zeros((1, self.max_length - returns_to_go.shape[1], 1), device=returns_to_go.device),
-            returns_to_go,
-        ], dim=1).float()
-        timesteps = torch.cat([
-            torch.zeros((1, self.max_length - timesteps.shape[1]), device=timesteps.device, dtype=torch.long),
-            timesteps,
-        ], dim=1)
+        L = states.shape[1]
+        pad = self.max_length - L
+        device = states.device
+        states = torch.cat(
+            [torch.zeros(1, pad, self.state_dim, device=device), states], dim=1
+        ).float()
+        contexts = torch.cat(
+            [torch.zeros(1, pad, self.context_dim, device=device), contexts], dim=1
+        ).float()
+        actions = torch.cat(
+            [torch.ones(1, pad, self.act_dim, device=device) * -10.0, actions], dim=1
+        ).float()
+        returns_to_go = torch.cat(
+            [torch.zeros(1, pad, 1, device=device), returns_to_go], dim=1
+        ).float()
+        timesteps = torch.cat(
+            [torch.zeros(1, pad, device=device, dtype=torch.long), timesteps], dim=1
+        )
+        attention_mask = torch.cat(
+            [
+                torch.zeros(pad, device=device, dtype=torch.long),
+                torch.ones(L, device=device, dtype=torch.long),
+            ]
+        ).reshape(1, -1)
 
         use_prompt = prompt is not None and current_step > warm_train_steps
-        _, action_preds, _ = self.forward(
-            states, contexts, actions, None, returns_to_go, timesteps,
-            attention_mask=attention_mask, prompt=prompt if use_prompt else None,
+        batch = DTBatch(
+            states=states,
+            contexts=contexts,
+            actions=actions,
+            returns_to_go=returns_to_go,
+            timesteps=timesteps,
+            attention_mask=attention_mask,
+            prompt=prompt if use_prompt else None,
         )
-        return action_preds[0, -1]
+        out = self.forward(batch)
+        return out.pred_actions[0, -1]

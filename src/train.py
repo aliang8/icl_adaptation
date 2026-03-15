@@ -2,10 +2,12 @@
 Single training entrypoint: start fresh, resume from checkpoint, eval-only, or save final export.
 No notebook-only training logic. Use notebooks only for analysis.
 """
+
 import os
 import random
 import sys
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import torch
@@ -26,8 +28,9 @@ from src.engine.run_dir import (
 )
 from src.engine.eval_viz import run_rollouts_and_save_viz
 from src.engine.trainer import Trainer
-from src.models import MetaDecisionTransformer, RNNContextEncoder
-from src.data import ICLTrajectoryDataset
+from src.models import MetaDecisionTransformer, RNNContextEncoder, VLADecisionTransformer
+from src.models.types import DTBatch
+from src.data import ICLTrajectoryDataset, collate_icl_batch
 from src.data.trajectories import convert_data_to_trajectories, sort_trajectories_by_return
 
 
@@ -36,6 +39,7 @@ def _print_config(cfg):
     from rich.console import Console
     from rich.panel import Panel
     from rich.syntax import Syntax
+
     yaml_str = OmegaConf.to_yaml(cfg)
     syntax = Syntax(yaml_str, "yaml", theme="monokai", line_numbers=False)
     console = Console()
@@ -63,7 +67,9 @@ def _print_model_architecture(model, title="Model architecture"):
     table.add_row("[bold]Total[/bold]", f"[bold]{total:,}[/bold]")
     table.add_row("Trainable", f"{trainable:,}")
     console = Console()
-    console.print(Panel(table, title=f"[bold]{title}[/bold] (MetaDecisionTransformer)", border_style="green"))
+    console.print(
+        Panel(table, title=f"[bold]{title}[/bold] (MetaDecisionTransformer)", border_style="green")
+    )
     # Optional: full repr in a collapsed/smaller panel
     console.print(Panel(str(model), title="[dim]Full model repr[/dim]", border_style="dim"))
 
@@ -76,7 +82,11 @@ def _print_dataset_stats(dataset, loader, env_name: str = "", data_quality: str 
 
     n_trajectories = len(dataset.trajectories)
     n_segments = len(dataset)
-    total_steps = sum(t["rewards"].shape[0] for t in dataset.trajectories)
+    traj_lengths = [t["rewards"].shape[0] for t in dataset.trajectories]
+    total_steps = sum(traj_lengths)
+    min_len = min(traj_lengths) if traj_lengths else 0
+    max_len = max(traj_lengths) if traj_lengths else 0
+    mean_len = total_steps / n_trajectories if n_trajectories else 0
 
     table = Table(show_header=True, header_style="bold")
     table.add_column("Stat", style="cyan")
@@ -84,6 +94,21 @@ def _print_dataset_stats(dataset, loader, env_name: str = "", data_quality: str 
     table.add_row("Trajectories", f"{n_trajectories:,}")
     table.add_row("Segments (training)", f"{n_segments:,}")
     table.add_row("Total steps", f"{total_steps:,}")
+    table.add_row("Traj length (min / max / mean)", f"{min_len} / {max_len} / {mean_len:.1f}")
+    if getattr(dataset, "task_instructions", None):
+        tasks = dataset.task_instructions
+        num_tasks = len(tasks)
+        table.add_row("Num tasks", str(num_tasks))
+        if num_tasks > 0:
+            table.add_row("Episodes per task (approx)", f"{n_trajectories / num_tasks:.1f}")
+            # Example tasks (first 5, truncated)
+            max_examples = 5
+            max_chars = 55
+            examples = [
+                str(t).strip()[:max_chars] + ("…" if len(str(t).strip()) > max_chars else "")
+                for t in tasks[:max_examples]
+            ]
+            table.add_row("Example tasks", "\n".join(examples) if examples else "—")
     table.add_row("Return (min)", f"{dataset.return_min:.2f}")
     table.add_row("Return (max)", f"{dataset.return_max:.2f}")
     table.add_row("Return (mean)", f"{dataset.return_avg:.2f}")
@@ -92,7 +117,11 @@ def _print_dataset_stats(dataset, loader, env_name: str = "", data_quality: str 
     table.add_row("Horizon", str(dataset.horizon))
     table.add_row("Max episode steps", str(dataset.max_episode_steps))
     table.add_row("Context trajectories", str(dataset.num_context_trajectories))
-    table.add_row("Prompt length", str(dataset.prompt_length))
+    prompt_len = getattr(dataset, "prompt_length", None)
+    table.add_row(
+        "Prompt length",
+        str(prompt_len) if prompt_len is not None else "— (full traj)",
+    )
     table.add_row("Total prompt length", str(dataset.total_prompt_len))
     table.add_row("Batch size", str(loader.batch_size))
     table.add_row("Batches per epoch", f"{len(loader):,}")
@@ -133,10 +162,19 @@ def resolve_paths(cfg):
     if str(paths_cfg.repo_root) != ".":
         repo_root = Path(paths_cfg.repo_root).resolve()
     data_root_str = paths_cfg.data_root
-    data_root = Path(data_root_str).resolve() if Path(data_root_str).is_absolute() else (repo_root / data_root_str).resolve()
+    data_root = (
+        Path(data_root_str).resolve()
+        if Path(data_root_str).is_absolute()
+        else (repo_root / data_root_str).resolve()
+    )
     output_root_str = paths_cfg.output_root
-    output_root = Path(output_root_str).resolve() if Path(output_root_str).is_absolute() else (repo_root / output_root_str).resolve()
+    output_root = (
+        Path(output_root_str).resolve()
+        if Path(output_root_str).is_absolute()
+        else (repo_root / output_root_str).resolve()
+    )
     from types import SimpleNamespace
+
     return SimpleNamespace(repo_root=repo_root, data_root=data_root, output_root=output_root)
 
 
@@ -160,10 +198,10 @@ def validate_dataset_paths(env_name: str, paths, data_cfg) -> None:
         log.info("LIBERO-Cosmos manifest found: {}", manifest_path)
 
 
-def build_model(cfg, state_dim: int, action_dim: int):
+def build_model(cfg, state_dim: int, action_dim: int, num_instructions: Optional[int] = None):
     m = cfg.model
     n_inner = m.n_inner or (4 * m.hidden_size)
-    model = MetaDecisionTransformer(
+    common = dict(
         state_dim=state_dim,
         act_dim=action_dim,
         hidden_size=m.hidden_size,
@@ -178,6 +216,17 @@ def build_model(cfg, state_dim: int, action_dim: int):
         attn_pdrop=m.attn_pdrop,
         action_tanh=m.action_tanh,
     )
+    if m.use_vision or m.use_language:
+        model = VLADecisionTransformer(
+            **common,
+            use_vision=m.use_vision,
+            use_language=m.use_language,
+            num_instructions=num_instructions or 0,
+            num_views=m.num_views,
+            image_embed_dim=m.image_embed_dim,
+        )
+    else:
+        model = MetaDecisionTransformer(**common)
     return model
 
 
@@ -189,43 +238,88 @@ def build_optimizer_scheduler(model, cfg):
         weight_decay=o.weight_decay,
     )
     warmup = o.warmup_steps
+
     def lr_lambda(step):
         return min((step + 1) / warmup, 1.0)
+
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     return optimizer, scheduler
 
 
-def train_step_fn(model, batch):
-    """One step: forward, MSE loss on actions, return (loss, grad_norm). Batch includes 15 elements (14 tensors + instructions)."""
-    (states, contexts, actions, rewards, dones, rtg, timesteps, masks,
-     prompt_s, prompt_a, prompt_r, prompt_rtg, prompt_ts, prompt_m, instructions) = batch
-    # instructions: ICRT-style language (one per sample); unused for HalfCheetah, used later for robot manipulation
-    # Trim last step from all prompt tensors so lengths match (prompt_rtg is used as returns_to_go and trimmed to T-1)
-    prompt_rtg = prompt_rtg[:, :-1, :]
-    prompt_s = prompt_s[:, :-1, :]
-    prompt_a = prompt_a[:, :-1, :]
-    prompt_r = prompt_r[:, :-1, :]
-    prompt_ts = prompt_ts[:, :-1]
-    prompt_m = prompt_m[:, :-1]
-    prompt = (prompt_s, prompt_a, prompt_r, prompt_rtg, prompt_ts, prompt_m)
-    state_preds, action_preds, return_preds = model(
-        states, contexts, actions, rewards, rtg[:, :-1], timesteps,
-        attention_mask=masks, prompt=prompt,
-    )
-    act_dim = action_preds.shape[2]
-    action_preds = action_preds.reshape(-1, act_dim)[masks.reshape(-1) > 0]
-    action_target = actions.reshape(-1, act_dim)[masks.reshape(-1) > 0]
-    loss = torch.nn.functional.mse_loss(action_preds, action_target)
-    with torch.no_grad():
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1e9)
-    return loss, grad_norm
+def make_train_step_fn(task_instructions):
+    """Build a train step that passes instruction_indices and optional image_embeddings to VLA-DT."""
+    task_list = list(task_instructions) if task_instructions else []
+
+    def train_step_fn(model, batch):
+        """One step: forward, MSE loss on actions. Batch: 15 elements (14 tensors + instructions); optional 16th = images."""
+        (
+            states,
+            contexts,
+            actions,
+            rewards,
+            dones,
+            rtg,
+            timesteps,
+            masks,
+            prompt_s,
+            prompt_a,
+            prompt_r,
+            prompt_rtg,
+            prompt_ts,
+            prompt_m,
+            instructions,
+        ) = batch[:15]
+        # Trim last step from all prompt tensors so lengths match
+        prompt_rtg = prompt_rtg[:, :-1, :]
+        prompt_s = prompt_s[:, :-1, :]
+        prompt_a = prompt_a[:, :-1, :]
+        prompt_r = prompt_r[:, :-1, :]
+        prompt_ts = prompt_ts[:, :-1]
+        prompt_m = prompt_m[:, :-1]
+        prompt = (prompt_s, prompt_a, prompt_r, prompt_rtg, prompt_ts, prompt_m)
+
+        # VLA-DT: instruction indices (one per sample) from task_instructions
+        instruction_indices = None
+        if getattr(model, "use_language", False) and task_list and instructions is not None:
+            device = next(model.parameters()).device
+            idx_list = [
+                task_list.index(instr) if instr in task_list else 0 for instr in instructions
+            ]
+            instruction_indices = torch.tensor(idx_list, dtype=torch.long, device=device)
+
+        # VLA-DT: image_embeddings when dataset returns images (optional 16th element)
+        image_embeddings = None
+        if len(batch) > 15 and batch[15] is not None:
+            if getattr(model, "vision_encoder", None) is not None:
+                image_embeddings = model.vision_encoder(batch[15])
+
+        dt_batch = DTBatch(
+            states=states,
+            contexts=contexts,
+            actions=actions,
+            returns_to_go=rtg[:, :-1],
+            timesteps=timesteps,
+            attention_mask=masks,
+            prompt=prompt,
+            image_embeddings=image_embeddings,
+            instruction_indices=instruction_indices,
+        )
+        out = model(dt_batch)
+        loss = out.loss if out.loss is not None else torch.tensor(0.0, device=states.device)
+        with torch.no_grad():
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1e9)
+        return loss, grad_norm
+
+    return train_step_fn
 
 
 def main():
     import argparse
+
     # Use spawn for DataLoader workers so CUDA is not re-initialized in forked subprocesses.
     try:
         import torch.multiprocessing as mp
+
         mp.set_start_method("spawn", force=True)
     except RuntimeError:
         pass
@@ -233,7 +327,12 @@ def main():
     parser.add_argument("--config-dir", type=str, default="configs", help="Hydra config directory")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume")
     parser.add_argument("--eval-only", action="store_true", help="Only run evaluation")
-    parser.add_argument("--export-only", type=str, default=None, help="Export inference artifact from this checkpoint")
+    parser.add_argument(
+        "--export-only",
+        type=str,
+        default=None,
+        help="Export inference artifact from this checkpoint",
+    )
     parser.add_argument(
         "--override",
         action="append",
@@ -342,20 +441,32 @@ def main():
 
     if env_name == "HalfCheetah-v2":
         from src.data.d4rl_loader import load_halfcheetah_trajectories
+
         trajectories, prompt_per_task = load_halfcheetah_trajectories(
             str(data_root),
             env_name=data_cfg.env_name,
             data_quality=data_cfg.data_quality,
         )
         if trajectories:
-            log.info("Loaded {} HalfCheetah trajectories (mixed returns) from {}", len(trajectories), data_root)
+            log.info(
+                "Loaded {} HalfCheetah trajectories (mixed returns) from {}",
+                len(trajectories),
+                data_root,
+            )
 
     if env_name == "ICRT-MT":
         config_path = data_root / "ICRT-MT" / "dataset_config.json"
         assert config_path.exists(), f"ICRT-MT config missing (validated earlier): {config_path}"
         from src.data.icrt_dataset import load_icrt_trajectories
-        proprio_keys = data_cfg.proprio_keys or ["observation/cartesian_position", "observation/gripper_position"]
-        action_keys = data_cfg.action_keys or ["action/cartesian_position", "action/gripper_position"]
+
+        proprio_keys = data_cfg.proprio_keys or [
+            "observation/cartesian_position",
+            "observation/gripper_position",
+        ]
+        action_keys = data_cfg.action_keys or [
+            "action/cartesian_position",
+            "action/gripper_position",
+        ]
         trajectories, prompt_per_task, task_instructions_from_loader = load_icrt_trajectories(
             str(config_path.resolve()),
             proprio_keys=proprio_keys,
@@ -371,10 +482,17 @@ def main():
             )
         state_dim = int(trajectories[0]["observations"].shape[1])
         action_dim = int(trajectories[0]["actions"].shape[1])
-        log.info("Loaded {} ICRT-MT trajectories from {} (state_dim={}, action_dim={})", len(trajectories), config_path, state_dim, action_dim)
+        log.info(
+            "Loaded {} ICRT-MT trajectories from {} (state_dim={}, action_dim={})",
+            len(trajectories),
+            config_path,
+            state_dim,
+            action_dim,
+        )
 
     if env_name == "LIBERO-Cosmos":
         from src.data.libero_dataset import load_libero_trajectories
+
         manifest_path = data_root / "LIBERO-Cosmos-Policy" / "manifest.json"
         trajectories, prompt_per_task, task_instructions_from_loader = load_libero_trajectories(
             str(data_root),
@@ -382,10 +500,15 @@ def main():
             repo_id=data_cfg.libero_repo_id,
         )
         if trajectories:
-            log.info("Loaded {} LIBERO-Cosmos trajectories (manifest: {})", len(trajectories), manifest_path.resolve())
+            log.info(
+                "Loaded {} LIBERO-Cosmos trajectories (manifest: {})",
+                len(trajectories),
+                manifest_path.resolve(),
+            )
 
     if not trajectories and data_dir.is_dir():
         import pickle
+
         for task_id in range(data_cfg.num_train_tasks):
             path = data_dir / f"dataset_task_{task_id}.pkl"
             if path.is_file():
@@ -395,7 +518,9 @@ def main():
                     d["observations"] = d["states"]
                     d["next_observations"] = d.get("next_states", d["states"])
                     d["terminals"] = d.get("dones", d.get("terminals", np.zeros(len(d["rewards"]))))
-                trajs = convert_data_to_trajectories(d, data_cfg.max_episode_steps, max_trajectories=500)
+                trajs = convert_data_to_trajectories(
+                    d, data_cfg.max_episode_steps, max_trajectories=500
+                )
                 trajectories.extend(trajs)
         for task_id in range(data_cfg.num_tasks):
             path = data_dir / f"dataset_task_prompt{task_id}.pkl"
@@ -421,7 +546,9 @@ def main():
             }
             for _ in range(n_traj)
         ]
-        prompt_per_task = [sort_trajectories_by_return(trajectories[:5], ascending=False)] * max(1, data_cfg.num_tasks)
+        prompt_per_task = [sort_trajectories_by_return(trajectories[:5], ascending=False)] * max(
+            1, data_cfg.num_tasks
+        )
         log.warning("No dataset found at {}; using dummy data for dry run", data_dir.resolve())
 
     dataset = ICLTrajectoryDataset(
@@ -444,7 +571,9 @@ def main():
         context_style=data_cfg.context_style,
         lazy_dataset=data_cfg.lazy_dataset,
         max_training_examples=data_cfg.max_training_examples,
-        task_instructions=task_instructions_from_loader if task_instructions_from_loader is not None else data_cfg.task_instructions,
+        task_instructions=task_instructions_from_loader
+        if task_instructions_from_loader is not None
+        else data_cfg.task_instructions,
         seed=data_cfg.seed,
     )
     state_mean = dataset.state_mean
@@ -455,10 +584,16 @@ def main():
         batch_size=data_cfg.batch_size,
         shuffle=True,
         num_workers=data_cfg.num_workers,
+        collate_fn=collate_icl_batch,
     )
-    _print_dataset_stats(dataset, loader, env_name=data_cfg.env_name, data_quality=data_cfg.data_quality or "")
+    _print_dataset_stats(
+        dataset, loader, env_name=data_cfg.env_name, data_quality=data_cfg.data_quality or ""
+    )
 
-    model = build_model(cfg, state_dim, action_dim).to(device)
+    num_instructions = (
+        len(dataset.task_instructions) if getattr(dataset, "task_instructions", None) else None
+    )
+    model = build_model(cfg, state_dim, action_dim, num_instructions=num_instructions).to(device)
     _print_model_architecture(model)
     optimizer, scheduler = build_optimizer_scheduler(model, cfg)
     use_wandb = args.wandb or sys_cfg.use_wandb
@@ -472,14 +607,23 @@ def main():
         entity=sys_cfg.wandb_entity,
     )
     if use_wandb:
-        log.info("W&B logging enabled (entity: {}, project: {})", sys_cfg.wandb_entity, sys_cfg.wandb_project)
+        log.info(
+            "W&B logging enabled (entity: {}, project: {})",
+            sys_cfg.wandb_entity,
+            sys_cfg.wandb_project,
+        )
 
     global_step_start = 0
     best_metric_start = float("-inf")
 
     if args.resume:
         _, global_step_start, best_metric_start, _, _ = load_checkpoint(
-            args.resume, model, optimizer=optimizer, scheduler=scheduler, device=device, restore_rng=True,
+            args.resume,
+            model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            device=device,
+            restore_rng=True,
         )
 
     if args.eval_only:
@@ -519,6 +663,7 @@ def main():
 
     log.info("Starting training loop (max_steps={})", cfg.experiment.max_steps)
     export_dir = str(run_dir / "artifacts" / "inference")
+    train_step_fn = make_train_step_fn(getattr(dataset, "task_instructions", None) or [])
     final_step, best_metric = trainer.run_training(
         train_loader=loader,
         global_step_start=global_step_start,
@@ -529,11 +674,14 @@ def main():
         state_std=state_std,
         export_dir=export_dir,
     )
-    write_metrics_summary(run_dir, {
-        "final_step": final_step,
-        "best_metric": best_metric,
-        "best_metric_name": cfg.experiment.best_metric_name,
-    })
+    write_metrics_summary(
+        run_dir,
+        {
+            "final_step": final_step,
+            "best_metric": best_metric,
+            "best_metric_name": cfg.experiment.best_metric_name,
+        },
+    )
     log.info("Training finished.")
     logger.close()
 

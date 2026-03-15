@@ -1,6 +1,7 @@
 """
 Eval rollout visualization: run env rollouts and save state/action curves and returns to viz/samples/step_XXXXX/.
 """
+
 from __future__ import annotations
 
 import os
@@ -14,10 +15,12 @@ def _try_make_env(env_name: str):
     """Try to create env (Gymnasium or gym)."""
     try:
         import gymnasium as gym
+
         return gym.make(env_name)
     except Exception:
         try:
             import gym
+
             return gym.make(env_name)
         except Exception:
             return None
@@ -57,6 +60,7 @@ def run_rollouts_and_save_viz(
     state_std_t = np.asarray(state_std_t, dtype=np.float32)
 
     import torch
+
     all_returns = []
     all_lengths = []
     all_states: List[np.ndarray] = []
@@ -78,7 +82,8 @@ def run_rollouts_and_save_viz(
         ep_return = 0.0
         for t in range(max_episode_steps):
             action = model.get_action(
-                (states - torch.from_numpy(state_mean_t).to(device)) / torch.from_numpy(state_std_t).to(device),
+                (states - torch.from_numpy(state_mean_t).to(device))
+                / torch.from_numpy(state_std_t).to(device),
                 contexts,
                 actions_t,
                 rewards_t,
@@ -102,8 +107,12 @@ def run_rollouts_and_save_viz(
             ep_actions.append(action_np.copy())
             actions_t = torch.cat([actions_t, action], dim=0)
             rewards_t = torch.cat([rewards_t, torch.tensor([reward], device=device)])
-            states = torch.cat([states, torch.from_numpy(next_obs).float().reshape(1, -1).to(device)], dim=0)
-            returns_to_go = torch.cat([returns_to_go, (returns_to_go[0, -1] - reward / scale).reshape(1, 1)], dim=1)
+            states = torch.cat(
+                [states, torch.from_numpy(next_obs).float().reshape(1, -1).to(device)], dim=0
+            )
+            returns_to_go = torch.cat(
+                [returns_to_go, (returns_to_go[0, -1] - reward / scale).reshape(1, 1)], dim=1
+            )
             timesteps = torch.cat([timesteps, torch.tensor([[t + 1]], device=device)], dim=1)
             if done or truncated:
                 break
@@ -118,8 +127,10 @@ def run_rollouts_and_save_viz(
     viz_dir.mkdir(parents=True, exist_ok=True)
     try:
         import matplotlib
+
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+
         for i in range(min(num_rollouts, len(all_states))):
             fig, axes = plt.subplots(2, 1, figsize=(8, 6), sharex=True)
             S = all_states[i]
@@ -145,7 +156,12 @@ def run_rollouts_and_save_viz(
         # Summary of returns
         fig2, ax = plt.subplots(figsize=(4, 3))
         ax.bar(range(len(all_returns)), all_returns, color="steelblue")
-        ax.axhline(np.mean(all_returns), color="red", linestyle="--", label=f"mean={np.mean(all_returns):.1f}")
+        ax.axhline(
+            np.mean(all_returns),
+            color="red",
+            linestyle="--",
+            label=f"mean={np.mean(all_returns):.1f}",
+        )
         ax.set_xlabel("rollout")
         ax.set_ylabel("return")
         ax.legend()

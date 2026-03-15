@@ -1,11 +1,11 @@
-# Meta-DT style transformer (in-context DT)
+# VLA (Vision-Language-Action) DT for ICRT-MT / robot manipulation.
+# Use with data=[base,icrt_mt]: --override data=[base,icrt_mt] model=vla_dt
 state_dim: 27
 act_dim: 8
 context_dim: 16
 hidden_size: 128
-max_length: 20
-# Match data max_episode_steps (e.g. HalfCheetah 1000) so timestep embedding covers full episode
-max_ep_len: 1000
+max_length: 32
+max_ep_len: 512
 n_layer: 3
 n_head: 1
 n_inner: null
@@ -14,7 +14,8 @@ resid_pdrop: 0.1
 attn_pdrop: 0.1
 n_positions: 1024
 action_tanh: true
-use_vision: false
-use_language: false
+# VLA
+use_vision: true
+use_language: true
 num_views: 2
 image_embed_dim: 256

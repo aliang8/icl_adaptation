@@ -7,6 +7,7 @@ Usage:
   python scripts/visualize_icrt_data.py --config datasets/ICRT-MT/dataset_config.json --out-dir outputs/icrt_viz
   python scripts/visualize_icrt_data.py --max-episodes 3 --sample-frames 5
 """
+
 from __future__ import annotations
 
 import argparse
@@ -24,6 +25,7 @@ except ImportError:
 
 try:
     import matplotlib
+
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 except ImportError:
@@ -85,8 +87,15 @@ def main():
     parser = argparse.ArgumentParser(description="Visualize ICRT-MT dataset")
     parser.add_argument("--config", type=str, default="datasets/ICRT-MT/dataset_config.json")
     parser.add_argument("--out-dir", type=str, default="outputs/icrt_viz")
-    parser.add_argument("--max-episodes", type=int, default=2, help="Max episodes to load frames from (for speed)")
-    parser.add_argument("--sample-frames", type=int, default=3, help="Number of timesteps to show per episode (start, mid, end)")
+    parser.add_argument(
+        "--max-episodes", type=int, default=2, help="Max episodes to load frames from (for speed)"
+    )
+    parser.add_argument(
+        "--sample-frames",
+        type=int,
+        default=3,
+        help="Number of timesteps to show per episode (start, mid, end)",
+    )
     args = parser.parse_args()
 
     config_path = Path(args.config)
@@ -97,7 +106,9 @@ def main():
     dataset_paths = config["dataset_path"]
     if isinstance(dataset_paths, str):
         dataset_paths = [dataset_paths]
-    image_keys = config.get("image_keys", ["observation/exterior_image_1_left", "observation/wrist_image_left"])
+    image_keys = config.get(
+        "image_keys", ["observation/exterior_image_1_left", "observation/wrist_image_left"]
+    )
 
     # Use only keys that exist in first HDF5 (for simplicity we use part1 only if it has the key)
     h5path = dataset_paths[0]
@@ -109,7 +120,9 @@ def main():
     counts = [len(verb_to_episode[t]) for t in tasks]
 
     # 2) Episode lengths (sample from first file only to avoid loading both)
-    with open(config["hdf5_keys"][0] if isinstance(config["hdf5_keys"], list) else config["hdf5_keys"]) as f:
+    with open(
+        config["hdf5_keys"][0] if isinstance(config["hdf5_keys"], list) else config["hdf5_keys"]
+    ) as f:
         keys_part1 = json.load(f)
     with h5py.File(h5path, "r") as f:
         lengths = []
@@ -137,7 +150,9 @@ def main():
     # ----- Plot 2: Episode length histogram -----
     if lengths:
         fig2, ax2 = plt.subplots(figsize=(6, 4))
-        ax2.hist(lengths, bins=min(50, len(set(lengths))), color="coral", edgecolor="darkred", alpha=0.8)
+        ax2.hist(
+            lengths, bins=min(50, len(set(lengths))), color="coral", edgecolor="darkred", alpha=0.8
+        )
         ax2.set_xlabel("Episode length (steps)")
         ax2.set_ylabel("Count")
         ax2.set_title("ICRT-MT: Episode length distribution")

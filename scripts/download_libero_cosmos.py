@@ -12,6 +12,7 @@ Usage:
   python scripts/download_libero_cosmos.py --output-dir datasets
   python scripts/download_libero_cosmos.py --output-dir datasets --split-fraction 0.9 --seed 42
 """
+
 from __future__ import annotations
 
 import argparse
@@ -83,7 +84,11 @@ def main():
         suite_names = []
 
         def infer_suite(row):
-            td = (row.get("task_description") or [None])[0] if hasattr(row.get("task_description"), "__getitem__") else row.get("task_description")
+            td = (
+                (row.get("task_description") or [None])[0]
+                if hasattr(row.get("task_description"), "__getitem__")
+                else row.get("task_description")
+            )
             if td is None:
                 return "unknown"
             td = str(td).lower()
@@ -112,7 +117,9 @@ def main():
             if idx % 50000 == 0:
                 log("  Processed %d rows...", idx)
         if prev_task is not None:
-            episode_boundaries.append((current_start, idx, prev_task, None, infer_suite({"task_description": prev_task})))
+            episode_boundaries.append(
+                (current_start, idx, prev_task, None, infer_suite({"task_description": prev_task}))
+            )
         log("Inferred %d episodes from %d rows (streaming).", len(episode_boundaries), idx)
     else:
         # Non-streaming: full dataset in memory / cache
@@ -122,16 +129,25 @@ def main():
             ep_col = "episode_index" if "episode_index" in ds.column_names else "episode_id"
             episode_boundaries = []
             eps = ds[ep_col]
-            task_col = ds["task_description"] if "task_description" in ds.column_names else [None] * len(ds)
+            task_col = (
+                ds["task_description"]
+                if "task_description" in ds.column_names
+                else [None] * len(ds)
+            )
             success_col = ds["success"] if "success" in ds.column_names else [None] * len(ds)
             start = 0
             for i in range(1, len(eps)):
                 if eps[i] != eps[i - 1] or i == len(eps) - 1:
                     end = i if eps[i] != eps[i - 1] else len(eps)
-                    task = task_col[start] if hasattr(task_col, "__getitem__") else (task_col[start] if start < len(task_col) else None)
+                    task = (
+                        task_col[start]
+                        if hasattr(task_col, "__getitem__")
+                        else (task_col[start] if start < len(task_col) else None)
+                    )
                     succ = success_col[start] if start < len(success_col) else success_col[start]
                     episode_boundaries.append((start, end, task, succ, "unknown"))
                     start = i
+
             def _infer_suite(td):
                 if td is None:
                     return "unknown"
@@ -145,12 +161,25 @@ def main():
                 if "long" in td or "10" in td:
                     return "libero_10"
                 return "unknown"
+
             if start < len(eps):
                 t = task_col[start] if start < len(task_col) else None
-                episode_boundaries.append((start, len(eps), t, success_col[start] if start < len(success_col) else None, _infer_suite(t)))
+                episode_boundaries.append(
+                    (
+                        start,
+                        len(eps),
+                        t,
+                        success_col[start] if start < len(success_col) else None,
+                        _infer_suite(t),
+                    )
+                )
         else:
             # Infer boundaries by task_description change (same task = same episode; may merge episodes)
-            task_col = ds["task_description"] if "task_description" in ds.column_names else [None] * len(ds)
+            task_col = (
+                ds["task_description"]
+                if "task_description" in ds.column_names
+                else [None] * len(ds)
+            )
             success_col = ds["success"] if "success" in ds.column_names else [None] * len(ds)
             episode_boundaries = []
 
@@ -179,14 +208,25 @@ def main():
                     episode_boundaries.append((start, end, task, succ, _infer_suite(task)))
                     start = i
             if start < len(ds):
-                episode_boundaries.append((start, len(ds), task_col[start], success_col[start] if start < len(success_col) else None, _infer_suite(task_col[start])))
+                episode_boundaries.append(
+                    (
+                        start,
+                        len(ds),
+                        task_col[start],
+                        success_col[start] if start < len(success_col) else None,
+                        _infer_suite(task_col[start]),
+                    )
+                )
 
     # Train/val split per suite (in-distribution held-out)
     import random
+
     rng = random.Random(args.seed)
     by_suite = {}
-    for (s, e, task, succ, suite) in episode_boundaries:
-        by_suite.setdefault(suite, []).append({"start": s, "end": e, "task_description": task, "success": succ})
+    for s, e, task, succ, suite in episode_boundaries:
+        by_suite.setdefault(suite, []).append(
+            {"start": s, "end": e, "task_description": task, "success": succ}
+        )
     train_episodes = []
     val_episodes = []
     for suite, eps in by_suite.items():
@@ -200,15 +240,38 @@ def main():
 
     manifest = {
         "repo_id": args.repo_id,
-        "train_episodes": [{"start": e["start"], "end": e["end"], "task_description": e["task_description"], "success": e["success"], "suite": s} for e, s in train_episodes],
-        "val_episodes": [{"start": e["start"], "end": e["end"], "task_description": e["task_description"], "success": e["success"], "suite": s} for e, s in val_episodes],
+        "train_episodes": [
+            {
+                "start": e["start"],
+                "end": e["end"],
+                "task_description": e["task_description"],
+                "success": e["success"],
+                "suite": s,
+            }
+            for e, s in train_episodes
+        ],
+        "val_episodes": [
+            {
+                "start": e["start"],
+                "end": e["end"],
+                "task_description": e["task_description"],
+                "success": e["success"],
+                "suite": s,
+            }
+            for e, s in val_episodes
+        ],
         "split_fraction": args.split_fraction,
         "seed": args.seed,
     }
     manifest_path = out_root / "manifest.json"
     with open(manifest_path, "w") as f:
         json.dump(manifest, f, indent=2)
-    log("Wrote %s (%d train, %d val episodes)", manifest_path, len(manifest["train_episodes"]), len(manifest["val_episodes"]))
+    log(
+        "Wrote %s (%d train, %d val episodes)",
+        manifest_path,
+        len(manifest["train_episodes"]),
+        len(manifest["val_episodes"]),
+    )
 
     # Save dataset to disk so we don't rely on HF cache only (optional for non-streaming)
     if not args.streaming and hasattr(ds, "save_to_disk"):

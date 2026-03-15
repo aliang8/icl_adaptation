@@ -22,5 +22,5 @@ $PY -m src.train \
   --config-dir "${PROJECT_ROOT}/configs" \
   --wandb \
   --run-name "halfcheetah-medium_expert" \
-  --override "data=halfcheetah" \
+  --override "data=[base,halfcheetah]" \
   "$@"

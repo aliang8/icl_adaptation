@@ -30,20 +30,20 @@ The script infers episode boundaries from the dataset (e.g. `episode_index` if p
 
 ```bash
 uv run python -m src.train \
-  --override data=libero_cosmos \
+  --override data=[base,libero_cosmos] \
   experiment.eval_every_steps=5000 \
   experiment.max_steps=100000 \
   --run-name libero_cosmos_run
 ```
 
-- `data=libero_cosmos` uses `configs/data/libero_cosmos.yaml` (state_dim=9, act_dim=7, language, etc.).
+- `data=[base,libero_cosmos]` merges `configs/data/base.yaml` with `configs/data/libero_cosmos.yaml` (state_dim=9, act_dim=7, language, etc.).
 - Training loads trajectories from the manifest + HuggingFace (or local) data and writes checkpoints under `outputs/icl_adaptation/<date>/<run_name>__seed_<X>__<hash>/`.
 
 To **disable** env-based evaluation (no rollouts, same as ICRT-MT):
 
 ```bash
 uv run python -m src.train \
-  --override data=libero_cosmos experiment.eval_every_steps=0 \
+  --override data=[base,libero_cosmos] experiment.eval_every_steps=0 \
   --run-name libero_cosmos_run
 ```
 
@@ -78,7 +78,7 @@ Success rate is the fraction of val episodes that were successful (from dataset 
 |------------|--------|
 | Install    | `uv sync --extra icrt` (or `pip install datasets`) |
 | Download   | `uv run python scripts/download_libero_cosmos.py --output-dir datasets` |
-| Train      | `uv run python -m src.train --override data=libero_cosmos --run-name libero_cosmos_run` |
+| Train      | `uv run python -m src.train --override data=[base,libero_cosmos] --run-name libero_cosmos_run` |
 | Eval (ID)  | `uv run python scripts/run_libero_eval.py --ckpt <path-to-ckpt> --manifest datasets/LIBERO-Cosmos-Policy/manifest.json --data-dir datasets` |
 
 Everything is **modular**: download script, `src/data/libero_dataset.py`, config `configs/data/libero_cosmos.yaml`, and `scripts/run_libero_eval.py` can be run and read independently.

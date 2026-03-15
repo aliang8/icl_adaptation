@@ -92,17 +92,17 @@ You can install both if you plan to use HalfCheetah and ICRT-style data.
 
 - **HalfCheetah (with W&B):**
   ```bash
-  uv run python -m src.train --wandb --run-name halfcheetah-run1 --override data=halfcheetah
+  uv run python -m src.train --wandb --run-name halfcheetah-run1 --override data=[base,halfcheetah]
   ```
 
 - **Resume from checkpoint:**
   ```bash
-  uv run python -m src.train --resume outputs/checkpoints/checkpoint_latest.pt --override data=halfcheetah
+  uv run python -m src.train --resume outputs/checkpoints/checkpoint_latest.pt --override data=[base,halfcheetah]
   ```
 
 - **Override config (e.g. steps, batch size):**
   ```bash
-  uv run python -m src.train --override data=halfcheetah experiment.max_steps=5000 data.batch_size=64
+  uv run python -m src.train --override data=[base,halfcheetah] experiment.max_steps=5000 data.batch_size=64
   ```
 
 ---
@@ -177,7 +177,7 @@ For robot manipulation with **language instructions** and **multi-view camera im
    Outputs PNGs in `outputs/icrt_viz/` (or `--out-dir`).
 5. **Config and model:**
    - Data: `configs/data/icrt_mt.yaml` (sets `dataset_config_json`, `image_keys`, `use_vision`, `use_language`).
-   - Model: `ICRTDecisionTransformer` in `src/models/icrt_dt.py` (Meta-DT + optional vision encoder + language embedding). Use `--override data=icrt_mt` and a model config with `use_vision=true`, `use_language=true` when training on ICRT-MT.
+   - Model: `VLADecisionTransformer` in `src/models/vla_dt.py` (Meta-DT + optional vision encoder + language embedding). Use `--override data=[base,icrt_mt] model=vla_dt` when training on ICRT-MT.
 
 ---
 
@@ -192,9 +192,9 @@ For robot manipulation with **language instructions** and **multi-view camera im
 | Install ICRT deps | `uv sync --extra icrt` |
 | Download ICRT-MT | `uv run python scripts/download_icrt_dataset.py --output-dir datasets` |
 | Visualize ICRT-MT | `uv run python scripts/visualize_icrt_data.py` (optional: `--out-dir outputs/icrt_viz --max-episodes 2`) |
-| Train (HalfCheetah) | `uv run python -m src.train --wandb --override data=halfcheetah` |
-| Resume training | `uv run python -m src.train --resume outputs/checkpoints/checkpoint_latest.pt --override data=halfcheetah` |
-| Override config | `uv run python -m src.train --override data=halfcheetah experiment.max_steps=5000 data.batch_size=64` |
+| Train (HalfCheetah) | `uv run python -m src.train --wandb --override data=[base,halfcheetah]` |
+| Resume training | `uv run python -m src.train --resume outputs/checkpoints/checkpoint_latest.pt --override data=[base,halfcheetah]` |
+| Override config | `uv run python -m src.train --override data=[base,halfcheetah] experiment.max_steps=5000 data.batch_size=64` |
 
 ---
 

@@ -1,4 +1,5 @@
 """Typed config schema (OmegaConf structured configs / dataclasses)."""
+
 from dataclasses import dataclass, field
 from typing import Optional, List
 
@@ -6,6 +7,7 @@ from typing import Optional, List
 @dataclass
 class ModelConfig:
     """Decision transformer / in-context model."""
+
     state_dim: int = 27
     act_dim: int = 8
     context_dim: int = 16
@@ -20,11 +22,17 @@ class ModelConfig:
     attn_pdrop: float = 0.1
     n_positions: int = 1024
     action_tanh: bool = True
+    # VLA-DT (vision-language-action): set true in model=vla_dt
+    use_vision: bool = False
+    use_language: bool = False
+    num_views: int = 2
+    image_embed_dim: int = 256
 
 
 @dataclass
 class DataConfig:
     """Dataset and dataloader."""
+
     env_name: str = "AntDir-v0"
     data_quality: str = "medium"
     data_dir: str = "datasets"
@@ -69,6 +77,7 @@ class DataConfig:
 @dataclass
 class OptimConfig:
     """Optimizer and scheduler."""
+
     lr: float = 5e-5
     weight_decay: float = 1e-4
     warmup_steps: int = 10000
@@ -79,6 +88,7 @@ class OptimConfig:
 @dataclass
 class PathsConfig:
     """Path config: resolved to pathlib.Path at runtime. Override paths.data_root etc. from CLI."""
+
     data_root: str = "datasets"
     output_root: str = "outputs"
     repo_root: str = "."
@@ -87,6 +97,7 @@ class PathsConfig:
 @dataclass
 class SystemConfig:
     """Runtime: device, seed, distributed, logging."""
+
     device: str = "cuda:0"
     seed: int = 412
     deterministic: bool = True
@@ -94,7 +105,9 @@ class SystemConfig:
     output_dir: str = "outputs"
     project_name: str = "icl_adaptation"
     # run_name set from CLI or config; used with seed and git hash for run slug
-    save_dir: str = "outputs/checkpoints"  # deprecated when run_dir used; ckpts live under run_dir/ckpts
+    save_dir: str = (
+        "outputs/checkpoints"  # deprecated when run_dir used; ckpts live under run_dir/ckpts
+    )
     # distributed (rank 0 saves)
     world_size: int = 1
     rank: int = 0
@@ -107,6 +120,7 @@ class SystemConfig:
 @dataclass
 class ExperimentConfig:
     """Training loop: steps, eval, checkpoint policy."""
+
     max_steps: int = 500_000
     eval_every_steps: int = 1000
     num_eval_episodes: int = 5
@@ -127,6 +141,7 @@ class ExperimentConfig:
 @dataclass
 class AppConfig:
     """Top-level composed config."""
+
     model: ModelConfig = field(default_factory=ModelConfig)
     data: DataConfig = field(default_factory=DataConfig)
     optim: OptimConfig = field(default_factory=OptimConfig)

@@ -39,7 +39,10 @@ def _resolve_config_paths(config: Dict[str, Any], config_dir: Path) -> Dict[str,
             if not p.is_absolute():
                 out[key] = str((config_dir / p).resolve())
         elif isinstance(val, list):
-            out[key] = [str((config_dir / Path(p)).resolve()) if not Path(p).is_absolute() else p for p in val]
+            out[key] = [
+                str((config_dir / Path(p)).resolve()) if not Path(p).is_absolute() else p
+                for p in val
+            ]
     return out
 
 
@@ -195,8 +198,10 @@ def load_icrt_trajectories(
     """
     try:
         import h5py
-    except ImportError:
-        raise ImportError("Install h5py for ICRT: pip install h5py")
+    except ImportError as e:
+        raise ImportError(
+            "ICRT-MT loading requires h5py. Install with: uv sync --extra icrt  (or: pip install h5py)"
+        ) from e
 
     path = Path(config_path).resolve()
     config = load_dataset_config(path)

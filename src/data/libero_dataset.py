@@ -12,6 +12,7 @@ Returns: (trajectories, prompt_trajectories_per_task, task_instructions)
 - prompt_trajectories_per_task: list of list of trajectory dicts (for in-context prompt)
 - task_instructions: list of unique task description strings
 """
+
 from __future__ import annotations
 
 import json
@@ -42,6 +43,7 @@ def _get_ds_from_cache_or_hf(
     local_data = root / "data"
     if local_data.is_dir():
         from datasets import load_from_disk
+
         return load_from_disk(str(local_data))
     return load_dataset(repo_id, split=split, trust_remote_code=True)
 
@@ -137,7 +139,9 @@ def load_libero_trajectories(
             if end <= start:
                 continue
             traj = _episode_to_trajectory(
-                ds, start, end,
+                ds,
+                start,
+                end,
                 ep.get("task_description"),
                 ep.get("success"),
             )
@@ -186,7 +190,11 @@ def load_libero_trajectories(
                 task_order.append("")
                 task_to_trajs[""] = [traj]
 
-    task_instructions = task_order if task_order else list(dict.fromkeys(str(t.get("task_description") or "") for t in trajectories))
+    task_instructions = (
+        task_order
+        if task_order
+        else list(dict.fromkeys(str(t.get("task_description") or "") for t in trajectories))
+    )
     prompt_per_task = [task_to_trajs.get(ti, [])[:5] for ti in task_instructions]
     if not any(prompt_per_task):
         prompt_per_task = [trajectories[:5]] * max(1, len(task_instructions))

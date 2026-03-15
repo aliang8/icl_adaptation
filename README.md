@@ -8,7 +8,7 @@ This codebase follows a single training entrypoint, compositional Hydra configs,
 
 **Setup** (uv, conda, D4RL/MuJoCo) and **step-by-step commands** for D4RL HalfCheetah (download → train) are in **[SETUP.md](SETUP.md)**.
 
-TL;DR with uv: `uv venv && source .venv/bin/activate && uv sync` then `uv sync --extra d4rl` for HalfCheetah (Minari); download with `uv run python scripts/download_d4rl_halfcheetah.py --qualities medium expert medium_expert` and train with `uv run python -m src.train --wandb --override data=halfcheetah`.
+TL;DR with uv: `uv venv && source .venv/bin/activate && uv sync` then `uv sync --extra d4rl` for HalfCheetah (Minari); download with `uv run python scripts/download_d4rl_halfcheetah.py --qualities medium expert medium_expert` and train with `uv run python -m src.train --wandb --override data=[base,halfcheetah]`.
 
 ## Project layout
 
@@ -107,9 +107,9 @@ Use the output pkl as your dataset; see script docstring for trajectory format (
 
 Dataset layout:
 
-- **HalfCheetah (Minari)**: `datasets/HalfCheetah-v2/<data_quality>/trajectories.pkl` (created by `scripts/download_d4rl_halfcheetah.py` via Minari). Use `data_quality: medium_expert` (or `medium`, `expert`) in config and `--override data=halfcheetah`.
-- **ICRT-MT (language + multi-view images)**: `datasets/ICRT-MT/` from `uv run python scripts/download_icrt_dataset.py --output-dir datasets` ([HuggingFace](https://huggingface.co/datasets/Ravenh97/ICRT-MT)). After `uv sync --extra icrt`, visualize with `uv run python scripts/visualize_icrt_data.py`. Use `configs/data/icrt_mt.yaml` and `ICRTDecisionTransformer` for language-conditioned, vision-based in-context policy. See [docs/ICRT_MT_TRAINING.md](docs/ICRT_MT_TRAINING.md) (training only, no eval) and SETUP.md “Optional: ICRT-style”.
-- **LIBERO-Cosmos-Policy**: [nvidia/LIBERO-Cosmos-Policy](https://huggingface.co/datasets/nvidia/LIBERO-Cosmos-Policy) — download with `uv run python scripts/download_libero_cosmos.py --output-dir datasets`, train with `data=libero_cosmos`, run in-distribution eval with `scripts/run_libero_eval.py`. See [docs/LIBERO_COSMOS_TRAINING.md](docs/LIBERO_COSMOS_TRAINING.md).
+- **HalfCheetah (Minari)**: `datasets/HalfCheetah-v2/<data_quality>/trajectories.pkl` (created by `scripts/download_d4rl_halfcheetah.py` via Minari). Use `data_quality: medium_expert` (or `medium`, `expert`) in config and `--override data=[base,halfcheetah]`.
+- **ICRT-MT (language + multi-view images)**: `datasets/ICRT-MT/` from `uv run python scripts/download_icrt_dataset.py --output-dir datasets` ([HuggingFace](https://huggingface.co/datasets/Ravenh97/ICRT-MT)). After `uv sync --extra icrt`, visualize with `uv run python scripts/visualize_icrt_data.py`. Use `data=[base,icrt_mt] model=vla_dt` for language-conditioned, vision-based in-context policy (VLA-DT). See [docs/ICRT_MT_TRAINING.md](docs/ICRT_MT_TRAINING.md) (training only, no eval) and SETUP.md “Optional: ICRT-style”.
+- **LIBERO-Cosmos-Policy**: [nvidia/LIBERO-Cosmos-Policy](https://huggingface.co/datasets/nvidia/LIBERO-Cosmos-Policy) — download with `uv run python scripts/download_libero_cosmos.py --output-dir datasets`, train with `data=[base,libero_cosmos]`, run in-distribution eval with `scripts/run_libero_eval.py`. See [docs/LIBERO_COSMOS_TRAINING.md](docs/LIBERO_COSMOS_TRAINING.md).
 - **AntDir / multi-task**: `datasets/<env_name>/<data_quality>/dataset_task_<id>.pkl` and `dataset_task_prompt<id>.pkl` (see Meta-DT data collection).  
 If no data is found, the trainer falls back to minimal dummy data for a dry run.
 
@@ -132,6 +132,19 @@ Besides **D4RL** (HalfCheetah, Hopper, Walker2d, Ant: medium / medium-replay / m
 For a minimal start we use **D4RL HalfCheetah** (medium + medium-expert) so trajectories naturally have a mix of returns; context is sorted by return for training and (at inference) previous rollouts can be passed sorted ascending.
 
 ## Citation
+
+## Format and lint
+
+Install dev deps then run Ruff to format and fix lint:
+
+```bash
+uv sync --extra dev
+uv run ruff format src scripts
+uv run ruff check src scripts --fix
+```
+
+- `ruff format` — normalize quotes, indentation, line length (100).
+- `ruff check --fix` — fix auto-fixable issues (E, F, I).
 
 If you use this code or ideas from it, please cite:
 

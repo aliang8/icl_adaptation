@@ -2,6 +2,7 @@
 Logging: train/val loss, main metric, lr, grad norm, throughput, GPU memory, checkpoint path.
 Supports TensorBoard and W&B; save resolved config and run metadata.
 """
+
 import os
 import time
 from pathlib import Path
@@ -32,6 +33,7 @@ class Logger:
 
         try:
             from torch.utils.tensorboard import SummaryWriter
+
             self._writer = SummaryWriter(log_dir=str(self.log_dir))
         except Exception:
             pass
@@ -40,8 +42,13 @@ class Logger:
             try:
                 import wandb
                 from omegaconf import OmegaConf
-                cfg_dict = OmegaConf.to_container(config, resolve=True) if config is not None else {}
-                self._wandb = wandb.init(project=project, entity=entity, name=run_name, config=cfg_dict)
+
+                cfg_dict = (
+                    OmegaConf.to_container(config, resolve=True) if config is not None else {}
+                )
+                self._wandb = wandb.init(
+                    project=project, entity=entity, name=run_name, config=cfg_dict
+                )
             except Exception:
                 self._wandb = None
 

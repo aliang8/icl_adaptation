@@ -1,22 +1,10 @@
-# HalfCheetah with full in-context trajectories (ICRT-style).
-# Same as halfcheetah but context_style=full_trajectory; prompt = whole traj(s) capped by max_total_prompt_length.
-# Use: --override data=halfcheetah_full_context
+# HalfCheetah with full in-context trajectories. Use: --override data=[base,halfcheetah_full_context]
 env_name: HalfCheetah-v2
 data_quality: medium_expert
-data_dir: datasets
-horizon: 20
-prompt_length: 5
 return_scale: 5000.0
-batch_size: 128
-num_workers: 0
 num_tasks: 1
 num_train_tasks: 1
 max_episode_steps: 1000
-context_horizon: 4
-context_dim: 16
-context_hidden_dim: 128
 num_context_trajectories: 3
-context_sort_ascending: true
-context_sampling: random
-max_total_prompt_length: 256  # required for full_trajectory; cap total prompt steps (use last N)
+max_total_prompt_length: 256
 context_style: full_trajectory

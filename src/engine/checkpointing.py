@@ -3,6 +3,7 @@ Checkpointing: full resume state (model, optimizer, scheduler, scaler, epoch, st
 Saves under ckpts/last/, ckpts/best/, ckpts/step_XXXXX/.
 Separate inference/export artifact under artifacts/inference/.
 """
+
 import json
 import os
 import random
@@ -42,7 +43,9 @@ def _set_rng_state(state: Dict[str, Any]) -> None:
     np.random.set_state(state["numpy"])
     torch.random.set_rng_state(torch.tensor(state["torch_cpu"], dtype=torch.uint8))
     if state.get("torch_cuda") and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all([torch.tensor(s, dtype=torch.uint8) for s in state["torch_cuda"]])
+        torch.cuda.set_rng_state_all(
+            [torch.tensor(s, dtype=torch.uint8) for s in state["torch_cuda"]]
+        )
 
 
 def save_checkpoint(
@@ -68,7 +71,11 @@ def save_checkpoint(
     if rank != 0:
         return ""
     os.makedirs(save_dir, exist_ok=True)
-    config_container = OmegaConf.to_container(cfg, resolve=True) if hasattr(cfg, "__dict__") or hasattr(cfg, "items") else cfg
+    config_container = (
+        OmegaConf.to_container(cfg, resolve=True)
+        if hasattr(cfg, "__dict__") or hasattr(cfg, "items")
+        else cfg
+    )
 
     ckpt = {
         "model": model.state_dict(),

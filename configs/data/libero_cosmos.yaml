@@ -1,20 +1,18 @@
 # LIBERO-Cosmos-Policy: nvidia/LIBERO-Cosmos-Policy on HuggingFace
 # Download: python scripts/download_libero_cosmos.py --output-dir datasets
-# Suites: libero_spatial, libero_object, libero_goal, libero_10 (in-distribution eval)
 env_name: LIBERO-Cosmos
-data_dir: datasets
-# Path to manifest (train/val episodes). Relative to cwd or absolute.
+data_quality: ""
 libero_manifest: datasets/LIBERO-Cosmos-Policy/manifest.json
 libero_repo_id: nvidia/LIBERO-Cosmos-Policy
-# State = proprio (9), action = 7-DoF + gripper (7)
 use_language: true
 use_vision: false
-# Set to true if using vision model (primary_images_jpeg, wrist_images_jpeg)
 horizon: 32
 prompt_length: 8
 return_scale: 1.0
 batch_size: 16
 num_workers: 2
+num_tasks: 20
+num_train_tasks: 20
 num_context_trajectories: 3
 context_style: subsampled
 lazy_dataset: true

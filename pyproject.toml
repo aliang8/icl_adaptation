@@ -16,6 +16,7 @@ dependencies = [
     "tqdm",
     "gym>=0.17",
     "transformers>=4.20.0",
+    "ipdb",
 ]
 
 [project.optional-dependencies]
@@ -32,6 +33,10 @@ include = ["src*"]
 [tool.ruff]
 line-length = 100
 target-version = "py39"
+src = ["src", "scripts"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I"]
+
+[tool.ruff.format]
+quote-style = "double"

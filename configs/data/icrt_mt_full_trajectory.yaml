@@ -1,5 +1,6 @@
-# ICRT-style: language + multi-view camera images (e.g. ICRT-MT from HuggingFace)
-# Download: python scripts/download_icrt_dataset.py --output-dir datasets
+# ICRT-MT with full in-context trajectories (prompt = whole demo(s), capped by max_total_prompt_length).
+# Use: data=[base,icrt_mt_full_trajectory] model=vla_dt
+# Inherits from base; overrides below match icrt_mt and set full_trajectory.
 env_name: ICRT-MT
 data_quality: ""
 dataset_config_json: datasets/ICRT-MT/dataset_config.json
@@ -23,7 +24,8 @@ num_workers: 2
 num_tasks: 20
 num_train_tasks: 20
 num_context_trajectories: 3
-context_style: subsampled
+context_style: full_trajectory
+max_total_prompt_length: 256
 lazy_dataset: true
 max_training_examples: 200000
 max_episode_steps: 512

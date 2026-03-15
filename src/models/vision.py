@@ -4,6 +4,7 @@ Multi-view vision encoder for ICRT-style architectures.
 Encodes multiple camera views (e.g. exterior + wrist) into a single embedding
 or per-step features. Supports optional camera/modality positional embeddings.
 """
+
 from __future__ import annotations
 
 from typing import List, Optional, Tuple
@@ -102,16 +103,18 @@ class MultiViewVisionEncoder(nn.Module):
         self.modality_pos_emb = modality_pos_emb
 
         if separate_encoders:
-            self.encoders = nn.ModuleList([
-                SingleViewEncoder(
-                    in_channels=in_channels,
-                    embed_dim=embed_dim,
-                    img_size=img_size,
-                    patch_size=patch_size,
-                    use_cls=use_cls_per_view,
-                )
-                for _ in range(num_views)
-            ])
+            self.encoders = nn.ModuleList(
+                [
+                    SingleViewEncoder(
+                        in_channels=in_channels,
+                        embed_dim=embed_dim,
+                        img_size=img_size,
+                        patch_size=patch_size,
+                        use_cls=use_cls_per_view,
+                    )
+                    for _ in range(num_views)
+                ]
+            )
         else:
             shared = SingleViewEncoder(
                 in_channels=in_channels,

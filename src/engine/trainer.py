@@ -2,6 +2,7 @@
 Training loop: forward, loss, backward, grad clip, optimizer step, scheduler step,
 log metrics, checkpoint (latest/best/periodic), eval hook. Uses tqdm progress bar.
 """
+
 import os
 from typing import Any, Callable, Dict, Optional, Tuple
 
@@ -43,12 +44,14 @@ class Trainer:
         self.rank = self.sys_cfg.rank
         self.best_metric_name = self.exp_cfg.best_metric_name
         self.best_metric_mode = self.exp_cfg.best_metric_mode
-        self._is_better = (max if self.best_metric_mode == "max" else min)
+        self._is_better = max if self.best_metric_mode == "max" else min
 
     def train_step(
         self,
         batch: Tuple[Any, ...],
-        step_fn: Callable[[torch.nn.Module, Tuple[Any, ...]], Tuple[torch.Tensor, Optional[torch.Tensor]]],
+        step_fn: Callable[
+            [torch.nn.Module, Tuple[Any, ...]], Tuple[torch.Tensor, Optional[torch.Tensor]]
+        ],
     ) -> Tuple[float, Optional[float]]:
         """Single step: forward, loss, backward, grad clip, step. Returns (loss, grad_norm)."""
         self.model.train()
@@ -64,12 +67,16 @@ class Trainer:
         else:
             loss.backward()
             if self.grad_clip_norm > 0:
-                grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_norm)
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(), self.grad_clip_norm
+                )
             self.optimizer.step()
         if self.scheduler is not None:
             self.scheduler.step()
         loss_val = loss.detach().cpu().item()
-        grad_norm_val = grad_norm.detach().cpu().item() if isinstance(grad_norm, torch.Tensor) else grad_norm
+        grad_norm_val = (
+            grad_norm.detach().cpu().item() if isinstance(grad_norm, torch.Tensor) else grad_norm
+        )
         return loss_val, grad_norm_val
 
     def run_training(
@@ -77,7 +84,9 @@ class Trainer:
         train_loader: DataLoader,
         global_step_start: int,
         best_metric_start: float,
-        step_fn: Callable[[torch.nn.Module, Tuple[Any, ...]], Tuple[torch.Tensor, Optional[torch.Tensor]]],
+        step_fn: Callable[
+            [torch.nn.Module, Tuple[Any, ...]], Tuple[torch.Tensor, Optional[torch.Tensor]]
+        ],
         eval_fn: Optional[Callable[[int], Dict[str, float]]] = None,
         state_mean: Optional[Any] = None,
         state_std: Optional[Any] = None,
@@ -100,7 +109,12 @@ class Trainer:
         best_metric = best_metric_start
         epoch = 0
         iter_loader = iter(train_loader)
-        loguru_logger.info("Training started: max_steps={}, eval_every={}, save_latest_every={}", max_steps, eval_every, save_latest_every)
+        loguru_logger.info(
+            "Training started: max_steps={}, eval_every={}, save_latest_every={}",
+            max_steps,
+            eval_every,
+            save_latest_every,
+        )
 
         pbar = tqdm(
             total=max_steps,
@@ -118,12 +132,14 @@ class Trainer:
                 epoch += 1
                 iter_loader = iter(train_loader)
                 batch = next(iter_loader)
-            batch = tuple(
-                x.to(self.device) if isinstance(x, torch.Tensor) else x for x in batch
-            )
+            batch = tuple(x.to(self.device) if isinstance(x, torch.Tensor) else x for x in batch)
             loss_val, grad_norm_val = self.train_step(batch, step_fn)
             lr = self.optimizer.param_groups[0]["lr"]
-            gpu_mem = torch.cuda.max_memory_allocated(self.device) / 1e6 if torch.cuda.is_available() else None
+            gpu_mem = (
+                torch.cuda.max_memory_allocated(self.device) / 1e6
+                if torch.cuda.is_available()
+                else None
+            )
             log_metrics(
                 self.logger,
                 global_step,
@@ -164,7 +180,9 @@ class Trainer:
                                 kind="best",
                                 rank=self.rank,
                             )
-                            pbar.write(f"Saved best checkpoint ({self.best_metric_name}={best_metric:.4f})")
+                            pbar.write(
+                                f"Saved best checkpoint ({self.best_metric_name}={best_metric:.4f})"
+                            )
 
             # Checkpoints
             if self.rank == 0:

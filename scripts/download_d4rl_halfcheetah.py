@@ -7,6 +7,7 @@ Saves to datasets/HalfCheetah-v2/<quality>/trajectories.pkl for training.
 
 Run: uv run python scripts/download_d4rl_halfcheetah.py [--output-dir datasets] [--qualities medium medium_expert]
 """
+
 import argparse
 import pickle
 import sys
@@ -83,7 +84,9 @@ def main():
         default=["medium", "expert", "medium_expert"],
         help="Qualities to save: medium, expert, medium_replay, medium_expert (medium_expert = combined medium+expert)",
     )
-    parser.add_argument("--no-download", action="store_true", help="Only convert already-downloaded Minari data")
+    parser.add_argument(
+        "--no-download", action="store_true", help="Only convert already-downloaded Minari data"
+    )
     args = parser.parse_args()
 
     try:
@@ -102,14 +105,21 @@ def main():
         if quality == "medium_expert":
             # Mixed expertise: combine medium and expert into one dataset
             logger.info("Loading medium + expert for mixed-expertise (medium_expert)")
-            trajs_medium = load_minari_as_trajectories(MINARI_HALFCHEETAH["medium"], download=not args.no_download)
-            trajs_expert = load_minari_as_trajectories(MINARI_HALFCHEETAH["expert"], download=not args.no_download)
+            trajs_medium = load_minari_as_trajectories(
+                MINARI_HALFCHEETAH["medium"], download=not args.no_download
+            )
+            trajs_expert = load_minari_as_trajectories(
+                MINARI_HALFCHEETAH["expert"], download=not args.no_download
+            )
             trajectories = trajs_medium + trajs_expert
             quality_dir = "medium_expert"
         else:
             dataset_id = MINARI_HALFCHEETAH.get(quality)
             if dataset_id is None:
-                logger.warning("Unknown quality '{}'; skipping. Use medium, expert, medium_replay, or medium_expert.", quality)
+                logger.warning(
+                    "Unknown quality '{}'; skipping. Use medium, expert, medium_replay, or medium_expert.",
+                    quality,
+                )
                 continue
             logger.info("Loading Minari dataset: {}", dataset_id)
             trajectories = load_minari_as_trajectories(dataset_id, download=not args.no_download)

@@ -3,6 +3,7 @@ from src.data.dataset import (
     ICLTrajectoryDataset,
     ICLTrajectoryDatasetBase,
     SubsampledICLTrajectoryDataset,
+    collate_icl_batch,
     get_icl_trajectory_dataset,
 )
 from src.data.trajectories import (
@@ -27,6 +28,7 @@ __all__ = [
     "SubsampledICLTrajectoryDataset",
     "convert_data_to_trajectories",
     "discount_cumsum",
+    "collate_icl_batch",
     "get_icl_trajectory_dataset",
     "sample_context_trajectories",
     "sort_trajectories_by_return",
