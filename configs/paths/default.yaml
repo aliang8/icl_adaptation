@@ -1,0 +1,6 @@
+# Path config: resolved to absolute Path in code. Prefer these over ad hoc string concat.
+# Override from CLI: paths.data_root=/data/icl datasets
+data_root: datasets
+output_root: outputs
+# repo_root: used to resolve relative paths when data_root is relative (default: .)
+repo_root: .

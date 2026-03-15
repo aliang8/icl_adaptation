@@ -124,6 +124,43 @@ def get_config(config_dir: str, overrides: list = None):
     return cfg
 
 
+def resolve_paths(cfg):
+    """Resolve path config to absolute Paths. Relative paths are under repo_root."""
+    paths_cfg = getattr(cfg, "paths", None)
+    sys_cfg = cfg.system
+    data_cfg = cfg.data
+    repo_root = Path(__file__).resolve().parent.parent
+    raw_repo = getattr(paths_cfg, "repo_root", None)
+    if raw_repo and str(raw_repo) != ".":
+        repo_root = Path(raw_repo).resolve()
+    data_root_str = getattr(paths_cfg, "data_root", getattr(data_cfg, "data_dir", "datasets"))
+    data_root = Path(data_root_str).resolve() if Path(data_root_str).is_absolute() else (repo_root / data_root_str).resolve()
+    output_root_str = getattr(paths_cfg, "output_root", getattr(sys_cfg, "output_dir", "outputs"))
+    output_root = Path(output_root_str).resolve() if Path(output_root_str).is_absolute() else (repo_root / output_root_str).resolve()
+    from types import SimpleNamespace
+    return SimpleNamespace(repo_root=repo_root, data_root=data_root, output_root=output_root)
+
+
+def validate_dataset_paths(env_name: str, paths, data_cfg) -> None:
+    """Fail fast at startup if required dataset paths are missing."""
+    if env_name == "ICRT-MT":
+        config_path = paths.data_root / "ICRT-MT" / "dataset_config.json"
+        if not config_path.exists():
+            raise FileNotFoundError(
+                f"ICRT-MT dataset not found at {config_path}.\n"
+                f"Run: python scripts/download_icrt_dataset.py --output-dir {paths.data_root}"
+            )
+        log.info("ICRT-MT dataset config found: {}", config_path)
+    elif env_name == "LIBERO-Cosmos":
+        manifest_path = paths.data_root / "LIBERO-Cosmos-Policy" / "manifest.json"
+        if not manifest_path.exists():
+            raise FileNotFoundError(
+                f"LIBERO-Cosmos manifest not found at {manifest_path}.\n"
+                f"Run: python scripts/download_libero_cosmos.py --output-dir {paths.data_root}"
+            )
+        log.info("LIBERO-Cosmos manifest found: {}", manifest_path)
+
+
 def build_model(cfg, state_dim: int, action_dim: int):
     m = cfg.model
     n_inner = getattr(m, "n_inner", None) or (4 * m.hidden_size)
@@ -234,6 +271,10 @@ def main():
     state_dim, action_dim = ENV_DIMS.get(env_name, (cfg.model.state_dim, cfg.model.act_dim))
     log.info("Env {} -> state_dim={}, action_dim={}", env_name, state_dim, action_dim)
 
+    paths = resolve_paths(cfg)
+    log.debug("Resolved paths: data_root={}, output_root={}", paths.data_root, paths.output_root)
+    validate_dataset_paths(env_name, paths, data_cfg)
+
     # Run directory: outputs/<project_name>/<date>/<run_name>__seed_X__<hash>/
     def _infer_run_dir(ckpt_path: str) -> Path:
         p = Path(ckpt_path).resolve()
@@ -264,7 +305,7 @@ def main():
             project_name=project_name,
             run_name=run_name,
             seed=seed,
-            base_dir=getattr(sys_cfg, "output_dir", "outputs"),
+            base_dir=str(paths.output_root),
             overrides=overrides,
         )
         write_hydra_config(run_dir, cfg, overrides=overrides)
@@ -290,9 +331,10 @@ def main():
         return
 
     # Build data: D4RL HalfCheetah, LIBERO-Cosmos, AntDir-style (dataset_task_*.pkl), or dummy
-    data_dir = os.path.join(data_cfg.data_dir, getattr(data_cfg, "env_name", ""), getattr(data_cfg, "data_quality", ""))
+    data_root = paths.data_root
+    data_dir = data_root / getattr(data_cfg, "env_name", "") / getattr(data_cfg, "data_quality", "")
     if env_name == "LIBERO-Cosmos":
-        data_dir = data_cfg.data_dir
+        data_dir = data_root
     trajectories = []
     prompt_per_task = []
     task_instructions_from_loader = None
@@ -300,50 +342,48 @@ def main():
     if env_name == "HalfCheetah-v2":
         from src.data.d4rl_loader import load_halfcheetah_trajectories
         trajectories, prompt_per_task = load_halfcheetah_trajectories(
-            data_cfg.data_dir,
+            str(data_root),
             env_name=data_cfg.env_name,
             data_quality=data_cfg.data_quality,
         )
         if trajectories:
-            log.info("Loaded {} HalfCheetah trajectories (mixed returns) from {}", len(trajectories), data_dir)
+            log.info("Loaded {} HalfCheetah trajectories (mixed returns) from {}", len(trajectories), data_root)
 
     if env_name == "ICRT-MT":
-        config_json = getattr(data_cfg, "dataset_config_json", None)
-        if config_json and os.path.isfile(config_json):
-            from src.data.icrt_dataset import load_icrt_trajectories
-            proprio_keys = getattr(data_cfg, "proprio_keys", ["observation/cartesian_position", "observation/gripper_position"])
-            action_keys = getattr(data_cfg, "action_keys", ["action/cartesian_position", "action/gripper_position"])
-            trajectories, prompt_per_task, task_instructions_from_loader = load_icrt_trajectories(
-                config_json,
-                proprio_keys=proprio_keys,
-                action_keys=action_keys,
-                min_trajectory_length=getattr(data_cfg, "min_trajectory_length", 30),
-                max_trajectory_length=getattr(data_cfg, "max_trajectory_length", 450),
-            )
-            if trajectories:
-                state_dim = int(trajectories[0]["observations"].shape[1])
-                action_dim = int(trajectories[0]["actions"].shape[1])
-                log.info("Loaded {} ICRT-MT trajectories from {} (state_dim={}, action_dim={})", len(trajectories), config_json, state_dim, action_dim)
-        else:
-            log.warning("ICRT-MT dataset_config_json not found or not set: {}; run scripts/download_icrt_dataset.py", config_json)
+        config_path = data_root / "ICRT-MT" / "dataset_config.json"
+        assert config_path.exists(), f"ICRT-MT config missing (validated earlier): {config_path}"
+        from src.data.icrt_dataset import load_icrt_trajectories
+        proprio_keys = getattr(data_cfg, "proprio_keys", ["observation/cartesian_position", "observation/gripper_position"])
+        action_keys = getattr(data_cfg, "action_keys", ["action/cartesian_position", "action/gripper_position"])
+        trajectories, prompt_per_task, task_instructions_from_loader = load_icrt_trajectories(
+            str(config_path.resolve()),
+            proprio_keys=proprio_keys,
+            action_keys=action_keys,
+            min_trajectory_length=getattr(data_cfg, "min_trajectory_length", 30),
+            max_trajectory_length=getattr(data_cfg, "max_trajectory_length", 450),
+        )
+        if trajectories:
+            state_dim = int(trajectories[0]["observations"].shape[1])
+            action_dim = int(trajectories[0]["actions"].shape[1])
+            log.info("Loaded {} ICRT-MT trajectories from {} (state_dim={}, action_dim={})", len(trajectories), config_path.resolve(), state_dim, action_dim)
 
     if env_name == "LIBERO-Cosmos":
         from src.data.libero_dataset import load_libero_trajectories
-        manifest = getattr(data_cfg, "libero_manifest", None) or os.path.join(data_cfg.data_dir, "LIBERO-Cosmos-Policy", "manifest.json")
+        manifest_path = data_root / "LIBERO-Cosmos-Policy" / "manifest.json"
         trajectories, prompt_per_task, task_instructions_from_loader = load_libero_trajectories(
-            data_cfg.data_dir,
-            manifest_path=manifest if os.path.isfile(manifest) else None,
+            str(data_root),
+            manifest_path=str(manifest_path) if manifest_path.exists() else None,
             repo_id=getattr(data_cfg, "libero_repo_id", "nvidia/LIBERO-Cosmos-Policy"),
         )
         if trajectories:
-            log.info("Loaded {} LIBERO-Cosmos trajectories (manifest: {})", len(trajectories), manifest)
+            log.info("Loaded {} LIBERO-Cosmos trajectories (manifest: {})", len(trajectories), manifest_path.resolve())
 
-    if not trajectories and os.path.isdir(data_dir):
+    if not trajectories and data_dir.is_dir():
         import pickle
         for task_id in range(getattr(data_cfg, "num_train_tasks", 1)):
-            path = os.path.join(data_dir, f"dataset_task_{task_id}.pkl")
-            if os.path.isfile(path):
-                with open(path, "rb") as f:
+            path = data_dir / f"dataset_task_{task_id}.pkl"
+            if path.is_file():
+                with path.open("rb") as f:
                     d = pickle.load(f)
                 if "states" in d:
                     d["observations"] = d["states"]
@@ -352,9 +392,9 @@ def main():
                 trajs = convert_data_to_trajectories(d, data_cfg.max_episode_steps, max_trajectories=500)
                 trajectories.extend(trajs)
         for task_id in range(getattr(data_cfg, "num_tasks", 1)):
-            path = os.path.join(data_dir, f"dataset_task_prompt{task_id}.pkl")
-            if os.path.isfile(path):
-                with open(path, "rb") as f:
+            path = data_dir / f"dataset_task_prompt{task_id}.pkl"
+            if path.is_file():
+                with path.open("rb") as f:
                     prompt_per_task.append(pickle.load(f))
             else:
                 prompt_per_task.append(trajectories[:5] if trajectories else [])
@@ -376,7 +416,7 @@ def main():
             for _ in range(n_traj)
         ]
         prompt_per_task = [sort_trajectories_by_return(trajectories[:5], ascending=False)] * max(1, getattr(data_cfg, "num_tasks", 1))
-        log.warning("No dataset found at {}; using dummy data for dry run", data_dir)
+        log.warning("No dataset found at {}; using dummy data for dry run", data_dir.resolve())
 
     dataset = ICLTrajectoryDataset(
         trajectories=trajectories,

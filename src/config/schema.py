@@ -69,6 +69,14 @@ class OptimConfig:
 
 
 @dataclass
+class PathsConfig:
+    """Path config: resolved to pathlib.Path at runtime. Override paths.data_root etc. from CLI."""
+    data_root: str = "datasets"
+    output_root: str = "outputs"
+    repo_root: str = "."
+
+
+@dataclass
 class SystemConfig:
     """Runtime: device, seed, distributed, logging."""
     device: str = "cuda:0"
@@ -116,6 +124,7 @@ class AppConfig:
     optim: OptimConfig = field(default_factory=OptimConfig)
     system: SystemConfig = field(default_factory=SystemConfig)
     experiment: ExperimentConfig = field(default_factory=ExperimentConfig)
+    paths: PathsConfig = field(default_factory=PathsConfig)
     # run metadata (set at runtime)
     run_name: Optional[str] = None
     resume: Optional[str] = None

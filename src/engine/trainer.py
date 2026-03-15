@@ -138,7 +138,7 @@ class Trainer:
 
             # Eval
             eval_metrics = None
-            if eval_fn and global_step % eval_every == 0 and global_step > 0:
+            if eval_fn and eval_every > 0 and global_step % eval_every == 0 and global_step > 0:
                 pbar.write(f"Evaluating at step {global_step}...")
                 eval_metrics = eval_fn(global_step)
                 log_metrics(self.logger, global_step, loss_val, lr, eval_metrics=eval_metrics)

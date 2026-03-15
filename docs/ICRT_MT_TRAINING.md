@@ -24,7 +24,7 @@ sudo apt install git-lfs && git lfs install
 uv run python scripts/download_icrt_dataset.py --output-dir datasets
 ```
 
-Data lands under `datasets/ICRT-MT/` with `dataset_config.json` and HDF5 files.
+Data lands under `datasets/ICRT-MT/` (or your `paths.data_root`) with `dataset_config.json` and HDF5 files. Paths are resolved from the **repo root** so the dataset is found at `<repo>/datasets/ICRT-MT/dataset_config.json`. Override from CLI: `paths.data_root=/abs/path/to/datasets`.
 
 ## 3. (Optional) Inspect data
 

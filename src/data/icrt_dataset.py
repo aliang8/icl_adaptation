@@ -12,15 +12,35 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
 
-def load_dataset_config(config_path: str) -> Dict[str, Any]:
-    """Load ICRT dataset_config.json."""
-    with open(config_path) as f:
+def load_dataset_config(config_path: Union[str, Path]) -> Dict[str, Any]:
+    """Load ICRT dataset_config.json. config_path can be str or Path."""
+    path = Path(config_path).resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"ICRT dataset config not found: {path}")
+    with path.open() as f:
         return json.load(f)
+
+
+def _resolve_config_paths(config: Dict[str, Any], config_dir: Path) -> Dict[str, Any]:
+    """Resolve relative paths in config relative to config_dir (config file's parent)."""
+    out = dict(config)
+    config_dir = config_dir.resolve()
+    for key in ("dataset_path", "hdf5_keys", "epi_len_mapping_json", "verb_to_episode"):
+        if key not in out:
+            continue
+        val = out[key]
+        if isinstance(val, str):
+            p = Path(val)
+            if not p.is_absolute():
+                out[key] = str((config_dir / p).resolve())
+        elif isinstance(val, list):
+            out[key] = [str((config_dir / Path(p)).resolve()) if not Path(p).is_absolute() else p for p in val]
+    return out
 
 
 def load_verb_to_episode(verb_to_episode_path: str) -> Dict[str, List[str]]:
@@ -49,17 +69,19 @@ def load_hdf5_keys(hdf5_keys_paths: List[str]) -> List[str]:
     return keys
 
 
-def open_icrt_hdf5(config_path: str):
+def open_icrt_hdf5(config_path: Union[str, Path]):
     """
     Open HDF5 file(s) from dataset config. Returns (list of h5py.File, keys_to_file map).
-    Caller must close the files when done.
+    Caller must close the files when done. Paths in config are resolved relative to config file's parent.
     """
     try:
         import h5py
     except ImportError:
         raise ImportError("Install h5py for ICRT dataset: pip install h5py")
 
-    config = load_dataset_config(config_path)
+    path = Path(config_path).resolve()
+    config = load_dataset_config(path)
+    config = _resolve_config_paths(config, path.parent)
     dataset_paths = config["dataset_path"]
     if isinstance(dataset_paths, str):
         dataset_paths = [dataset_paths]
@@ -155,7 +177,9 @@ def load_icrt_trajectories(
     except ImportError:
         raise ImportError("Install h5py for ICRT: pip install h5py")
 
-    config = load_dataset_config(config_path)
+    path = Path(config_path).resolve()
+    config = load_dataset_config(path)
+    config = _resolve_config_paths(config, path.parent)
     dataset_paths = config.get("dataset_path")
     if isinstance(dataset_paths, str):
         dataset_paths = [dataset_paths]
@@ -165,7 +189,7 @@ def load_icrt_trajectories(
 
     all_keys = []
     for p in hdf5_keys_paths:
-        with open(p) as f:
+        with Path(p).open() as f:
             all_keys.extend(json.load(f))
 
     verb_to_episode_path = config.get("verb_to_episode")
