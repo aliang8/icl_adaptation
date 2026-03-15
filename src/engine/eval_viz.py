@@ -66,7 +66,7 @@ def run_rollouts_and_save_viz(
         obs, _ = env.reset(seed=step + ep)
         if isinstance(obs, tuple):
             obs = obs[0]
-        context_dim = getattr(model, "context_dim", 16)
+        context_dim = model.context_dim
         states = torch.from_numpy(obs).float().reshape(1, -1).to(device)
         contexts = torch.zeros(1, context_dim, device=device)
         actions_t = torch.zeros(0, model.act_dim, device=device)

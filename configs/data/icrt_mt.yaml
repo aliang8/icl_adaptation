@@ -32,6 +32,6 @@ max_training_examples: 200000
 max_episode_steps: 512
 # Image size expected by vision encoder (H, W)
 image_size: [224, 224]
-# Min trajectory length to use (ICRT uses ~30 at 15Hz)
-min_trajectory_length: 30
+# Min/max trajectory length (lower min to include short demos)
+min_trajectory_length: 10
 max_trajectory_length: 450

@@ -84,9 +84,9 @@ def _print_dataset_stats(dataset, loader, env_name: str = "", data_quality: str 
     table.add_row("Trajectories", f"{n_trajectories:,}")
     table.add_row("Segments (training)", f"{n_segments:,}")
     table.add_row("Total steps", f"{total_steps:,}")
-    table.add_row("Return (min)", f"{getattr(dataset, 'return_min', 0):.2f}")
-    table.add_row("Return (max)", f"{getattr(dataset, 'return_max', 0):.2f}")
-    table.add_row("Return (mean)", f"{getattr(dataset, 'return_avg', 0):.2f}")
+    table.add_row("Return (min)", f"{dataset.return_min:.2f}")
+    table.add_row("Return (max)", f"{dataset.return_max:.2f}")
+    table.add_row("Return (mean)", f"{dataset.return_avg:.2f}")
     table.add_row("State dim", str(dataset.state_dim))
     table.add_row("Action dim", str(dataset.act_dim))
     table.add_row("Horizon", str(dataset.horizon))
@@ -126,16 +126,15 @@ def get_config(config_dir: str, overrides: list = None):
 
 def resolve_paths(cfg):
     """Resolve path config to absolute Paths. Relative paths are under repo_root."""
-    paths_cfg = getattr(cfg, "paths", None)
+    paths_cfg = cfg.paths
     sys_cfg = cfg.system
     data_cfg = cfg.data
     repo_root = Path(__file__).resolve().parent.parent
-    raw_repo = getattr(paths_cfg, "repo_root", None)
-    if raw_repo and str(raw_repo) != ".":
-        repo_root = Path(raw_repo).resolve()
-    data_root_str = getattr(paths_cfg, "data_root", getattr(data_cfg, "data_dir", "datasets"))
+    if str(paths_cfg.repo_root) != ".":
+        repo_root = Path(paths_cfg.repo_root).resolve()
+    data_root_str = paths_cfg.data_root
     data_root = Path(data_root_str).resolve() if Path(data_root_str).is_absolute() else (repo_root / data_root_str).resolve()
-    output_root_str = getattr(paths_cfg, "output_root", getattr(sys_cfg, "output_dir", "outputs"))
+    output_root_str = paths_cfg.output_root
     output_root = Path(output_root_str).resolve() if Path(output_root_str).is_absolute() else (repo_root / output_root_str).resolve()
     from types import SimpleNamespace
     return SimpleNamespace(repo_root=repo_root, data_root=data_root, output_root=output_root)
@@ -163,7 +162,7 @@ def validate_dataset_paths(env_name: str, paths, data_cfg) -> None:
 
 def build_model(cfg, state_dim: int, action_dim: int):
     m = cfg.model
-    n_inner = getattr(m, "n_inner", None) or (4 * m.hidden_size)
+    n_inner = m.n_inner or (4 * m.hidden_size)
     model = MetaDecisionTransformer(
         state_dim=state_dim,
         act_dim=action_dim,
@@ -177,7 +176,7 @@ def build_model(cfg, state_dim: int, action_dim: int):
         activation_function=m.activation_function,
         resid_pdrop=m.resid_pdrop,
         attn_pdrop=m.attn_pdrop,
-        action_tanh=getattr(m, "action_tanh", True),
+        action_tanh=m.action_tanh,
     )
     return model
 
@@ -263,11 +262,11 @@ def main():
     torch.manual_seed(sys_cfg.seed)
     np.random.seed(sys_cfg.seed)
     random.seed(sys_cfg.seed)
-    if getattr(sys_cfg, "deterministic", True):
+    if sys_cfg.deterministic:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
 
-    env_name = getattr(data_cfg, "env_name", "HalfCheetah-v2")
+    env_name = data_cfg.env_name
     state_dim, action_dim = ENV_DIMS.get(env_name, (cfg.model.state_dim, cfg.model.act_dim))
     log.info("Env {} -> state_dim={}, action_dim={}", env_name, state_dim, action_dim)
 
@@ -283,9 +282,9 @@ def main():
             return Path(*p.parts[:idx]).resolve()
         return p.parent.parent
 
-    run_name = getattr(args, "run_name", None) or getattr(cfg, "run_name", None) or getattr(sys_cfg, "run_name", None) or "train"
-    project_name = getattr(sys_cfg, "project_name", "icl_adaptation")
-    seed = getattr(sys_cfg, "seed", 412)
+    run_name = args.run_name or cfg.run_name or sys_cfg.run_name or "train"
+    project_name = sys_cfg.project_name
+    seed = sys_cfg.seed
     if args.resume and os.path.isfile(args.resume):
         run_dir = _infer_run_dir(args.resume)
         save_dir = str(run_dir / "ckpts")
@@ -332,7 +331,9 @@ def main():
 
     # Build data: D4RL HalfCheetah, LIBERO-Cosmos, AntDir-style (dataset_task_*.pkl), or dummy
     data_root = paths.data_root
-    data_dir = data_root / getattr(data_cfg, "env_name", "") / getattr(data_cfg, "data_quality", "")
+    data_dir = data_root / data_cfg.env_name
+    if data_cfg.data_quality:
+        data_dir = data_dir / data_cfg.data_quality
     if env_name == "LIBERO-Cosmos":
         data_dir = data_root
     trajectories = []
@@ -353,19 +354,24 @@ def main():
         config_path = data_root / "ICRT-MT" / "dataset_config.json"
         assert config_path.exists(), f"ICRT-MT config missing (validated earlier): {config_path}"
         from src.data.icrt_dataset import load_icrt_trajectories
-        proprio_keys = getattr(data_cfg, "proprio_keys", ["observation/cartesian_position", "observation/gripper_position"])
-        action_keys = getattr(data_cfg, "action_keys", ["action/cartesian_position", "action/gripper_position"])
+        proprio_keys = data_cfg.proprio_keys or ["observation/cartesian_position", "observation/gripper_position"]
+        action_keys = data_cfg.action_keys or ["action/cartesian_position", "action/gripper_position"]
         trajectories, prompt_per_task, task_instructions_from_loader = load_icrt_trajectories(
             str(config_path.resolve()),
             proprio_keys=proprio_keys,
             action_keys=action_keys,
-            min_trajectory_length=getattr(data_cfg, "min_trajectory_length", 30),
-            max_trajectory_length=getattr(data_cfg, "max_trajectory_length", 450),
+            min_trajectory_length=data_cfg.min_trajectory_length,
+            max_trajectory_length=data_cfg.max_trajectory_length,
         )
-        if trajectories:
-            state_dim = int(trajectories[0]["observations"].shape[1])
-            action_dim = int(trajectories[0]["actions"].shape[1])
-            log.info("Loaded {} ICRT-MT trajectories from {} (state_dim={}, action_dim={})", len(trajectories), config_path.resolve(), state_dim, action_dim)
+        if not trajectories:
+            raise FileNotFoundError(
+                f"ICRT-MT config at {config_path} found but no trajectories loaded. "
+                "Check that HDF5 paths in dataset_config.json exist (e.g. merged_data_part1.hdf5 in the same directory) "
+                "and that episode lengths are within min_trajectory_length and max_trajectory_length."
+            )
+        state_dim = int(trajectories[0]["observations"].shape[1])
+        action_dim = int(trajectories[0]["actions"].shape[1])
+        log.info("Loaded {} ICRT-MT trajectories from {} (state_dim={}, action_dim={})", len(trajectories), config_path, state_dim, action_dim)
 
     if env_name == "LIBERO-Cosmos":
         from src.data.libero_dataset import load_libero_trajectories
@@ -373,14 +379,14 @@ def main():
         trajectories, prompt_per_task, task_instructions_from_loader = load_libero_trajectories(
             str(data_root),
             manifest_path=str(manifest_path) if manifest_path.exists() else None,
-            repo_id=getattr(data_cfg, "libero_repo_id", "nvidia/LIBERO-Cosmos-Policy"),
+            repo_id=data_cfg.libero_repo_id,
         )
         if trajectories:
             log.info("Loaded {} LIBERO-Cosmos trajectories (manifest: {})", len(trajectories), manifest_path.resolve())
 
     if not trajectories and data_dir.is_dir():
         import pickle
-        for task_id in range(getattr(data_cfg, "num_train_tasks", 1)):
+        for task_id in range(data_cfg.num_train_tasks):
             path = data_dir / f"dataset_task_{task_id}.pkl"
             if path.is_file():
                 with path.open("rb") as f:
@@ -391,7 +397,7 @@ def main():
                     d["terminals"] = d.get("dones", d.get("terminals", np.zeros(len(d["rewards"]))))
                 trajs = convert_data_to_trajectories(d, data_cfg.max_episode_steps, max_trajectories=500)
                 trajectories.extend(trajs)
-        for task_id in range(getattr(data_cfg, "num_tasks", 1)):
+        for task_id in range(data_cfg.num_tasks):
             path = data_dir / f"dataset_task_prompt{task_id}.pkl"
             if path.is_file():
                 with path.open("rb") as f:
@@ -415,7 +421,7 @@ def main():
             }
             for _ in range(n_traj)
         ]
-        prompt_per_task = [sort_trajectories_by_return(trajectories[:5], ascending=False)] * max(1, getattr(data_cfg, "num_tasks", 1))
+        prompt_per_task = [sort_trajectories_by_return(trajectories[:5], ascending=False)] * max(1, data_cfg.num_tasks)
         log.warning("No dataset found at {}; using dummy data for dry run", data_dir.resolve())
 
     dataset = ICLTrajectoryDataset(
@@ -425,21 +431,21 @@ def main():
         return_scale=data_cfg.return_scale,
         device=device,
         prompt_trajectories_per_task=prompt_per_task,
-        context_dim=getattr(data_cfg, "context_dim", 16),
+        context_dim=data_cfg.context_dim,
         state_dim=state_dim,
         act_dim=action_dim,
         prompt_length=data_cfg.prompt_length,
         scale=data_cfg.return_scale,
-        total_epi_per_task=max(1, len(trajectories) // max(1, getattr(data_cfg, "num_train_tasks", 1))),
-        num_context_trajectories=getattr(data_cfg, "num_context_trajectories", 1),
-        context_sort_ascending=getattr(data_cfg, "context_sort_ascending", True),
-        context_sampling=getattr(data_cfg, "context_sampling", "random"),
-        max_total_prompt_length=getattr(data_cfg, "max_total_prompt_length", None),
-        context_style=getattr(data_cfg, "context_style", "subsampled"),
-        lazy_dataset=getattr(data_cfg, "lazy_dataset", True),
-        max_training_examples=getattr(data_cfg, "max_training_examples", 500_000),
-        task_instructions=task_instructions_from_loader if task_instructions_from_loader is not None else getattr(data_cfg, "task_instructions", None),
-        seed=getattr(data_cfg, "seed", 0),
+        total_epi_per_task=max(1, len(trajectories) // max(1, data_cfg.num_train_tasks)),
+        num_context_trajectories=data_cfg.num_context_trajectories,
+        context_sort_ascending=data_cfg.context_sort_ascending,
+        context_sampling=data_cfg.context_sampling,
+        max_total_prompt_length=data_cfg.max_total_prompt_length,
+        context_style=data_cfg.context_style,
+        lazy_dataset=data_cfg.lazy_dataset,
+        max_training_examples=data_cfg.max_training_examples,
+        task_instructions=task_instructions_from_loader if task_instructions_from_loader is not None else data_cfg.task_instructions,
+        seed=data_cfg.seed,
     )
     state_mean = dataset.state_mean
     state_std = dataset.state_std
@@ -448,22 +454,22 @@ def main():
         dataset,
         batch_size=data_cfg.batch_size,
         shuffle=True,
-        num_workers=getattr(data_cfg, "num_workers", 0),
+        num_workers=data_cfg.num_workers,
     )
-    _print_dataset_stats(dataset, loader, env_name=data_cfg.env_name, data_quality=getattr(data_cfg, "data_quality", ""))
+    _print_dataset_stats(dataset, loader, env_name=data_cfg.env_name, data_quality=data_cfg.data_quality or "")
 
     model = build_model(cfg, state_dim, action_dim).to(device)
     _print_model_architecture(model)
     optimizer, scheduler = build_optimizer_scheduler(model, cfg)
-    use_wandb = getattr(args, "wandb", False) or getattr(sys_cfg, "use_wandb", False)
-    run_name = getattr(args, "run_name", None) or getattr(cfg, "run_name", None) or getattr(sys_cfg, "run_name", None)
+    use_wandb = args.wandb or sys_cfg.use_wandb
+    run_name = args.run_name or cfg.run_name or sys_cfg.run_name
     logger = setup_logging(
         log_dir,
         cfg,
         use_wandb=use_wandb,
         run_name=run_name,
-        project=getattr(sys_cfg, "wandb_project", "icl_adaptation"),
-        entity=getattr(sys_cfg, "wandb_entity", "clvr"),
+        project=sys_cfg.wandb_project,
+        entity=sys_cfg.wandb_entity,
     )
     if use_wandb:
         log.info("W&B logging enabled (entity: {}, project: {})", sys_cfg.wandb_entity, sys_cfg.wandb_project)
@@ -495,7 +501,7 @@ def main():
     )
 
     def eval_fn(step):
-        num_rollouts = getattr(cfg.experiment, "num_eval_rollouts", 5)
+        num_rollouts = cfg.experiment.num_eval_rollouts
         metrics = run_rollouts_and_save_viz(
             model=model,
             env_name=env_name,
@@ -526,7 +532,7 @@ def main():
     write_metrics_summary(run_dir, {
         "final_step": final_step,
         "best_metric": best_metric,
-        "best_metric_name": getattr(cfg.experiment, "best_metric_name", "eval/return_mean"),
+        "best_metric_name": cfg.experiment.best_metric_name,
     })
     log.info("Training finished.")
     logger.close()

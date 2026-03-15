@@ -117,7 +117,7 @@ def run_eval_episodes(
         state = env.reset()
         if isinstance(state, tuple):
             state = state[0]
-        context_dim = getattr(model, "context_dim", 16)
+        context_dim = model.context_dim
         states = torch.from_numpy(state).float().reshape(1, -1).to(device)
         contexts = torch.zeros(1, context_dim, device=device)
         actions = torch.zeros(0, model.act_dim, device=device)

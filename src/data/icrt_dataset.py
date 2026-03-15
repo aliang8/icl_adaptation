@@ -89,6 +89,13 @@ def open_icrt_hdf5(config_path: Union[str, Path]):
     if isinstance(hdf5_keys, str):
         hdf5_keys = [hdf5_keys]
 
+    for p in dataset_paths:
+        if not Path(p).exists():
+            raise FileNotFoundError(f"ICRT HDF5 file not found: {p} (from {path})")
+    for k in hdf5_keys:
+        if not Path(k).exists():
+            raise FileNotFoundError(f"ICRT HDF5 keys file not found: {k} (from {path})")
+
     files = [h5py.File(p, "r") for p in dataset_paths]
     key_lists = [json.load(open(k)) for k in hdf5_keys]
     keys_to_file = {}
@@ -96,6 +103,16 @@ def open_icrt_hdf5(config_path: Union[str, Path]):
         for k in klist:
             keys_to_file[k] = f
     return files, keys_to_file
+
+
+def _key_in_group(grp, key: str):
+    """Resolve key in group: try full key then suffix after last '/' (e.g. observation/cartesian_position -> cartesian_position)."""
+    if key in grp:
+        return grp[key]
+    short = key.split("/")[-1] if "/" in key else key
+    if short in grp:
+        return grp[short]
+    return None
 
 
 def read_episode_obs_act(
@@ -108,6 +125,7 @@ def read_episode_obs_act(
     """
     Read one episode: observations (images + proprio) and actions.
     Returns (obs_dict, action_dict, language_instruction or None).
+    Keys can be full path (e.g. observation/cartesian_position) or short name; both are tried.
     """
     grp = h5file[episode_key]
     obs_grp = grp.get("observation", grp)
@@ -115,19 +133,22 @@ def read_episode_obs_act(
 
     obs = {}
     for k in image_keys:
-        if k in obs_grp:
-            buf = obs_grp[k][:]
+        ds = _key_in_group(obs_grp, k)
+        if ds is not None:
+            buf = ds[:]
             if buf.dtype == np.uint8 and buf.ndim == 1:
                 buf = np.frombuffer(buf.tobytes(), dtype=np.uint8)
             obs[k] = buf
     for k in proprio_keys:
-        if k in obs_grp:
-            obs[k] = np.array(obs_grp[k][:], dtype=np.float32)
+        ds = _key_in_group(obs_grp, k)
+        if ds is not None:
+            obs[k] = np.array(ds[:], dtype=np.float32)
 
     actions = {}
     for k in action_keys:
-        if k in act_grp:
-            actions[k] = np.array(act_grp[k][:], dtype=np.float32)
+        ds = _key_in_group(act_grp, k)
+        if ds is not None:
+            actions[k] = np.array(ds[:], dtype=np.float32)
 
     lang = None
     for name in ("language_instruction", "language_instruction_2", "language_instruction_3"):
@@ -200,6 +221,12 @@ def load_icrt_trajectories(
 
     task_instructions = get_task_instructions_from_verbs(verb_to_episode)
     files, keys_to_file = open_icrt_hdf5(config_path)
+    n_episodes = sum(len(v) for v in verb_to_episode.values())
+    n_in_file = sum(1 for keys in verb_to_episode.values() for ek in keys if ek in keys_to_file)
+    skipped_no_key = 0
+    skipped_no_obs = 0
+    skipped_no_act = 0
+    skipped_length = 0
     try:
         trajectories = []
         task_to_trajs: Dict[str, List[Dict]] = {t: [] for t in task_instructions}
@@ -207,6 +234,7 @@ def load_icrt_trajectories(
         for task_name, episode_keys in verb_to_episode.items():
             for ep_key in episode_keys:
                 if ep_key not in keys_to_file:
+                    skipped_no_key += 1
                     continue
                 if max_episodes and len(trajectories) >= max_episodes:
                     break
@@ -223,6 +251,7 @@ def load_icrt_trajectories(
                             arr = arr.reshape(-1, 1)
                         obs_list.append(arr)
                 if not obs_list:
+                    skipped_no_obs += 1
                     continue
                 observations = np.concatenate(obs_list, axis=-1)
                 act_list = []
@@ -233,6 +262,7 @@ def load_icrt_trajectories(
                             arr = arr.reshape(-1, 1)
                         act_list.append(arr)
                 if not act_list:
+                    skipped_no_act += 1
                     continue
                 actions = np.concatenate(act_list, axis=-1)
                 T = observations.shape[0]
@@ -241,6 +271,7 @@ def load_icrt_trajectories(
                     observations = observations[:T]
                     actions = actions[:T]
                 if T < min_trajectory_length or T > max_trajectory_length:
+                    skipped_length += 1
                     continue
                 rewards = np.zeros(T, dtype=np.float32)
                 rewards[-1] = 1.0
@@ -262,6 +293,14 @@ def load_icrt_trajectories(
         prompt_per_task = [task_to_trajs.get(ti, [])[:5] for ti in task_instructions]
         if not any(prompt_per_task):
             prompt_per_task = [trajectories[:5]] * max(1, len(task_instructions))
+        if not trajectories:
+            raise ValueError(
+                f"No ICRT trajectories loaded (config: {config_path}). "
+                f"Episodes in verb_to_episode: {n_episodes}, in keys_to_file: {n_in_file}. "
+                f"Skipped: no_key={skipped_no_key}, no_proprio={skipped_no_obs}, no_action={skipped_no_act}, length_filter={skipped_length} "
+                f"(min_len={min_trajectory_length}, max_len={max_trajectory_length}). "
+                "Check HDF5 structure (observation/action groups and key names) and length limits."
+            )
         return trajectories, prompt_per_task, task_instructions
     finally:
         for f in files:

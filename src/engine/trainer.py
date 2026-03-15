@@ -36,13 +36,13 @@ class Trainer:
         self.logger = logger
         self.scaler = scaler
         self.grad_clip_norm = grad_clip_norm
-        self.exp_cfg = getattr(cfg, "experiment", None) or getattr(cfg, "experiment", cfg)
-        self.sys_cfg = getattr(cfg, "system", None) or getattr(cfg, "system", cfg)
-        self.optim_cfg = getattr(cfg, "optim", None) or getattr(cfg, "optim", cfg)
-        self.save_dir = getattr(self, "_save_dir_override", None) or getattr(self.sys_cfg, "save_dir", "outputs/checkpoints")
-        self.rank = getattr(self.sys_cfg, "rank", 0)
-        self.best_metric_name = getattr(self.exp_cfg, "best_metric_name", "eval/return_mean")
-        self.best_metric_mode = getattr(self.exp_cfg, "best_metric_mode", "max")
+        self.exp_cfg = cfg.experiment
+        self.sys_cfg = cfg.system
+        self.optim_cfg = cfg.optim
+        self.save_dir = getattr(self, "_save_dir_override", None) or self.sys_cfg.save_dir
+        self.rank = self.sys_cfg.rank
+        self.best_metric_name = self.exp_cfg.best_metric_name
+        self.best_metric_mode = self.exp_cfg.best_metric_mode
         self._is_better = (max if self.best_metric_mode == "max" else min)
 
     def train_step(
@@ -89,12 +89,12 @@ class Trainer:
         eval_fn(step) -> dict of metrics (e.g. eval/return_mean).
         Returns (final_global_step, best_metric).
         """
-        max_steps = getattr(self.exp_cfg, "max_steps", 500_000)
-        eval_every = getattr(self.exp_cfg, "eval_every_steps", 1000)
-        save_latest_every = getattr(self.exp_cfg, "save_latest_every_steps", 5000)
-        save_periodic_every = getattr(self.exp_cfg, "save_periodic_every_steps", 25000)
-        save_best = getattr(self.exp_cfg, "save_best", True)
-        export_final = getattr(self.exp_cfg, "export_final", True)
+        max_steps = self.exp_cfg.max_steps
+        eval_every = self.exp_cfg.eval_every_steps
+        save_latest_every = self.exp_cfg.save_latest_every_steps
+        save_periodic_every = self.exp_cfg.save_periodic_every_steps
+        save_best = self.exp_cfg.save_best
+        export_final = self.exp_cfg.export_final
 
         global_step = global_step_start
         best_metric = best_metric_start

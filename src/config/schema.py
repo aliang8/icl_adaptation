@@ -56,6 +56,14 @@ class DataConfig:
     use_language: bool = False
     image_keys: Optional[List[str]] = None
     image_size: Optional[List[int]] = None
+    proprio_keys: Optional[List[str]] = None
+    action_keys: Optional[List[str]] = None
+    min_trajectory_length: int = 10
+    max_trajectory_length: int = 450
+    # LIBERO-Cosmos
+    libero_manifest: Optional[str] = None
+    libero_repo_id: str = "nvidia/LIBERO-Cosmos-Policy"
+    seed: int = 0
 
 
 @dataclass
