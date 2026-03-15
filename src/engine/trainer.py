@@ -1,6 +1,6 @@
 """
 Training loop: forward, loss, backward, grad clip, optimizer step, scheduler step,
-log metrics, checkpoint (latest/best/periodic), eval hook.
+log metrics, checkpoint (latest/best/periodic), eval hook. Uses tqdm progress bar.
 """
 import os
 from typing import Any, Callable, Dict, Optional, Tuple
@@ -8,6 +8,7 @@ from typing import Any, Callable, Dict, Optional, Tuple
 import torch
 from torch.utils.data import DataLoader
 from loguru import logger as loguru_logger
+from tqdm import tqdm
 
 from src.engine.checkpointing import save_checkpoint, load_checkpoint, save_inference_artifact
 from src.engine.logging import Logger, log_metrics
@@ -24,8 +25,10 @@ class Trainer:
         logger: Logger,
         scaler: Optional[Any] = None,
         grad_clip_norm: float = 0.25,
+        save_dir: Optional[str] = None,
     ):
         self.model = model
+        self._save_dir_override = save_dir
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.device = device
@@ -36,7 +39,7 @@ class Trainer:
         self.exp_cfg = getattr(cfg, "experiment", None) or getattr(cfg, "experiment", cfg)
         self.sys_cfg = getattr(cfg, "system", None) or getattr(cfg, "system", cfg)
         self.optim_cfg = getattr(cfg, "optim", None) or getattr(cfg, "optim", cfg)
-        self.save_dir = getattr(self.sys_cfg, "save_dir", "outputs/checkpoints")
+        self.save_dir = getattr(self, "_save_dir_override", None) or getattr(self.sys_cfg, "save_dir", "outputs/checkpoints")
         self.rank = getattr(self.sys_cfg, "rank", 0)
         self.best_metric_name = getattr(self.exp_cfg, "best_metric_name", "eval/return_mean")
         self.best_metric_mode = getattr(self.exp_cfg, "best_metric_mode", "max")
@@ -78,6 +81,7 @@ class Trainer:
         eval_fn: Optional[Callable[[int], Dict[str, float]]] = None,
         state_mean: Optional[Any] = None,
         state_std: Optional[Any] = None,
+        export_dir: Optional[str] = None,
     ) -> Tuple[int, float]:
         """
         Run training until max_steps. Saves latest/best/periodic checkpoints.
@@ -98,12 +102,20 @@ class Trainer:
         iter_loader = iter(train_loader)
         loguru_logger.info("Training started: max_steps={}, eval_every={}, save_latest_every={}", max_steps, eval_every, save_latest_every)
 
+        pbar = tqdm(
+            total=max_steps,
+            initial=global_step_start,
+            unit="step",
+            dynamic_ncols=True,
+            leave=True,
+            desc="Train",
+        )
+
         while global_step <= max_steps:
             try:
                 batch = next(iter_loader)
             except StopIteration:
                 epoch += 1
-                loguru_logger.debug("Epoch {} | global_step {}", epoch, global_step)
                 iter_loader = iter(train_loader)
                 batch = next(iter_loader)
             batch = tuple(
@@ -121,15 +133,21 @@ class Trainer:
                 gpu_mem_mb=gpu_mem,
             )
 
+            pbar.update(1)
+            pbar.set_postfix(loss=f"{loss_val:.4f}", lr=f"{lr:.2e}", gn=f"{grad_norm_val:.3f}")
+
             # Eval
             eval_metrics = None
             if eval_fn and global_step % eval_every == 0 and global_step > 0:
-                loguru_logger.info("Evaluating at step {}...", global_step)
+                pbar.write(f"Evaluating at step {global_step}...")
                 eval_metrics = eval_fn(global_step)
                 log_metrics(self.logger, global_step, loss_val, lr, eval_metrics=eval_metrics)
                 current = eval_metrics.get(self.best_metric_name)
                 if current is not None:
-                    loguru_logger.info("Step {} | loss={:.4f} | lr={:.2e} | {}={:.4f}", global_step, loss_val, lr, self.best_metric_name, current)
+                    pbar.write(
+                        f"Step {global_step} | loss={loss_val:.4f} | lr={lr:.2e} | {self.best_metric_name}={current:.4f}"
+                    )
+                    pbar.set_postfix(loss=f"{loss_val:.4f}", lr=f"{lr:.2e}", eval=f"{current:.4f}")
                     if self._is_better(current, best_metric):
                         best_metric = current
                         if save_best and self.rank == 0:
@@ -146,7 +164,7 @@ class Trainer:
                                 kind="best",
                                 rank=self.rank,
                             )
-                            loguru_logger.info("Saved best checkpoint ({}={:.4f})", self.best_metric_name, best_metric)
+                            pbar.write(f"Saved best checkpoint ({self.best_metric_name}={best_metric:.4f})")
 
             # Checkpoints
             if self.rank == 0:
@@ -183,9 +201,13 @@ class Trainer:
             if global_step > max_steps:
                 break
 
+        pbar.close()
         if export_final and self.rank == 0:
+            out_dir = export_dir or self.save_dir
+            if export_dir:
+                os.makedirs(out_dir, exist_ok=True)
             save_inference_artifact(
-                self.save_dir,
+                out_dir,
                 self.model,
                 self.cfg,
                 state_mean=state_mean,

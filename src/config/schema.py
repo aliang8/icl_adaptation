@@ -45,6 +45,17 @@ class DataConfig:
     context_sort_ascending: bool = True
     context_sampling: str = "random"
     max_total_prompt_length: Optional[int] = None
+    # "subsampled" = prompt_length steps per context traj; "full_trajectory" = entire traj (capped by max_total_prompt_length)
+    context_style: str = "subsampled"
+    lazy_dataset: bool = True
+    max_training_examples: int = 500_000
+    task_instructions: Optional[List[str]] = None
+    # ICRT-style: language + multi-view images (robot manipulation)
+    dataset_config_json: Optional[str] = None
+    use_vision: bool = False
+    use_language: bool = False
+    image_keys: Optional[List[str]] = None
+    image_size: Optional[List[int]] = None
 
 
 @dataclass
@@ -63,9 +74,11 @@ class SystemConfig:
     device: str = "cuda:0"
     seed: int = 412
     deterministic: bool = True
-    # checkpoint dirs
+    # run directory: outputs/<project_name>/<date>/<run_name>__seed_<X>__<hash>/
     output_dir: str = "outputs"
-    save_dir: str = "outputs/checkpoints"
+    project_name: str = "icl_adaptation"
+    # run_name set from CLI or config; used with seed and git hash for run slug
+    save_dir: str = "outputs/checkpoints"  # deprecated when run_dir used; ckpts live under run_dir/ckpts
     # distributed (rank 0 saves)
     world_size: int = 1
     rank: int = 0
@@ -81,6 +94,7 @@ class ExperimentConfig:
     max_steps: int = 500_000
     eval_every_steps: int = 1000
     num_eval_episodes: int = 5
+    num_eval_rollouts: int = 5  # number of env rollouts per eval (for real eval)
     warm_train_steps: int = 70_000
     zero_shot: bool = False
     # checkpoint types

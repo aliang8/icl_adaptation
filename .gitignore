@@ -12,6 +12,9 @@ build/
 # Pickle and large data
 *.pkl
 *.pickle
+*.hdf5
+*.h5
+*.json
 
 # Virtual envs
 .venv/

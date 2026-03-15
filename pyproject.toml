@@ -21,6 +21,8 @@ dependencies = [
 [project.optional-dependencies]
 # Minari: offline RL datasets (Gymnasium + MuJoCo 2, no mujoco_py / no Cython).
 d4rl = ["minari[all]"]
+# ICRT-style: robot manipulation with language + multi-view images (HuggingFace + HDF5 + viz).
+icrt = ["huggingface_hub>=0.20.0", "h5py>=3.8.0", "matplotlib>=3.5.0"]
 dev = ["pytest", "ruff"]
 
 [tool.setuptools.packages.find]

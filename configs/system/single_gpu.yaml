@@ -2,7 +2,8 @@ device: cuda:0
 seed: 412
 deterministic: true
 output_dir: outputs
-save_dir: outputs/checkpoints
+project_name: icl_adaptation  # run dir: outputs/<project_name>/<date>/<run_name>__seed_<X>__<hash>/
+save_dir: outputs/checkpoints  # overridden at runtime to run_dir/ckpts
 world_size: 1
 rank: 0
 # W&B: set use_wandb: true or pass --wandb

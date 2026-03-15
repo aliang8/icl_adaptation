@@ -62,13 +62,31 @@ Configs are **compositional** (Hydra):
 - `configs/config.yaml`: `defaults: [model: transformer, data: ant_dir, optim: adamw, system: single_gpu, experiment: base]`
 - Typed schema lives in `src/config/schema.py` (ModelConfig, DataConfig, OptimConfig, SystemConfig, ExperimentConfig).
 
-Every run saves a **resolved config** under `outputs/resolved_config.yaml` and the checkpoint stores the exact resolved config for reproducibility.
+## Run directory (experiment layout)
+
+Each training run writes to a **dated, named directory** with a fixed layout:
+
+```
+outputs/<project_name>/<YYYY-MM-DD>/<run_name>__seed_<X>__<git_hash>/
+  .hydra/           config.yaml, overrides.yaml
+  logs/             train.log
+  metrics/          history.jsonl, summary.json
+  ckpts/            last/, best/, step_00050000/ ... (checkpoint.pt + metadata.json)
+  artifacts/        inference/ (model_export.pt), export/
+  eval/             val/, test/ (metrics.json, per_task.json)
+  viz/samples/      step_*/ rollout_*.png, returns.png (eval rollout visualizations)
+  code/             git.txt, diff.patch
+  README.md
+```
+
+- **Experiment name**: `run_name` from `--run-name` or config; slug includes `seed` and short git hash for reproducibility.
+- **Resume**: pass path to a checkpoint file under that run, e.g. `--resume outputs/icl_adaptation/2026-03-15/my_run__seed_0__a1b2c3d/ckpts/last/checkpoint.pt`; the same run directory is reused for logs and later checkpoints.
+- **Eval**: at each eval step, rollout visualizations are saved under `viz/samples/step_XXXXX/` (state/action curves and return bars when an env is available).
 
 ## Checkpoints
 
-- **Training checkpoint** (resume state): model, optimizer, scheduler, scaler, epoch, global_step, best_metric, full config, git commit, RNG state.
-- **Three types**: `checkpoint_latest.pt`, `checkpoint_best.pt`, and periodic `checkpoint_step_*.pt`.
-- **Inference artifact**: separate export via `--export-only` (model weights + config + state_mean/state_std). Use for deployment, not for resuming training.
+- **Training checkpoint** (resume state): model, optimizer, scheduler, scaler, epoch, global_step, best_metric, full config, git commit, RNG state. Stored under `ckpts/last/`, `ckpts/best/`, `ckpts/step_*/` as `checkpoint.pt` plus `metadata.json`.
+- **Inference artifact**: exported under `artifacts/inference/model_export.pt` at end of training, or via `--export-only` (model weights + config + state_mean/state_std). Use for deployment, not for resuming.
 
 Loading untrusted checkpoints: use `weights_only=True` when loading (see PyTorch docs and `src/engine/checkpointing.py`).
 
@@ -90,13 +108,15 @@ Use the output pkl as your dataset; see script docstring for trajectory format (
 Dataset layout:
 
 - **HalfCheetah (Minari)**: `datasets/HalfCheetah-v2/<data_quality>/trajectories.pkl` (created by `scripts/download_d4rl_halfcheetah.py` via Minari). Use `data_quality: medium_expert` (or `medium`, `expert`) in config and `--override data=halfcheetah`.
+- **ICRT-MT (language + multi-view images)**: `datasets/ICRT-MT/` from `uv run python scripts/download_icrt_dataset.py --output-dir datasets` ([HuggingFace](https://huggingface.co/datasets/Ravenh97/ICRT-MT)). After `uv sync --extra icrt`, visualize with `uv run python scripts/visualize_icrt_data.py`. Use `configs/data/icrt_mt.yaml` and `ICRTDecisionTransformer` for language-conditioned, vision-based in-context policy. See [docs/ICRT_MT_TRAINING.md](docs/ICRT_MT_TRAINING.md) (training only, no eval) and SETUP.md “Optional: ICRT-style”.
+- **LIBERO-Cosmos-Policy**: [nvidia/LIBERO-Cosmos-Policy](https://huggingface.co/datasets/nvidia/LIBERO-Cosmos-Policy) — download with `uv run python scripts/download_libero_cosmos.py --output-dir datasets`, train with `data=libero_cosmos`, run in-distribution eval with `scripts/run_libero_eval.py`. See [docs/LIBERO_COSMOS_TRAINING.md](docs/LIBERO_COSMOS_TRAINING.md).
 - **AntDir / multi-task**: `datasets/<env_name>/<data_quality>/dataset_task_<id>.pkl` and `dataset_task_prompt<id>.pkl` (see Meta-DT data collection).  
 If no data is found, the trainer falls back to minimal dummy data for a dry run.
 
 ## Logging
 
 - **TensorBoard**: `outputs/logs`.
-- **W&B**: `python -m src.train --wandb` (and optional `--run-name <name>`). Logs train loss, lr, grad norm, GPU memory, eval metric, and full config.
+- **W&B**: `uv run python -m src.train --wandb` (and optional `--run-name <name>`). Logs train loss, lr, grad norm, GPU memory, eval metric, and full config.
 - **Loguru**: progress messages (e.g. “Evaluating at step …”, “Saved best checkpoint”, “Training started: max_steps=…”) to stderr. Configure level/format via `loguru` API if needed.
 
 ## Other offline RL benchmarks (trajectories with different returns)

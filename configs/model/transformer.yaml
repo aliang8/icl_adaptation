@@ -4,7 +4,8 @@ act_dim: 8
 context_dim: 16
 hidden_size: 128
 max_length: 20
-max_ep_len: 200
+# Match data max_episode_steps (e.g. HalfCheetah 1000) so timestep embedding covers full episode
+max_ep_len: 1000
 n_layer: 3
 n_head: 1
 n_inner: null

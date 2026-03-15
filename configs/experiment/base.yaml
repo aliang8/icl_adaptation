@@ -1,6 +1,7 @@
 max_steps: 500000
 eval_every_steps: 1000
 num_eval_episodes: 5
+num_eval_rollouts: 5  # number of env rollouts per evaluation
 warm_train_steps: 70000
 zero_shot: false
 save_latest_every_steps: 5000

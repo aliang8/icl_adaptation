@@ -18,3 +18,10 @@ num_context_trajectories: 3
 context_sort_ascending: true
 context_sampling: random
 max_total_prompt_length: 60
+# subsampled = prompt_length (5) steps per context traj; full_trajectory = whole traj, cap by max_total_prompt_length
+context_style: subsampled
+# Lazy build: sample on the fly up to max_training_examples (faster startup; no prebuild of all segments)
+lazy_dataset: true
+max_training_examples: 500000
+# ICRT-style language instructions (one per task); null for HalfCheetah, set for robot manipulation later
+task_instructions: null

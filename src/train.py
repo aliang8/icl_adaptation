@@ -18,6 +18,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.engine.checkpointing import load_checkpoint, save_inference_artifact
 from src.engine.logging import setup_logging
+from src.engine.run_dir import (
+    create_run_dir,
+    write_hydra_config,
+    append_metrics_history,
+    write_metrics_summary,
+)
+from src.engine.eval_viz import run_rollouts_and_save_viz
 from src.engine.trainer import Trainer
 from src.models import MetaDecisionTransformer, RNNContextEncoder
 from src.data import ICLTrajectoryDataset
@@ -60,10 +67,51 @@ def _print_model_architecture(model, title="Model architecture"):
     # Optional: full repr in a collapsed/smaller panel
     console.print(Panel(str(model), title="[dim]Full model repr[/dim]", border_style="dim"))
 
+
+def _print_dataset_stats(dataset, loader, env_name: str = "", data_quality: str = ""):
+    """Print dataset statistics with rich formatting."""
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.table import Table
+
+    n_trajectories = len(dataset.trajectories)
+    n_segments = len(dataset)
+    total_steps = sum(t["rewards"].shape[0] for t in dataset.trajectories)
+
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("Stat", style="cyan")
+    table.add_column("Value", justify="right", style="green")
+    table.add_row("Trajectories", f"{n_trajectories:,}")
+    table.add_row("Segments (training)", f"{n_segments:,}")
+    table.add_row("Total steps", f"{total_steps:,}")
+    table.add_row("Return (min)", f"{getattr(dataset, 'return_min', 0):.2f}")
+    table.add_row("Return (max)", f"{getattr(dataset, 'return_max', 0):.2f}")
+    table.add_row("Return (mean)", f"{getattr(dataset, 'return_avg', 0):.2f}")
+    table.add_row("State dim", str(dataset.state_dim))
+    table.add_row("Action dim", str(dataset.act_dim))
+    table.add_row("Horizon", str(dataset.horizon))
+    table.add_row("Max episode steps", str(dataset.max_episode_steps))
+    table.add_row("Context trajectories", str(dataset.num_context_trajectories))
+    table.add_row("Prompt length", str(dataset.prompt_length))
+    table.add_row("Total prompt length", str(dataset.total_prompt_len))
+    table.add_row("Batch size", str(loader.batch_size))
+    table.add_row("Batches per epoch", f"{len(loader):,}")
+
+    title = "Dataset stats"
+    if env_name or data_quality:
+        title += f" — {env_name or '?'}"
+        if data_quality:
+            title += f" / {data_quality}"
+    console = Console()
+    console.print(Panel(table, title=f"[bold]{title}[/bold]", border_style="magenta"))
+
+
 # Env observation/action dims (for known envs)
 ENV_DIMS = {
     "HalfCheetah-v2": (17, 6),
     "AntDir-v0": (27, 8),
+    "ICRT-MT": (8, 8),  # proprio (e.g. 3+1 or 6+1), action same
+    "LIBERO-Cosmos": (9, 7),  # proprio 9, action 7
     "WalkerRandParams-v0": (17, 6),
     "HopperRandParams-v0": (11, 3),
 }
@@ -112,10 +160,17 @@ def build_optimizer_scheduler(model, cfg):
 
 
 def train_step_fn(model, batch):
-    """One step: forward, MSE loss on actions, return (loss, grad_norm)."""
+    """One step: forward, MSE loss on actions, return (loss, grad_norm). Batch includes 15 elements (14 tensors + instructions)."""
     (states, contexts, actions, rewards, dones, rtg, timesteps, masks,
-     prompt_s, prompt_a, prompt_r, prompt_rtg, prompt_ts, prompt_m) = batch
+     prompt_s, prompt_a, prompt_r, prompt_rtg, prompt_ts, prompt_m, instructions) = batch
+    # instructions: ICRT-style language (one per sample); unused for HalfCheetah, used later for robot manipulation
+    # Trim last step from all prompt tensors so lengths match (prompt_rtg is used as returns_to_go and trimmed to T-1)
     prompt_rtg = prompt_rtg[:, :-1, :]
+    prompt_s = prompt_s[:, :-1, :]
+    prompt_a = prompt_a[:, :-1, :]
+    prompt_r = prompt_r[:, :-1, :]
+    prompt_ts = prompt_ts[:, :-1]
+    prompt_m = prompt_m[:, :-1]
     prompt = (prompt_s, prompt_a, prompt_r, prompt_rtg, prompt_ts, prompt_m)
     state_preds, action_preds, return_preds = model(
         states, contexts, actions, rewards, rtg[:, :-1], timesteps,
@@ -132,6 +187,12 @@ def train_step_fn(model, batch):
 
 def main():
     import argparse
+    # Use spawn for DataLoader workers so CUDA is not re-initialized in forked subprocesses.
+    try:
+        import torch.multiprocessing as mp
+        mp.set_start_method("spawn", force=True)
+    except RuntimeError:
+        pass
     parser = argparse.ArgumentParser()
     parser.add_argument("--config-dir", type=str, default="configs", help="Hydra config directory")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume")
@@ -172,27 +233,69 @@ def main():
     env_name = getattr(data_cfg, "env_name", "HalfCheetah-v2")
     state_dim, action_dim = ENV_DIMS.get(env_name, (cfg.model.state_dim, cfg.model.act_dim))
     log.info("Env {} -> state_dim={}, action_dim={}", env_name, state_dim, action_dim)
-    save_dir = os.path.join(sys_cfg.output_dir, "checkpoints")
-    os.makedirs(save_dir, exist_ok=True)
-    log_dir = os.path.join(sys_cfg.output_dir, "logs")
-    os.makedirs(log_dir, exist_ok=True)
 
-    # Save resolved config
-    with open(os.path.join(sys_cfg.output_dir, "resolved_config.yaml"), "w") as f:
-        f.write(OmegaConf.to_yaml(cfg))
+    # Run directory: outputs/<project_name>/<date>/<run_name>__seed_X__<hash>/
+    def _infer_run_dir(ckpt_path: str) -> Path:
+        p = Path(ckpt_path).resolve()
+        if "ckpts" in p.parts:
+            idx = p.parts.index("ckpts")
+            return Path(*p.parts[:idx]).resolve()
+        return p.parent.parent
+
+    run_name = getattr(args, "run_name", None) or getattr(cfg, "run_name", None) or getattr(sys_cfg, "run_name", None) or "train"
+    project_name = getattr(sys_cfg, "project_name", "icl_adaptation")
+    seed = getattr(sys_cfg, "seed", 412)
+    if args.resume and os.path.isfile(args.resume):
+        run_dir = _infer_run_dir(args.resume)
+        save_dir = str(run_dir / "ckpts")
+        log_dir = str(run_dir / "logs")
+        run_dir.mkdir(parents=True, exist_ok=True)
+        Path(save_dir).mkdir(parents=True, exist_ok=True)
+        Path(log_dir).mkdir(parents=True, exist_ok=True)
+        log.info("Resuming: run_dir={}", run_dir)
+    elif args.export_only and os.path.isfile(args.export_only):
+        run_dir = _infer_run_dir(args.export_only)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "artifacts" / "inference").mkdir(parents=True, exist_ok=True)
+        save_dir = str(run_dir / "ckpts")
+        log_dir = str(run_dir / "logs")
+    else:
+        run_dir = create_run_dir(
+            project_name=project_name,
+            run_name=run_name,
+            seed=seed,
+            base_dir=getattr(sys_cfg, "output_dir", "outputs"),
+            overrides=overrides,
+        )
+        write_hydra_config(run_dir, cfg, overrides=overrides)
+        save_dir = str(run_dir / "ckpts")
+        log_dir = str(run_dir / "logs")
+        log.info("Run dir: {}", run_dir)
+
+    # Optional: log to run_dir/logs/train.log
+    train_log = Path(log_dir) / "train.log"
+    try:
+        log.add(train_log, level="INFO", format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}")
+    except Exception:
+        pass
     _print_config(cfg)
 
     if args.export_only:
         model = build_model(cfg, state_dim, action_dim)
         load_checkpoint(args.export_only, model, device=device, weights_only=True)
-        save_inference_artifact(save_dir, model, cfg, filename="model_export.pt", rank=0)
-        log.info("Exported model_export.pt to {}", save_dir)
+        export_dir = run_dir / "artifacts" / "inference"
+        export_dir.mkdir(parents=True, exist_ok=True)
+        save_inference_artifact(str(export_dir), model, cfg, filename="model_export.pt", rank=0)
+        log.info("Exported model_export.pt to {}", export_dir)
         return
 
-    # Build data: D4RL HalfCheetah (trajectories.pkl) or AntDir-style (dataset_task_*.pkl) or dummy
-    data_dir = os.path.join(data_cfg.data_dir, data_cfg.env_name, data_cfg.data_quality)
+    # Build data: D4RL HalfCheetah, LIBERO-Cosmos, AntDir-style (dataset_task_*.pkl), or dummy
+    data_dir = os.path.join(data_cfg.data_dir, getattr(data_cfg, "env_name", ""), getattr(data_cfg, "data_quality", ""))
+    if env_name == "LIBERO-Cosmos":
+        data_dir = data_cfg.data_dir
     trajectories = []
     prompt_per_task = []
+    task_instructions_from_loader = None
 
     if env_name == "HalfCheetah-v2":
         from src.data.d4rl_loader import load_halfcheetah_trajectories
@@ -203,6 +306,37 @@ def main():
         )
         if trajectories:
             log.info("Loaded {} HalfCheetah trajectories (mixed returns) from {}", len(trajectories), data_dir)
+
+    if env_name == "ICRT-MT":
+        config_json = getattr(data_cfg, "dataset_config_json", None)
+        if config_json and os.path.isfile(config_json):
+            from src.data.icrt_dataset import load_icrt_trajectories
+            proprio_keys = getattr(data_cfg, "proprio_keys", ["observation/cartesian_position", "observation/gripper_position"])
+            action_keys = getattr(data_cfg, "action_keys", ["action/cartesian_position", "action/gripper_position"])
+            trajectories, prompt_per_task, task_instructions_from_loader = load_icrt_trajectories(
+                config_json,
+                proprio_keys=proprio_keys,
+                action_keys=action_keys,
+                min_trajectory_length=getattr(data_cfg, "min_trajectory_length", 30),
+                max_trajectory_length=getattr(data_cfg, "max_trajectory_length", 450),
+            )
+            if trajectories:
+                state_dim = int(trajectories[0]["observations"].shape[1])
+                action_dim = int(trajectories[0]["actions"].shape[1])
+                log.info("Loaded {} ICRT-MT trajectories from {} (state_dim={}, action_dim={})", len(trajectories), config_json, state_dim, action_dim)
+        else:
+            log.warning("ICRT-MT dataset_config_json not found or not set: {}; run scripts/download_icrt_dataset.py", config_json)
+
+    if env_name == "LIBERO-Cosmos":
+        from src.data.libero_dataset import load_libero_trajectories
+        manifest = getattr(data_cfg, "libero_manifest", None) or os.path.join(data_cfg.data_dir, "LIBERO-Cosmos-Policy", "manifest.json")
+        trajectories, prompt_per_task, task_instructions_from_loader = load_libero_trajectories(
+            data_cfg.data_dir,
+            manifest_path=manifest if os.path.isfile(manifest) else None,
+            repo_id=getattr(data_cfg, "libero_repo_id", "nvidia/LIBERO-Cosmos-Policy"),
+        )
+        if trajectories:
+            log.info("Loaded {} LIBERO-Cosmos trajectories (manifest: {})", len(trajectories), manifest)
 
     if not trajectories and os.path.isdir(data_dir):
         import pickle
@@ -251,7 +385,7 @@ def main():
         return_scale=data_cfg.return_scale,
         device=device,
         prompt_trajectories_per_task=prompt_per_task,
-        context_dim=data_cfg.context_dim,
+        context_dim=getattr(data_cfg, "context_dim", 16),
         state_dim=state_dim,
         act_dim=action_dim,
         prompt_length=data_cfg.prompt_length,
@@ -261,6 +395,11 @@ def main():
         context_sort_ascending=getattr(data_cfg, "context_sort_ascending", True),
         context_sampling=getattr(data_cfg, "context_sampling", "random"),
         max_total_prompt_length=getattr(data_cfg, "max_total_prompt_length", None),
+        context_style=getattr(data_cfg, "context_style", "subsampled"),
+        lazy_dataset=getattr(data_cfg, "lazy_dataset", True),
+        max_training_examples=getattr(data_cfg, "max_training_examples", 500_000),
+        task_instructions=task_instructions_from_loader if task_instructions_from_loader is not None else getattr(data_cfg, "task_instructions", None),
+        seed=getattr(data_cfg, "seed", 0),
     )
     state_mean = dataset.state_mean
     state_std = dataset.state_std
@@ -271,6 +410,7 @@ def main():
         shuffle=True,
         num_workers=getattr(data_cfg, "num_workers", 0),
     )
+    _print_dataset_stats(dataset, loader, env_name=data_cfg.env_name, data_quality=getattr(data_cfg, "data_quality", ""))
 
     model = build_model(cfg, state_dim, action_dim).to(device)
     _print_model_architecture(model)
@@ -311,14 +451,29 @@ def main():
         cfg=cfg,
         logger=logger,
         grad_clip_norm=cfg.optim.grad_clip_norm,
+        save_dir=save_dir,
     )
 
     def eval_fn(step):
-        # Placeholder: real eval would run env with model.get_action and context encoder
-        return {"eval/return_mean": 0.0}
+        num_rollouts = getattr(cfg.experiment, "num_eval_rollouts", 5)
+        metrics = run_rollouts_and_save_viz(
+            model=model,
+            env_name=env_name,
+            state_mean=state_mean,
+            state_std=state_std,
+            device=device,
+            run_dir=run_dir,
+            step=step,
+            num_rollouts=num_rollouts,
+            max_episode_steps=data_cfg.max_episode_steps,
+            scale=data_cfg.return_scale,
+        )
+        append_metrics_history(run_dir, step, metrics)
+        return metrics
 
     log.info("Starting training loop (max_steps={})", cfg.experiment.max_steps)
-    trainer.run_training(
+    export_dir = str(run_dir / "artifacts" / "inference")
+    final_step, best_metric = trainer.run_training(
         train_loader=loader,
         global_step_start=global_step_start,
         best_metric_start=best_metric_start,
@@ -326,7 +481,13 @@ def main():
         eval_fn=eval_fn,
         state_mean=state_mean,
         state_std=state_std,
+        export_dir=export_dir,
     )
+    write_metrics_summary(run_dir, {
+        "final_step": final_step,
+        "best_metric": best_metric,
+        "best_metric_name": getattr(cfg.experiment, "best_metric_name", "eval/return_mean"),
+    })
     log.info("Training finished.")
     logger.close()
 

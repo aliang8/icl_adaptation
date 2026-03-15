@@ -1,6 +1,115 @@
 # Setup
 
-## Environment
+This guide gets you from a fresh clone to running training (HalfCheetah or ICRT-style robot data).
+
+---
+
+## Prerequisites
+
+- **Python**: 3.9 or 3.10 (3.10 recommended).
+- **GPU**: Optional but recommended for training; CPU works for small runs.
+- **Disk**: ~500 MB for HalfCheetah data; more for ICRT-MT (HDF5 + images).
+- **Git LFS**: Required only for downloading ICRT-MT (large files). Install with `sudo apt install git-lfs && git lfs install` (Linux) or see [git-lfs.github.com](https://git-lfs.github.com).
+
+---
+
+## Step 1: Clone and enter the project
+
+```bash
+cd /path/to/icl_adaptation   # or wherever you cloned the repo
+```
+
+---
+
+## Step 2: Create environment and install dependencies
+
+Pick **one** of the following.
+
+### Option A: With [uv](https://github.com/astral-sh/uv)
+
+```bash
+uv venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+uv sync
+```
+
+This creates a virtualenv in `.venv` and installs the base dependencies from `pyproject.toml`.
+
+### Option B: With conda + pip
+
+```bash
+conda create -n icl_adaptation python=3.10 -y
+conda activate icl_adaptation
+pip install -e .
+```
+
+**Verify:** From the project root, run `python -c "import src.train; print('OK')"`. If that succeeds, the base setup is correct.
+
+---
+
+## Step 3: Install optional dependencies (depending on what you want to run)
+
+| Goal | What to install | Command |
+|------|-----------------|--------|
+| **HalfCheetah (Minari)** | Minari + Gymnasium + MuJoCo 2 | `uv sync --extra d4rl` |
+| **ICRT-MT dataset + viz** | HuggingFace Hub + HDF5 + matplotlib | `uv sync --extra icrt` |
+
+You can install both if you plan to use HalfCheetah and ICRT-style data.
+
+---
+
+## Step 4: Download data (choose one path)
+
+### Path A: HalfCheetah (Minari)
+
+1. Install Minari (see Step 3).
+2. Download datasets into `datasets/`:
+
+   ```bash
+   uv run python scripts/download_d4rl_halfcheetah.py --output-dir datasets --qualities medium expert medium_expert
+   ```
+
+3. Check that files exist:  
+   `datasets/HalfCheetah-v2/medium_expert/trajectories.pkl` (and similarly for `medium`, `expert`).
+
+### Path B: ICRT-MT (language + multi-view images)
+
+1. Run `uv sync --extra icrt` (see Step 3).
+2. (Recommended) Install Git LFS for large files:  
+   `sudo apt install git-lfs && git lfs install`
+3. Download the dataset:
+
+   ```bash
+   uv run python scripts/download_icrt_dataset.py --output-dir datasets
+   ```
+
+4. Check that the folder exists:  
+   `datasets/ICRT-MT/` and `datasets/ICRT-MT/dataset_config.json`.
+
+---
+
+## Step 5: Run training
+
+- **HalfCheetah (with W&B):**
+  ```bash
+  uv run python -m src.train --wandb --run-name halfcheetah-run1 --override data=halfcheetah
+  ```
+
+- **Resume from checkpoint:**
+  ```bash
+  uv run python -m src.train --resume outputs/checkpoints/checkpoint_latest.pt --override data=halfcheetah
+  ```
+
+- **Override config (e.g. steps, batch size):**
+  ```bash
+  uv run python -m src.train --override data=halfcheetah experiment.max_steps=5000 data.batch_size=64
+  ```
+
+---
+
+## Environment (reference)
+
+If you only need the exact commands for creating the env (without the full walkthrough above):
 
 ### With [uv](https://github.com/astral-sh/uv)
 
@@ -21,73 +130,13 @@ pip install -e .
 
 ---
 
-## Optional: Minari (HalfCheetah / offline RL)
+## Optional: Minari (HalfCheetah) in one go
 
-We use **Minari** for HalfCheetah mixed-expertise data. Minari uses Gymnasium and MuJoCo 2 and does **not** use the old `mujoco_py` (no Cython compilation).
-
-**uv:**
-```bash
-uv sync --extra d4rl
-```
-This installs `minari[all]` (Gymnasium, MuJoCo 2, dataset download).
-
-**pip:**
-```bash
-pip install "minari[all]"
-```
-
----
-
-## Quick start: HalfCheetah via Minari (download → train)
-
-**1. Install Minari**  
-
-With **uv**:
-```bash
-uv sync --extra d4rl
-```
-
-With pip:
-```bash
-pip install "minari[all]"
-```
-
-**2. Download HalfCheetah datasets (mixed expertise)**  
-Saves to `datasets/HalfCheetah-v2/<quality>/trajectories.pkl`. Use `medium_expert` for a mix of medium and expert returns.
-
-With **uv**:
-```bash
-uv run python scripts/download_d4rl_halfcheetah.py --output-dir datasets --qualities medium expert medium_expert
-```
-
-With pip:
-```bash
-python scripts/download_d4rl_halfcheetah.py --output-dir datasets --qualities medium expert medium_expert
-```
-
-**3. Train Meta-DT with W&B and Loguru**  
-
-With **uv**:
-```bash
-uv run python -m src.train --wandb --run-name halfcheetah-run1 --override data=halfcheetah
-```
-
-With pip:
-```bash
-python -m src.train --wandb --run-name halfcheetah-run1 --override data=halfcheetah
-```
-
-**4. All-in-one script (download + train)**  
-Uses `uv run python` if `uv` is on your PATH, otherwise `python`.
+Minari uses Gymnasium and MuJoCo 2 (no `mujoco_py`). Run `uv sync --extra d4rl`, then follow **Step 4 (Path A)** and **Step 5** above. Alternatively, use the all-in-one script:
 
 ```bash
 chmod +x scripts/run_halfcheetah.sh
 ./scripts/run_halfcheetah.sh
-```
-
-**5. Optional overrides**  
-```bash
-uv run python -m src.train --wandb --override data=halfcheetah experiment.max_steps=100000 experiment.eval_every_steps=2000
 ```
 
 ---
@@ -113,13 +162,52 @@ uv run python -m src.train --wandb --override data=halfcheetah experiment.max_st
 
 ---
 
+## Optional: ICRT-style (language + multi-view images)
+
+For robot manipulation with **language instructions** and **multi-view camera images** (exterior + wrist), similar to [ICRT](https://github.com/Max-Fu/icrt) (ICRA 2025):
+
+1. **Install deps:** `uv sync --extra icrt` (includes huggingface_hub, h5py, matplotlib for download and visualization).
+2. **Install Git LFS** (for large HDF5 files): `sudo apt install git-lfs && git lfs install`.
+3. **Download data:** See **Step 4 (Path B)** above. This fetches [Ravenh97/ICRT-MT](https://huggingface.co/datasets/Ravenh97/ICRT-MT) to `datasets/ICRT-MT/` and writes `dataset_config.json`.
+4. **Visualize dataset** (task distribution, episode lengths, sample frames):
+   ```bash
+   uv run python scripts/visualize_icrt_data.py
+   uv run python scripts/visualize_icrt_data.py --out-dir outputs/icrt_viz --max-episodes 2 --sample-frames 5
+   ```
+   Outputs PNGs in `outputs/icrt_viz/` (or `--out-dir`).
+5. **Config and model:**
+   - Data: `configs/data/icrt_mt.yaml` (sets `dataset_config_json`, `image_keys`, `use_vision`, `use_language`).
+   - Model: `ICRTDecisionTransformer` in `src/models/icrt_dt.py` (Meta-DT + optional vision encoder + language embedding). Use `--override data=icrt_mt` and a model config with `use_vision=true`, `use_language=true` when training on ICRT-MT.
+
+---
+
+## Quick reference: common commands
+
+| What | Command |
+|------|--------|
+| Create env (uv) | `uv venv && source .venv/bin/activate && uv sync` |
+| Create env (conda) | `conda create -n icl_adaptation python=3.10 -y && conda activate icl_adaptation && pip install -e .` |
+| Install HalfCheetah deps | `uv sync --extra d4rl` |
+| Download HalfCheetah | `uv run python scripts/download_d4rl_halfcheetah.py --output-dir datasets --qualities medium expert medium_expert` |
+| Install ICRT deps | `uv sync --extra icrt` |
+| Download ICRT-MT | `uv run python scripts/download_icrt_dataset.py --output-dir datasets` |
+| Visualize ICRT-MT | `uv run python scripts/visualize_icrt_data.py` (optional: `--out-dir outputs/icrt_viz --max-episodes 2`) |
+| Train (HalfCheetah) | `uv run python -m src.train --wandb --override data=halfcheetah` |
+| Resume training | `uv run python -m src.train --resume outputs/checkpoints/checkpoint_latest.pt --override data=halfcheetah` |
+| Override config | `uv run python -m src.train --override data=halfcheetah experiment.max_steps=5000 data.batch_size=64` |
+
+---
+
 ## Troubleshooting
 
 - **`mujoco_py` / Cython errors**  
-  This project uses **Minari** for HalfCheetah, not the legacy D4RL package that can pull in `mujoco_py`. Install `minari[all]` (see “Optional: Minari” above). If you see Cython errors from another package, uninstall `mujoco_py` and use Minari only.
+  This project uses **Minari** for HalfCheetah, not the legacy D4RL package that can pull in `mujoco_py`. Install `minari[all]` (see Step 3 / Optional: Minari). If you see Cython errors from another package, uninstall `mujoco_py` and use Minari only.
 
 - **`transformer_engine` or `accelerate` import errors**  
   Use a clean environment with only the dependencies in `pyproject.toml`. Avoid pulling in extras that depend on `accelerate`/`transformer_engine` if you don’t need them.
 
 - **Minari not found**  
   Run `uv sync --extra d4rl` or `pip install "minari[all]"` so the download script and env can use Minari datasets.
+
+- **ICRT-MT download fails or files missing**  
+  Ensure Git LFS is installed (`git lfs install`) and that you have enough disk space. You can also download the dataset manually from [HuggingFace ICRT-MT](https://huggingface.co/datasets/Ravenh97/ICRT-MT) and place it under `datasets/ICRT-MT/`, then create or adjust `dataset_config.json` to match the file paths.

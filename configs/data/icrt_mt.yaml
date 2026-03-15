@@ -1,0 +1,37 @@
+# ICRT-style: language + multi-view camera images (e.g. ICRT-MT from HuggingFace)
+# Download: python scripts/download_icrt_dataset.py --output-dir datasets
+# Dataset at datasets/ICRT-MT/ with dataset_config.json
+env_name: ICRT-MT
+data_dir: datasets
+data_quality: ""  # not used for ICRT-MT; kept for config struct compatibility
+# Path to ICRT dataset_config.json (relative to cwd or absolute)
+dataset_config_json: datasets/ICRT-MT/dataset_config.json
+context_dim: 16
+# Keys in HDF5 for images (exterior + wrist)
+image_keys:
+  - observation/exterior_image_1_left
+  - observation/wrist_image_left
+proprio_keys:
+  - observation/cartesian_position
+  - observation/gripper_position
+action_keys:
+  - action/cartesian_position
+  - action/gripper_position
+# Task/language: verb_to_episode maps task name -> episode list; one instruction per task
+use_language: true
+use_vision: true
+horizon: 32
+prompt_length: 8
+return_scale: 1.0
+batch_size: 16
+num_workers: 2
+num_context_trajectories: 3
+context_style: subsampled
+lazy_dataset: true
+max_training_examples: 200000
+max_episode_steps: 512
+# Image size expected by vision encoder (H, W)
+image_size: [224, 224]
+# Min trajectory length to use (ICRT uses ~30 at 15Hz)
+min_trajectory_length: 30
+max_trajectory_length: 450

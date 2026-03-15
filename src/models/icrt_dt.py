@@ -1,18 +1,50 @@
 """
-Meta Decision Transformer: in-context learning for robot trajectories.
-Context trajectories (same task) sorted by returns during training;
-at inference, zero-shot adaptation with previous rollouts sorted ascending.
-Based on Meta-DT (NJU-RL/Meta-DT); uses transformers.GPT2Model with inputs_embeds.
+ICRT-style Decision Transformer: language + multi-view camera images.
+
+Extends MetaDecisionTransformer with optional:
+- Multi-view vision encoder (exterior + wrist images) -> image embeddings fused with state.
+- Language instruction embedding (one per task/sample) -> added to state or prepended as token.
+
+Reference: https://github.com/Max-Fu/icrt (ICRA 2025)
 """
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional, Tuple
+
 import torch
 import torch.nn as nn
-from transformers import GPT2Config, GPT2Model
+
+from src.models.meta_dt import MetaDecisionTransformer
+from src.models.vision import MultiViewVisionEncoder
 
 
-class MetaDecisionTransformer(nn.Module):
+class LanguageEmbedder(nn.Module):
+    """Embed language instructions (e.g. one per task) to hidden_size. Simple bag-of-words or lookup."""
+
+    def __init__(
+        self,
+        vocab_size: int = 512,
+        hidden_size: int = 128,
+        max_instruction_length: int = 64,
+    ):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, hidden_size)
+        self.max_len = max_instruction_length
+
+    def forward(self, instruction_ids: torch.Tensor) -> torch.Tensor:
+        # instruction_ids: (B, L) long -> (B, hidden_size) pooled
+        x = self.embed(instruction_ids)
+        return x.mean(dim=1)
+
+
+class ICRTDecisionTransformer(MetaDecisionTransformer):
     """
-    Models (Return_t, state_t, action_t, ...) with optional prompt (context) sequences.
-    State is encoded with context (e.g. from RNN context encoder) then fed as state_dim*2 -> hidden.
+    Meta-DT with optional vision (multi-view images) and language (instruction) conditioning.
+
+    - vision_encoder: MultiViewVisionEncoder that returns (B, T, num_tokens, D) or (B, T, D_pooled).
+    - language_embedder: maps instruction indices or embeddings to hidden_size; optional.
+    - When image_embeddings and/or language_embeddings are passed in forward, they are fused
+      with state embeddings before the transformer.
     """
 
     def __init__(
@@ -31,19 +63,22 @@ class MetaDecisionTransformer(nn.Module):
         resid_pdrop: float = 0.1,
         attn_pdrop: float = 0.1,
         n_positions: int = 1024,
-        **kwargs,
+        # ICRT-style
+        use_vision: bool = False,
+        use_language: bool = False,
+        num_views: int = 2,
+        image_embed_dim: int = 256,
+        vision_fusion: str = "concat",  # "concat" (project to hidden) or "add" (after project)
+        **kwargs: Any,
     ):
-        super().__init__()
-        n_inner = n_inner or 4 * hidden_size
-        self.state_dim = state_dim
-        self.act_dim = act_dim
-        self.context_dim = context_dim
-        self.max_length = max_length
-        self.hidden_size = hidden_size
-
-        config = GPT2Config(
-            vocab_size=1,
-            n_embd=hidden_size,
+        super().__init__(
+            state_dim=state_dim,
+            act_dim=act_dim,
+            hidden_size=hidden_size,
+            context_dim=context_dim,
+            max_length=max_length,
+            max_ep_len=max_ep_len,
+            action_tanh=action_tanh,
             n_layer=n_layer,
             n_head=n_head,
             n_inner=n_inner,
@@ -53,25 +88,29 @@ class MetaDecisionTransformer(nn.Module):
             n_positions=n_positions,
             **kwargs,
         )
-        self.transformer = GPT2Model(config)
 
-        self.embed_timestep = nn.Embedding(max_ep_len, hidden_size)
-        self.embed_return = nn.Linear(1, hidden_size)
-        self.embed_action = nn.Linear(act_dim, hidden_size)
-        self.state_encoder = nn.Linear(state_dim, context_dim)
-        self.embed_state = nn.Linear(context_dim * 2, hidden_size)
-        self.prompt_embed_timestep = nn.Embedding(max_ep_len, hidden_size)
-        self.prompt_embed_return = nn.Linear(1, hidden_size)
-        self.prompt_embed_state = nn.Linear(state_dim, hidden_size)
-        self.prompt_embed_action = nn.Linear(act_dim, hidden_size)
-        self.embed_ln = nn.LayerNorm(hidden_size)
+        self.use_vision = use_vision
+        self.use_language = use_language
+        self.vision_fusion = vision_fusion
 
-        self.predict_state = nn.Linear(hidden_size, state_dim)
-        self.predict_action = nn.Sequential(
-            nn.Linear(hidden_size, act_dim),
-            (nn.Tanh() if action_tanh else nn.Identity()),
-        )
-        self.predict_return = nn.Linear(hidden_size, 1)
+        if use_vision:
+            self.vision_encoder = MultiViewVisionEncoder(
+                num_views=num_views,
+                embed_dim=image_embed_dim,
+                img_size=(224, 224),
+            )
+            if vision_fusion == "concat":
+                self.vision_proj = nn.Linear(image_embed_dim * num_views, hidden_size)
+            else:
+                self.vision_proj = nn.Linear(image_embed_dim * num_views, hidden_size)
+        else:
+            self.vision_encoder = None
+            self.vision_proj = None
+
+        if use_language:
+            self.language_proj = nn.Linear(hidden_size, hidden_size)
+        else:
+            self.language_proj = None
 
     def forward(
         self,
@@ -83,7 +122,13 @@ class MetaDecisionTransformer(nn.Module):
         timesteps,
         attention_mask=None,
         prompt=None,
+        image_embeddings: Optional[torch.Tensor] = None,
+        language_embeddings: Optional[torch.Tensor] = None,
     ):
+        """
+        image_embeddings: (B, T, D_vision) from vision encoder (pooled per step).
+        language_embeddings: (B, D_lang) one vector per sample.
+        """
         batch_size, seq_length = states.shape[0], states.shape[1]
         if attention_mask is None:
             attention_mask = torch.ones((batch_size, seq_length), dtype=torch.long, device=states.device)
@@ -92,6 +137,17 @@ class MetaDecisionTransformer(nn.Module):
 
         state_encoding = self.state_encoder(states)
         state_embeddings = self.embed_state(torch.cat((state_encoding, contexts), dim=-1))
+
+        if image_embeddings is not None and self.vision_proj is not None:
+            # image_embeddings: (B, T, D_vision)
+            v = self.vision_proj(image_embeddings)
+            state_embeddings = state_embeddings + v
+
+        if language_embeddings is not None and self.language_proj is not None:
+            # (B, D_lang) -> (B, 1, D) broadcast to (B, T, D)
+            lang = self.language_proj(language_embeddings).unsqueeze(1)
+            state_embeddings = state_embeddings + lang
+
         action_embeddings = self.embed_action(actions)
         returns_embeddings = self.embed_return(returns_to_go)
         time_embeddings = self.embed_timestep(timesteps)
@@ -151,61 +207,3 @@ class MetaDecisionTransformer(nn.Module):
         state_preds = self.predict_state(x[:, 2])[:, -seq_length:, :]
         action_preds = self.predict_action(x[:, 1])[:, -seq_length:, :]
         return state_preds, action_preds, return_preds
-
-    def get_action(
-        self,
-        states,
-        contexts,
-        actions,
-        rewards,
-        returns_to_go,
-        timesteps,
-        prompt,
-        warm_train_steps: int,
-        current_step: int,
-        **kwargs,
-    ):
-        states = states.reshape(1, -1, self.state_dim)
-        contexts = contexts.reshape(1, -1, self.context_dim)
-        actions = actions.reshape(1, -1, self.act_dim)
-        returns_to_go = returns_to_go.reshape(1, -1, 1)
-        timesteps = timesteps.reshape(1, -1)
-
-        if self.max_length is not None:
-            states = states[:, -self.max_length:]
-            contexts = contexts[:, -self.max_length:]
-            actions = actions[:, -self.max_length:]
-            returns_to_go = returns_to_go[:, -self.max_length:]
-            timesteps = timesteps[:, -self.max_length:]
-
-        attention_mask = torch.cat([
-            torch.zeros(self.max_length - states.shape[1], device=states.device, dtype=torch.long),
-            torch.ones(states.shape[1], device=states.device, dtype=torch.long),
-        ]).reshape(1, -1)
-        states = torch.cat([
-            torch.zeros((1, self.max_length - states.shape[1], self.state_dim), device=states.device),
-            states,
-        ], dim=1).float()
-        contexts = torch.cat([
-            torch.zeros((1, self.max_length - contexts.shape[1], self.context_dim), device=contexts.device),
-            contexts,
-        ], dim=1).float()
-        actions = torch.cat([
-            torch.ones((1, self.max_length - actions.shape[1], self.act_dim), device=actions.device) * -10.0,
-            actions,
-        ], dim=1).float()
-        returns_to_go = torch.cat([
-            torch.zeros((1, self.max_length - returns_to_go.shape[1], 1), device=returns_to_go.device),
-            returns_to_go,
-        ], dim=1).float()
-        timesteps = torch.cat([
-            torch.zeros((1, self.max_length - timesteps.shape[1]), device=timesteps.device, dtype=torch.long),
-            timesteps,
-        ], dim=1)
-
-        use_prompt = prompt is not None and current_step > warm_train_steps
-        _, action_preds, _ = self.forward(
-            states, contexts, actions, None, returns_to_go, timesteps,
-            attention_mask=attention_mask, prompt=prompt if use_prompt else None,
-        )
-        return action_preds[0, -1]

@@ -1,8 +1,9 @@
 """
 Checkpointing: full resume state (model, optimizer, scheduler, scaler, epoch, step, best_metric, config, git, RNG).
-Saves three types: latest, best, periodic.
-Separate inference/export artifact from training checkpoint.
+Saves under ckpts/last/, ckpts/best/, ckpts/step_XXXXX/.
+Separate inference/export artifact under artifacts/inference/.
 """
+import json
 import os
 import random
 import subprocess
@@ -83,13 +84,24 @@ def save_checkpoint(
         "sampler": sampler_state,
         **(extra or {}),
     }
+    # Save under ckpts/last/, ckpts/best/, or ckpts/step_XXXXX/
     if kind == "latest":
-        path = os.path.join(save_dir, "checkpoint_latest.pt")
+        subdir = os.path.join(save_dir, "last")
     elif kind == "best":
-        path = os.path.join(save_dir, "checkpoint_best.pt")
+        subdir = os.path.join(save_dir, "best")
     else:
-        path = os.path.join(save_dir, f"checkpoint_step_{global_step}.pt")
+        subdir = os.path.join(save_dir, f"step_{global_step:06d}")
+    os.makedirs(subdir, exist_ok=True)
+    path = os.path.join(subdir, "checkpoint.pt")
     torch.save(ckpt, path)
+    metadata = {
+        "epoch": epoch,
+        "global_step": global_step,
+        "best_metric": best_metric,
+        "kind": kind,
+    }
+    with open(os.path.join(subdir, "metadata.json"), "w") as f:
+        json.dump(metadata, f, indent=2)
     return path
 
 
