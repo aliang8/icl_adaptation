@@ -24,6 +24,7 @@ dependencies = [
 d4rl = ["minari[all]"]
 # ICRT-style: robot manipulation with language + multi-view images (HuggingFace + HDF5 + viz).
 icrt = ["huggingface_hub>=0.20.0", "h5py>=3.8.0", "matplotlib>=3.5.0", "datasets>=2.0.0"]
+# DINOv2, SigLIP/PaliGemma, ViT (CrossMAE-style) use transformers. LLaMA 2 needs HuggingFace token for gated models.
 dev = ["pytest", "ruff"]
 
 [tool.setuptools.packages.find]

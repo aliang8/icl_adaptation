@@ -2,7 +2,7 @@
 VLA (Vision-Language-Action) Decision Transformer: language + multi-view camera images.
 
 Extends MetaDecisionTransformer with optional:
-- Multi-view vision encoder -> image embeddings fused with state.
+- Modular vision encoder (patch / crossmae / dinov2 / dinov3 / paligemma) -> fused with state.
 - Language instruction embedding (one per task/sample) -> fused with state.
 
 Reference: https://github.com/Max-Fu/icrt (ICRA 2025)
@@ -18,7 +18,7 @@ from torch import Tensor
 
 from src.models.meta_dt import MetaDecisionTransformer
 from src.models.types import DTBatch, DTOutput
-from src.models.vision import MultiViewVisionEncoder
+from src.models.vision_encoders import build_vision_encoder
 
 
 class LanguageEmbedder(nn.Module):
@@ -67,6 +67,11 @@ class VLADecisionTransformer(MetaDecisionTransformer):
         num_views: int = 2,
         image_embed_dim: int = 256,
         vision_fusion: str = "concat",
+        transformer_backbone: str = "gpt2",
+        llama_model_name: Optional[str] = None,
+        vision_encoder_type: str = "patch",
+        vision_encoder_pool: bool = True,
+        vision_encoder_attention_pool: bool = False,
         **kwargs: Any,
     ):
         super().__init__(
@@ -84,6 +89,8 @@ class VLADecisionTransformer(MetaDecisionTransformer):
             resid_pdrop=resid_pdrop,
             attn_pdrop=attn_pdrop,
             n_positions=n_positions,
+            transformer_backbone=transformer_backbone,
+            llama_model_name=llama_model_name,
             **kwargs,
         )
 
@@ -92,12 +99,16 @@ class VLADecisionTransformer(MetaDecisionTransformer):
         self.vision_fusion = vision_fusion
 
         if use_vision:
-            self.vision_encoder = MultiViewVisionEncoder(
+            self.vision_encoder = build_vision_encoder(
+                encoder_type=vision_encoder_type,
                 num_views=num_views,
                 embed_dim=image_embed_dim,
                 img_size=(224, 224),
+                pool=vision_encoder_pool,
+                attention_pool=vision_encoder_attention_pool,
             )
-            self.vision_proj = nn.Linear(image_embed_dim * num_views, hidden_size)
+            out_dim = getattr(self.vision_encoder, "output_dim", image_embed_dim * num_views)
+            self.vision_proj = nn.Linear(out_dim, hidden_size)
         else:
             self.vision_encoder = None
             self.vision_proj = None

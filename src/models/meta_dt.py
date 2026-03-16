@@ -2,7 +2,7 @@
 Meta Decision Transformer: in-context learning for robot trajectories.
 Context trajectories (same task) sorted by returns during training;
 at inference, zero-shot adaptation with previous rollouts sorted ascending.
-Based on Meta-DT (NJU-RL/Meta-DT); uses transformers.GPT2Model with inputs_embeds.
+Supports transformer_backbone: gpt2 (custom) or llama2 (HuggingFace pretrained).
 """
 
 from __future__ import annotations
@@ -12,8 +12,8 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 from torch import Tensor
-from transformers import GPT2Config, GPT2Model
 
+from src.models.backbones import build_transformer_backbone
 from src.models.types import DTBatch, DTOutput
 
 
@@ -39,29 +39,30 @@ class MetaDecisionTransformer(nn.Module):
         resid_pdrop: float = 0.1,
         attn_pdrop: float = 0.1,
         n_positions: int = 1024,
+        transformer_backbone: str = "gpt2",
+        llama_model_name: Optional[str] = None,
         **kwargs,
     ):
         super().__init__()
-        n_inner = n_inner or 4 * hidden_size
         self.state_dim = state_dim
         self.act_dim = act_dim
         self.context_dim = context_dim
         self.max_length = max_length
         self.hidden_size = hidden_size
 
-        config = GPT2Config(
-            vocab_size=1,
-            n_embd=hidden_size,
+        self.transformer = build_transformer_backbone(
+            backbone_type=transformer_backbone,
+            hidden_size=hidden_size,
             n_layer=n_layer,
             n_head=n_head,
             n_inner=n_inner,
+            n_positions=n_positions,
             activation_function=activation_function,
             resid_pdrop=resid_pdrop,
             attn_pdrop=attn_pdrop,
-            n_positions=n_positions,
+            llama_model_name=llama_model_name,
             **kwargs,
         )
-        self.transformer = GPT2Model(config)
 
         self.embed_timestep = nn.Embedding(max_ep_len, hidden_size)
         self.embed_return = nn.Linear(1, hidden_size)

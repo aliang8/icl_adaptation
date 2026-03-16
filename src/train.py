@@ -216,10 +216,13 @@ def build_model(cfg, state_dim: int, action_dim: int, num_instructions: Optional
         n_layer=m.n_layer,
         n_head=m.n_head,
         n_inner=n_inner,
+        n_positions=getattr(m, "n_positions", 1024),
         activation_function=m.activation_function,
         resid_pdrop=m.resid_pdrop,
         attn_pdrop=m.attn_pdrop,
         action_tanh=m.action_tanh,
+        transformer_backbone=getattr(m, "transformer_backbone", "gpt2"),
+        llama_model_name=getattr(m, "llama_model_name", None),
     )
     if m.use_vision or m.use_language:
         model = VLADecisionTransformer(
@@ -229,6 +232,9 @@ def build_model(cfg, state_dim: int, action_dim: int, num_instructions: Optional
             num_instructions=num_instructions or 0,
             num_views=m.num_views,
             image_embed_dim=m.image_embed_dim,
+            vision_encoder_type=getattr(m, "vision_encoder_type", "patch"),
+            vision_encoder_pool=getattr(m, "vision_encoder_pool", True),
+            vision_encoder_attention_pool=getattr(m, "vision_encoder_attention_pool", False),
         )
     else:
         model = MetaDecisionTransformer(**common)

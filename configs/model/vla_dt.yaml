@@ -19,3 +19,11 @@ use_vision: true
 use_language: true
 num_views: 2
 image_embed_dim: 256
+# Transformer: gpt2 (custom) or llama2 (set llama_model_name e.g. meta-llama/Llama-2-7b-hf)
+transformer_backbone: gpt2
+llama_model_name: null
+# Vision encoder: patch | crossmae | dinov2 | dinov3 | paligemma
+vision_encoder_type: patch
+vision_encoder_pool: true
+# ICRT-style attention pooling over patch tokens (set true for crossmae/dinov2 to compress patches to one token per view)
+vision_encoder_attention_pool: false

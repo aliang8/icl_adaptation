@@ -102,6 +102,39 @@ uv run python -m src.train \
 
 (Use the same `data.query_history_length` as the run you are resuming.)
 
+## 9. Model variants (transformer and vision)
+
+**Transformer backbone** (`model.transformer_backbone`):
+
+- **gpt2** (default): Custom GPT-2, randomly initialized.
+- **llama2**: HuggingFace LLaMA 2 pretrained. Set `model.llama_model_name` (e.g. `meta-llama/Llama-2-7b-hf`). Requires HuggingFace token for gated models.
+
+**Vision encoder** (`model.vision_encoder_type`):
+
+- **patch** (default): Trainable per-patch CNN, pooled per view then concatenated.
+- **crossmae**: ViT per-patch style ([CrossMAE](https://crossmae.github.io/)); uses HuggingFace ViT.
+- **dinov2** / **dinov3**: One embedding per image (CLS token) or patch tokens + attention pooling; [DINOv2](https://huggingface.co/facebook/dinov2-base).
+- **paligemma**: [PaliGemma](https://huggingface.co/docs/transformers/en/model_doc/paligemma)-style SigLIP vision tower; pooled.
+
+**Attention pooling (ICRT-style)** ([ICRT](https://github.com/Max-Fu/icrt), [arxiv/2408.15980](https://arxiv.org/abs/2408.15980)): Set `model.vision_encoder_attention_pool=true` to compress patch tokens with a learned query attending over patches (one state token per view per timestep) instead of mean-pooling. Recommended for **crossmae** and optionally for **dinov2** when using patch tokens.
+
+Example (DINOv2 vision):
+
+```bash
+uv run python -m src.train \
+  --override data=[base,icrt_mt] model=vla_dt model.vision_encoder_type=dinov2 \
+  experiment.eval_every_steps=0 --run-name icrt_dinov2_run
+```
+
+Example (CrossMAE-style ViT with ICRT attention pooling):
+
+```bash
+uv run python -m src.train \
+  --override data=[base,icrt_mt] model=vla_dt \
+  model.vision_encoder_type=crossmae model.vision_encoder_attention_pool=true \
+  experiment.eval_every_steps=0 --run-name icrt_crossmae_run
+```
+
 ## Summary
 
 | Step        | Command |
