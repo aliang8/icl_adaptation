@@ -92,10 +92,13 @@ class ICLTrajectoryDatasetBase(Dataset, ABC):
         lazy_dataset: bool = False,
         max_training_examples: int = 500_000,
         seed: int = 0,
+        query_history_length: Optional[int] = None,
         **kwargs: Any,
     ):
         self.trajectories = trajectories
         self.horizon = horizon
+        # Query = last K steps of current trajectory; K=1 = OpenVLA-style; None = use horizon
+        self._query_length = horizon if query_history_length is None else query_history_length
         self.max_episode_steps = max_episode_steps
         self.return_scale = return_scale
         self.device = device
@@ -140,40 +143,43 @@ class ICLTrajectoryDatasetBase(Dataset, ABC):
         si: int,
         traj_contexts: np.ndarray,
     ) -> Tuple[np.ndarray, ...]:
-        """Build the 8 main-segment arrays for (traj, si). Returns (state_seg, context_seg, action_seg, reward_seg, done_seg, rtg_seg, ts_seg, mask_seg)."""
+        """Build the 8 main-segment arrays for (traj, si). Uses last K steps ending at si (K = query_history_length or horizon).
+        So: segment = [si-K+1 .. si] padded to length K at front. K=1 is OpenVLA-style (current obs only)."""
+        K = self._query_length
         max_ep_len = self.max_episode_steps
         state_mean, state_std = self.state_mean, self.state_std
-        state_seg = traj["observations"][si : si + self.horizon]
-        action_seg = traj["actions"][si : si + self.horizon]
-        reward_seg = traj["rewards"][si : si + self.horizon].reshape(-1, 1)
-        context_seg = traj_contexts[si : si + self.horizon]
-        done_seg = traj.get("terminals", traj.get("dones", np.zeros(len(reward_seg))))[
-            si : si + self.horizon
+        # Last K steps ending at si (inclusive): indices start..si
+        start = max(0, si - K + 1)
+        state_seg = traj["observations"][start : si + 1]
+        action_seg = traj["actions"][start : si + 1]
+        reward_seg = traj["rewards"][start : si + 1].reshape(-1, 1)
+        context_seg = traj_contexts[start : si + 1]
+        done_seg = traj.get("terminals", traj.get("dones", np.zeros(len(traj["rewards"]))))[
+            start : si + 1
         ]
         tlen = state_seg.shape[0]
+        pad_len = K - tlen
         state_seg = np.concatenate(
-            [np.zeros((self.horizon - tlen, state_seg.shape[1])), state_seg], axis=0
+            [np.zeros((pad_len, state_seg.shape[1])), state_seg], axis=0
         )
         state_seg = (state_seg - state_mean) / state_std
         context_seg = np.concatenate(
-            [np.zeros((self.horizon - tlen, context_seg.shape[1])), context_seg], axis=0
+            [np.zeros((pad_len, context_seg.shape[1])), context_seg], axis=0
         )
         action_seg = np.concatenate(
-            [np.ones((self.horizon - tlen, action_seg.shape[1])) * -10.0, action_seg], axis=0
+            [np.ones((pad_len, action_seg.shape[1])) * -10.0, action_seg], axis=0
         )
-        reward_seg = np.concatenate([np.zeros((self.horizon - tlen, 1)), reward_seg], axis=0)
-        done_seg = np.concatenate([np.ones(self.horizon - tlen) * 2, done_seg], axis=0)
-        rtg_seg = discount_cumsum(traj["rewards"][si:], gamma=1.0)[: tlen + 1].reshape(-1, 1)
-        if rtg_seg.shape[0] <= tlen:
-            rtg_seg = np.concatenate([rtg_seg, np.zeros((1, 1))], axis=0)
+        reward_seg = np.concatenate([np.zeros((pad_len, 1)), reward_seg], axis=0)
+        done_seg = np.concatenate([np.ones(pad_len) * 2, done_seg], axis=0)
+        rtg_seg = discount_cumsum(traj["rewards"][start:], gamma=1.0)[:tlen].reshape(-1, 1)
         rtg_seg = (
-            np.concatenate([np.zeros((self.horizon - tlen, 1)), rtg_seg], axis=0)
+            np.concatenate([np.zeros((pad_len, 1)), rtg_seg], axis=0)
             / self.return_scale
         )
-        ts_seg = np.arange(si, si + tlen)
+        ts_seg = np.arange(start, start + tlen, dtype=np.float32)
         ts_seg[ts_seg >= max_ep_len] = max_ep_len - 1
-        ts_seg = np.concatenate([np.zeros(self.horizon - tlen), ts_seg], axis=0)
-        mask_seg = np.concatenate([np.zeros(self.horizon - tlen), np.ones(tlen)], axis=0)
+        ts_seg = np.concatenate([np.zeros(pad_len), ts_seg], axis=0)
+        mask_seg = np.concatenate([np.zeros(pad_len), np.ones(tlen)], axis=0)
         return state_seg, context_seg, action_seg, reward_seg, done_seg, rtg_seg, ts_seg, mask_seg
 
     def _get_one_sample(
@@ -529,8 +535,9 @@ class SubsampledICLTrajectoryDataset(ICLTrajectoryDatasetBase):
 
 class FullTrajectoryICLTrajectoryDataset(ICLTrajectoryDatasetBase):
     """
-    In-context prompt = full trajectory(ies), concatenated and capped to max_total_prompt_length
-    (keeps last N steps). ICRT-style.
+    In-context prompt = full trajectory(ies). Each trajectory is capped to
+    max_prompt_trajectory_length steps (last N steps); concatenated sequence
+    is then capped to max_total_prompt_length. ICRT-style.
     """
 
     def __init__(
@@ -550,6 +557,7 @@ class FullTrajectoryICLTrajectoryDataset(ICLTrajectoryDatasetBase):
         context_sort_ascending: bool = True,
         context_sampling: str = "random",
         max_total_prompt_length: Optional[int] = None,
+        max_prompt_trajectory_length: Optional[int] = None,
         trajectory_contexts: Optional[Dict[int, np.ndarray]] = None,
         **kwargs: Any,
     ):
@@ -574,6 +582,7 @@ class FullTrajectoryICLTrajectoryDataset(ICLTrajectoryDatasetBase):
             **kwargs,
         )
         self.total_prompt_len = max_total_prompt_length
+        self.max_prompt_trajectory_length = max_prompt_trajectory_length
         if not self._lazy:
             log.info(
                 "Building segments (FullTrajectoryICL, total_prompt_len={}; may take a minute)...",
@@ -594,15 +603,24 @@ class FullTrajectoryICLTrajectoryDataset(ICLTrajectoryDatasetBase):
         state_mean: np.ndarray,
         state_std: np.ndarray,
     ) -> PromptArrays:
-        """Full trajectory arrays (no padding)."""
+        """Full trajectory arrays; capped to last max_prompt_trajectory_length steps when set."""
         T = traj["rewards"].shape[0]
         if T == 0:
             raise ValueError("Empty trajectory in _prompt_from_full_trajectory")
-        ps = (traj["observations"][:T] - state_mean) / state_std
-        pa = traj["actions"][:T]
-        pr = traj["rewards"][:T].reshape(-1, 1)
-        prtg = discount_cumsum(traj["rewards"], gamma=1.0)[:T].reshape(-1, 1) / self.scale
-        pts = np.arange(T, dtype=np.float32)
+        cap = getattr(self, "max_prompt_trajectory_length", None)
+        if cap is not None and T > cap:
+            start = T - cap
+            T = cap
+        else:
+            start = 0
+        ps = (traj["observations"][start : start + T] - state_mean) / state_std
+        pa = traj["actions"][start : start + T]
+        pr = traj["rewards"][start : start + T].reshape(-1, 1)
+        prtg = (
+            discount_cumsum(traj["rewards"][start:], gamma=1.0)[:T].reshape(-1, 1)
+            / self.scale
+        )
+        pts = np.arange(start, start + T, dtype=np.float32)
         pm = np.ones(T, dtype=np.float32)
         return ps, pa, pr, prtg, pts, pm
 

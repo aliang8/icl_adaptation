@@ -115,6 +115,8 @@ def _print_dataset_stats(dataset, loader, env_name: str = "", data_quality: str 
     table.add_row("State dim", str(dataset.state_dim))
     table.add_row("Action dim", str(dataset.act_dim))
     table.add_row("Horizon", str(dataset.horizon))
+    k = getattr(dataset, "_query_length", dataset.horizon)
+    table.add_row("Query history length (K)", str(k) + (" (OpenVLA-style)" if k == 1 else ""))
     table.add_row("Max episode steps", str(dataset.max_episode_steps))
     table.add_row("Context trajectories", str(dataset.num_context_trajectories))
     prompt_len = getattr(dataset, "prompt_length", None)
@@ -122,6 +124,9 @@ def _print_dataset_stats(dataset, loader, env_name: str = "", data_quality: str 
         "Prompt length",
         str(prompt_len) if prompt_len is not None else "— (full traj)",
     )
+    max_pt = getattr(dataset, "max_prompt_trajectory_length", None)
+    if max_pt is not None:
+        table.add_row("Max prompt trajectory length", str(max_pt))
     table.add_row("Total prompt length", str(dataset.total_prompt_len))
     table.add_row("Batch size", str(loader.batch_size))
     table.add_row("Batches per epoch", f"{len(loader):,}")
@@ -308,9 +313,41 @@ def make_train_step_fn(task_instructions):
         loss = out.loss if out.loss is not None else torch.tensor(0.0, device=states.device)
         with torch.no_grad():
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1e9)
-        return loss, grad_norm
+
+        # Batch stats for logging (min/max/mean return and in-context prompt length)
+        batch_stats = _batch_stats(rewards, masks, prompt_m)
+        return loss, grad_norm, batch_stats
 
     return train_step_fn
+
+
+def _batch_stats(
+    rewards: torch.Tensor,
+    masks: torch.Tensor,
+    prompt_m: torch.Tensor,
+) -> dict:
+    """Compute min/max/mean return and prompt length per batch for W&B."""
+    # Return per sample: sum of rewards over valid (masked) steps. rewards (B,T,1), masks (B,T)
+    valid_return = (rewards.squeeze(-1) * masks).sum(dim=1)
+    n = valid_return.shape[0]
+    if n == 0:
+        return {}
+    r_min = valid_return.min().cpu().item()
+    r_max = valid_return.max().cpu().item()
+    r_mean = valid_return.float().mean().cpu().item()
+    # Prompt length per sample: number of valid steps in context
+    prompt_len = prompt_m.sum(dim=1).float()
+    pl_min = prompt_len.min().cpu().item()
+    pl_max = prompt_len.max().cpu().item()
+    pl_mean = prompt_len.mean().cpu().item()
+    return {
+        "batch/return_min": r_min,
+        "batch/return_max": r_max,
+        "batch/return_mean": r_mean,
+        "batch/prompt_len_min": pl_min,
+        "batch/prompt_len_max": pl_max,
+        "batch/prompt_len_mean": pl_mean,
+    }
 
 
 def main():
@@ -568,6 +605,7 @@ def main():
         context_sort_ascending=data_cfg.context_sort_ascending,
         context_sampling=data_cfg.context_sampling,
         max_total_prompt_length=data_cfg.max_total_prompt_length,
+        max_prompt_trajectory_length=data_cfg.max_prompt_trajectory_length,
         context_style=data_cfg.context_style,
         lazy_dataset=data_cfg.lazy_dataset,
         max_training_examples=data_cfg.max_training_examples,
@@ -575,6 +613,7 @@ def main():
         if task_instructions_from_loader is not None
         else data_cfg.task_instructions,
         seed=data_cfg.seed,
+        query_history_length=data_cfg.query_history_length,
     )
     state_mean = dataset.state_mean
     state_std = dataset.state_std

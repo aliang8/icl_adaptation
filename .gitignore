@@ -42,3 +42,5 @@ Thumbs.db
 
 # Optional: uncomment if you don't want to track downloaded datasets
 # datasets/
+
+*.arrow

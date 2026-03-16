@@ -110,6 +110,7 @@ def log_metrics(
     throughput: Optional[float] = None,
     gpu_mem_mb: Optional[float] = None,
     eval_metrics: Optional[Dict[str, float]] = None,
+    batch_metrics: Optional[Dict[str, float]] = None,
     checkpoint_path: Optional[str] = None,
 ) -> None:
     metrics = {
@@ -124,6 +125,8 @@ def log_metrics(
         metrics["system/gpu_mem_mb"] = gpu_mem_mb
     if eval_metrics:
         metrics.update(eval_metrics)
+    if batch_metrics:
+        metrics.update(batch_metrics)
     logger.log_metrics(metrics, step)
     if checkpoint_path:
         logger.log_scalar("checkpoint/path_step", step, step)

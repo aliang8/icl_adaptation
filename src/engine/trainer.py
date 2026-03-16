@@ -50,13 +50,17 @@ class Trainer:
         self,
         batch: Tuple[Any, ...],
         step_fn: Callable[
-            [torch.nn.Module, Tuple[Any, ...]], Tuple[torch.Tensor, Optional[torch.Tensor]]
+            [torch.nn.Module, Tuple[Any, ...]],
+            Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Dict[str, float]]],
         ],
-    ) -> Tuple[float, Optional[float]]:
-        """Single step: forward, loss, backward, grad clip, step. Returns (loss, grad_norm)."""
+    ) -> Tuple[float, Optional[float], Optional[Dict[str, float]]]:
+        """Single step: forward, loss, backward, grad clip, step. Returns (loss, grad_norm, batch_metrics)."""
         self.model.train()
         self.optimizer.zero_grad()
-        loss, grad_norm = step_fn(self.model, batch)
+        result = step_fn(self.model, batch)
+        loss = result[0]
+        grad_norm = result[1]
+        batch_metrics = result[2] if len(result) > 2 else None
         if self.scaler is not None:
             self.scaler.scale(loss).backward()
             if self.grad_clip_norm > 0:
@@ -77,7 +81,7 @@ class Trainer:
         grad_norm_val = (
             grad_norm.detach().cpu().item() if isinstance(grad_norm, torch.Tensor) else grad_norm
         )
-        return loss_val, grad_norm_val
+        return loss_val, grad_norm_val, batch_metrics
 
     def run_training(
         self,
@@ -133,7 +137,7 @@ class Trainer:
                 iter_loader = iter(train_loader)
                 batch = next(iter_loader)
             batch = tuple(x.to(self.device) if isinstance(x, torch.Tensor) else x for x in batch)
-            loss_val, grad_norm_val = self.train_step(batch, step_fn)
+            loss_val, grad_norm_val, batch_metrics = self.train_step(batch, step_fn)
             lr = self.optimizer.param_groups[0]["lr"]
             gpu_mem = (
                 torch.cuda.max_memory_allocated(self.device) / 1e6
@@ -147,6 +151,7 @@ class Trainer:
                 lr=lr,
                 grad_norm=grad_norm_val,
                 gpu_mem_mb=gpu_mem,
+                batch_metrics=batch_metrics,
             )
 
             pbar.update(1)

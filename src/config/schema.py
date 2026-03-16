@@ -37,6 +37,8 @@ class DataConfig:
     data_quality: str = "medium"
     data_dir: str = "datasets"
     horizon: int = 20
+    # Query = last K steps of current trajectory; K=1 = OpenVLA-style; None = use horizon
+    query_history_length: Optional[int] = None
     prompt_length: int = 5
     return_scale: float = 500.0
     batch_size: int = 128
@@ -53,7 +55,9 @@ class DataConfig:
     context_sort_ascending: bool = True
     context_sampling: str = "random"
     max_total_prompt_length: Optional[int] = None
-    # "subsampled" = prompt_length steps per context traj; "full_trajectory" = entire traj (capped by max_total_prompt_length)
+    # full_trajectory only: max steps per context trajectory (each demo capped to this; then concatenated and capped by max_total_prompt_length)
+    max_prompt_trajectory_length: Optional[int] = None
+    # "subsampled" = prompt_length steps per context traj; "full_trajectory" = full traj per demo (capped per traj, then total)
     context_style: str = "subsampled"
     lazy_dataset: bool = True
     max_training_examples: int = 500_000
