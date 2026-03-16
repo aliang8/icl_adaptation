@@ -60,7 +60,20 @@ uv run python -m src.train \
 - Training loads trajectories from the manifest + HuggingFace (or local) data and writes checkpoints under `outputs/icl_adaptation/<date>/<run_name>__seed_<X>__<hash>/`.
 - At startup, **dataset stats** print observation keys: **Image keys (config)** = `primary_images_jpeg`, `wrist_images_jpeg` (primary + wrist camera in Hub/Parquet) and **Proprio keys (config)** = `proprio`. The current HDF5 loader provides proprio only; use Parquet or an image-enabled loader for vision.
 
-**Eval rollouts:** `env_name` is the [LIBERO](https://github.com/Lifelong-Robot-Learning/LIBERO) benchmark suite: **libero_10**, **libero_spatial**, **libero_object**, **libero_goal**, or **libero_90**. Install the LIBERO sim with: `uv sync --extra libero` (or `pip install -e ".[libero]"`). Then eval rollouts run in that suite (task 0). Without the extra, rollouts are skipped and a warning is logged; you still get **offline** evaluation via `scripts/run_libero_eval.py` (see §5). See also [Cosmos Policy LIBERO.md](https://github.com/NVlabs/cosmos-policy/blob/main/LIBERO.md). To skip rollout attempts entirely, set `experiment.eval_every_steps=0`.
+**Eval rollouts:** `env_name` is the [LIBERO](https://github.com/Lifelong-Robot-Learning/LIBERO) benchmark suite: **libero_10**, **libero_spatial**, **libero_object**, **libero_goal**, or **libero_90**. Eval rollouts need the `libero` package installed so we can create the sim env. Without it you get `ModuleNotFoundError: No module named 'libero'` at eval; you can still use offline eval via `scripts/run_libero_eval.py` (see §5) or set `experiment.eval_every_steps=0` to skip rollouts.
+
+**Installing LIBERO (sim for eval rollouts):** Clone LIBERO **inside** this project so the code can add it to `sys.path` and import it when you run from the project root:
+
+```bash
+# 1. Clone LIBERO into this repo (so you have icl_adaptation/LIBERO/)
+cd /path/to/icl_adaptation
+git clone https://github.com/Lifelong-Robot-Learning/LIBERO.git
+
+# 2. Install our libero extra (robosuite, bddl, h5py). No need to pip install LIBERO.
+uv sync --extra libero
+```
+
+When you run `uv run python -m src.train ...` from `icl_adaptation`, the LIBERO path is set so `import libero` finds `LIBERO/libero/`. If you see `ModuleNotFoundError: No module named 'robosuite.environments.manipulation.single_arm_env'`, re-sync so robosuite 1.4.x is installed: `uv sync --extra libero` (we pin `robosuite>=1.4.0,<1.5` for LIBERO compatibility).
 
 To **disable** env-based evaluation (no rollouts, same as ICRT-MT):
 

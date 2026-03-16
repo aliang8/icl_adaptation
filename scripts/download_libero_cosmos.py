@@ -88,17 +88,20 @@ def main():
         from src.data.libero_dataset import _parse_all_episodes_hdf5_filename
 
         import random as _rnd
+
         rng = _rnd.Random(args.seed)
         file_episodes = []
         for path in hdf5_files:
             rel = path.relative_to(out_root).as_posix()
             parsed = _parse_all_episodes_hdf5_filename(path.name)
-            file_episodes.append({
-                "file": rel,
-                "task_description": None,
-                "success": parsed["success"],
-                "suite": parsed["suite"],
-            })
+            file_episodes.append(
+                {
+                    "file": rel,
+                    "task_description": None,
+                    "success": parsed["success"],
+                    "suite": parsed["suite"],
+                }
+            )
         by_suite = {}
         for ep in file_episodes:
             by_suite.setdefault(ep["suite"], []).append(ep)
@@ -129,13 +132,19 @@ def main():
             len(train_episodes),
             len(val_episodes),
         )
-        log("Done. Use data_dir=%s for training (loader will read HDF5 per episode).", out_root.parent)
+        log(
+            "Done. Use data_dir=%s for training (loader will read HDF5 per episode).",
+            out_root.parent,
+        )
         return
 
     # Prefer local parquet from "hf download --local-dir LIBERO-Cosmos-Policy"
     parquet_train = sorted(out_root.glob("train*.parquet")) or sorted(out_root.glob("*.parquet"))
     if parquet_train and not args.streaming:
-        log("Loading from local parquet (hf download layout): %s", [p.name for p in parquet_train[:3]])
+        log(
+            "Loading from local parquet (hf download layout): %s",
+            [p.name for p in parquet_train[:3]],
+        )
         if len(parquet_train) > 3:
             log("  ... and %d more file(s)", len(parquet_train) - 3)
         data_files = [str(p) for p in parquet_train]
@@ -248,9 +257,7 @@ def main():
                         return "libero_10"
                     return "unknown"
 
-                episode_boundaries.append(
-                    (start, len(eps), t, succ, _infer_suite(t))
-                )
+                episode_boundaries.append((start, len(eps), t, succ, _infer_suite(t)))
         else:
             # Infer boundaries by task_description change (Parquet has no episode_index; ~643k rows)
             if "task_description" not in ds.column_names:
@@ -260,7 +267,10 @@ def main():
                 )
                 episode_boundaries = [(0, len(ds), None, None, "unknown")]
             else:
-                log("Using task_description to infer episode boundaries (columns: %s)", ds.column_names)
+                log(
+                    "Using task_description to infer episode boundaries (columns: %s)",
+                    ds.column_names,
+                )
                 task_col = ds["task_description"]
                 success_col = ds["success"] if "success" in ds.column_names else [None] * len(ds)
                 episode_boundaries = []
@@ -288,14 +298,18 @@ def main():
 
                 start = 0
                 for i in range(1, len(ds)):
-                    t_prev = _norm_task(task_col[i - 1] if hasattr(task_col, "__getitem__") else None)
+                    t_prev = _norm_task(
+                        task_col[i - 1] if hasattr(task_col, "__getitem__") else None
+                    )
                     t_cur = _norm_task(task_col[i] if hasattr(task_col, "__getitem__") else None)
                     if t_prev != t_cur:
                         task = task_col[start] if hasattr(task_col, "__getitem__") else None
                         succ = success_col[start] if start < len(success_col) else None
                         if isinstance(succ, (list, tuple)):
                             succ = succ[0] if succ else None
-                        episode_boundaries.append((start, i, _norm_task(task), succ, _infer_suite(task)))
+                        episode_boundaries.append(
+                            (start, i, _norm_task(task), succ, _infer_suite(task))
+                        )
                         start = i
                 if start < len(ds):
                     task = task_col[start] if hasattr(task_col, "__getitem__") else None
@@ -310,7 +324,16 @@ def main():
         total_rows = episode_boundaries[-1][1] if episode_boundaries else 0
         log("VERIFY: %d episodes, %d total rows", len(episode_boundaries), total_rows)
         for i, (s, e, task, succ, suite) in enumerate(episode_boundaries[:5]):
-            log("  episode %d: [%d, %d) len=%d task=%s success=%s suite=%s", i, s, e, e - s, repr(task)[:50], succ, suite)
+            log(
+                "  episode %d: [%d, %d) len=%d task=%s success=%s suite=%s",
+                i,
+                s,
+                e,
+                e - s,
+                repr(task)[:50],
+                succ,
+                suite,
+            )
         if len(episode_boundaries) > 5:
             log("  ... and %d more episodes", len(episode_boundaries) - 5)
         log("Verify done. Re-run without --verify to write manifest and save data.")

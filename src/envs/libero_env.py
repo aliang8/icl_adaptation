@@ -9,12 +9,20 @@ See: https://github.com/Lifelong-Robot-Learning/LIBERO
 from __future__ import annotations
 
 import os
+import sys
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 
 # Benchmark suite names (lowercase, as in get_benchmark_dict()). No libero import here so callers can use this without installing libero.
 LIBERO_SUITES = ("libero_10", "libero_spatial", "libero_object", "libero_goal", "libero_90")
+
+# Add project's LIBERO clone to path when this module is loaded, so "import libero" works when running from project root.
+_project_root = Path(__file__).resolve().parent.parent.parent
+_libero_dir = _project_root / "LIBERO"
+if _libero_dir.is_dir() and str(_libero_dir) not in sys.path:
+    sys.path.insert(0, str(_libero_dir))
 
 
 def _obs_to_proprio(obs: Any, state_dim: int = 9) -> np.ndarray:
@@ -64,9 +72,11 @@ def make_libero_env(
 
     try:
         import gymnasium as gym
+
         Box = gym.spaces.Box
     except ImportError:
         import gym
+
         Box = gym.spaces.Box
 
     benchmark_dict = benchmark.get_benchmark_dict()
@@ -90,12 +100,16 @@ def make_libero_env(
     )
 
     observation_space = Box(
-        low=-np.inf, high=np.inf,
-        shape=(state_dim,), dtype=np.float32,
+        low=-np.inf,
+        high=np.inf,
+        shape=(state_dim,),
+        dtype=np.float32,
     )
     action_space = Box(
-        low=-1.0, high=1.0,
-        shape=(action_dim,), dtype=np.float32,
+        low=-1.0,
+        high=1.0,
+        shape=(action_dim,),
+        dtype=np.float32,
     )
 
     class LIBEROWrapper:
@@ -118,7 +132,12 @@ def make_libero_env(
         def step(self, action: np.ndarray):
             action = np.asarray(action, dtype=np.float64).flatten()[: self._action_dim]
             if action.size < self._action_dim:
-                action = np.pad(action, (0, self._action_dim - action.size), mode="constant", constant_values=0.0)
+                action = np.pad(
+                    action,
+                    (0, self._action_dim - action.size),
+                    mode="constant",
+                    constant_values=0.0,
+                )
             step_out = self._env.step(action)
             if len(step_out) == 4:
                 obs, reward, done, info = step_out

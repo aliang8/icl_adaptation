@@ -91,7 +91,9 @@ def run_action_compare_eval(
                 if use_gt_action:
                     prev_actions = torch.from_numpy(gt_actions[:t].astype(np.float32)).to(device)
                 else:
-                    prev_actions = torch.from_numpy(np.stack(pred_list).astype(np.float32)).to(device)
+                    prev_actions = torch.from_numpy(np.stack(pred_list).astype(np.float32)).to(
+                        device
+                    )
                 prev_actions = prev_actions.reshape(1, t, act_dim)
                 pad_last = torch.ones(1, 1, act_dim, device=device) * -10.0
                 actions_input = torch.cat([prev_actions, pad_last], dim=1)
@@ -126,6 +128,7 @@ def run_action_compare_eval(
 
     try:
         import matplotlib
+
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 

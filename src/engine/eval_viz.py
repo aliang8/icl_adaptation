@@ -16,16 +16,15 @@ def _try_make_env(env_name: str):
     from src.envs.libero_env import LIBERO_SUITES, make_libero_env
 
     if env_name in LIBERO_SUITES:
-        try:
-            return make_libero_env(suite_name=env_name, task_id=0, state_dim=9, action_dim=7)
-        except ImportError:
-            return None  # libero not installed; caller will log and skip rollouts
+        return make_libero_env(suite_name=env_name, task_id=0, state_dim=9, action_dim=7)
     try:
         import gymnasium as gym
+
         return gym.make(env_name)
     except Exception:
         try:
             import gym
+
             return gym.make(env_name)
         except Exception:
             return None
@@ -35,6 +34,7 @@ def _wrap_record_video(env: Any, video_folder: Path):
     """Wrap env with RecordVideo if available (Gymnasium or gym). Returns wrapped env or original."""
     try:
         import gymnasium as gym
+
         if hasattr(gym, "wrappers") and hasattr(gym.wrappers, "RecordVideo"):
             return gym.wrappers.RecordVideo(
                 env,
@@ -45,10 +45,13 @@ def _wrap_record_video(env: Any, video_folder: Path):
         pass
     try:
         import gym
+
         if hasattr(gym, "wrappers") and hasattr(gym.wrappers, "RecordVideo"):
             return gym.wrappers.RecordVideo(env, str(video_folder), episode_trigger=lambda ep: True)
         if hasattr(gym, "wrappers") and hasattr(gym.wrappers, "Monitor"):
-            return gym.wrappers.Monitor(env, str(video_folder), video_callable=lambda ep: True, force=True)
+            return gym.wrappers.Monitor(
+                env, str(video_folder), video_callable=lambda ep: True, force=True
+            )
     except Exception:
         pass
     return env
@@ -77,6 +80,7 @@ def run_rollouts_and_save_viz(
         try:
             from loguru import logger as _log
             from src.envs.libero_env import LIBERO_SUITES
+
             if env_name in LIBERO_SUITES:
                 _log.warning(
                     "Eval rollouts skipped: LIBERO not installed for '{}'. "

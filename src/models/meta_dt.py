@@ -119,7 +119,9 @@ class MetaDecisionTransformer(nn.Module):
                     _,
                     prompt_attention_mask,
                 ) = batch.prompt
-                full_actions = torch.cat([prompt_actions.to(pred_actions_full.device), batch.actions], dim=1)
+                full_actions = torch.cat(
+                    [prompt_actions.to(pred_actions_full.device), batch.actions], dim=1
+                )
                 full_mask = torch.cat([prompt_attention_mask.to(mask.device), mask], dim=1)
                 loss = self.compute_loss(pred_actions_full, full_actions, full_mask)
             else:

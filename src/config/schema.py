@@ -29,10 +29,14 @@ class ModelConfig:
     image_embed_dim: int = 256
     # Transformer backbone: "gpt2" (custom) or "llama2" (HuggingFace pretrained)
     transformer_backbone: str = "gpt2"
-    llama_model_name: Optional[str] = None  # e.g. "meta-llama/Llama-2-7b-hf"; used when transformer_backbone=llama2
+    llama_model_name: Optional[str] = (
+        None  # e.g. "meta-llama/Llama-2-7b-hf"; used when transformer_backbone=llama2
+    )
     # Vision encoder type: "patch" (trainable per-patch), "crossmae" (ViT per-patch), "dinov2"/"dinov3" (1 emb per image), "paligemma" (SigLIP)
     vision_encoder_type: str = "patch"
-    vision_encoder_pool: bool = True  # if True, output 1 embedding per image (for fusion); if False, per-patch
+    vision_encoder_pool: bool = (
+        True  # if True, output 1 embedding per image (for fusion); if False, per-patch
+    )
     # ICRT-style attention pooling over patch tokens (learned query) instead of mean; used for crossmae and optionally patch/dinov2
     vision_encoder_attention_pool: bool = False
     # ICRT-style: only compute action loss on the query segment (default True). If False, loss on prompt + query.
@@ -139,8 +143,12 @@ class ExperimentConfig:
     eval_every_steps: int = 1000
     num_eval_episodes: int = 5
     num_eval_rollouts: int = 5  # number of env rollouts per eval (for real eval)
-    save_eval_video: bool = False  # if True, wrap eval env with RecordVideo and save to viz/samples/step_XXX/videos/
-    run_action_compare_eval: bool = False  # if True, plot predicted vs GT actions on demos to viz/action_compare/
+    save_eval_video: bool = (
+        False  # if True, wrap eval env with RecordVideo and save to viz/samples/step_XXX/videos/
+    )
+    run_action_compare_eval: bool = (
+        False  # if True, plot predicted vs GT actions on demos to viz/action_compare/
+    )
     num_action_compare_demos: int = 3  # number of trajectories to use for action-comparison plots
     warm_train_steps: int = 70_000
     zero_shot: bool = False

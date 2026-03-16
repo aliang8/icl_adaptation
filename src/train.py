@@ -662,9 +662,7 @@ def main():
         use_vision=data_cfg.use_vision,
     )
 
-    num_instructions = (
-        len(dataset.task_instructions) if dataset.task_instructions else None
-    )
+    num_instructions = len(dataset.task_instructions) if dataset.task_instructions else None
     model = build_model(cfg, state_dim, action_dim, num_instructions=num_instructions).to(device)
     _print_model_architecture(model)
     optimizer, scheduler = build_optimizer_scheduler(model, cfg)
@@ -731,7 +729,11 @@ def main():
             scale=data_cfg.return_scale,
             save_video=cfg.experiment.save_eval_video,
         )
-        if cfg.experiment.run_action_compare_eval and hasattr(dataset, "trajectories") and dataset.trajectories:
+        if (
+            cfg.experiment.run_action_compare_eval
+            and hasattr(dataset, "trajectories")
+            and dataset.trajectories
+        ):
             action_metrics = run_action_compare_eval(
                 model=model,
                 trajectories=dataset.trajectories,

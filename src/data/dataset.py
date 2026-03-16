@@ -161,9 +161,7 @@ class ICLTrajectoryDatasetBase(Dataset, ABC):
         ]
         tlen = state_seg.shape[0]
         pad_len = K - tlen
-        state_seg = np.concatenate(
-            [np.zeros((pad_len, state_seg.shape[1])), state_seg], axis=0
-        )
+        state_seg = np.concatenate([np.zeros((pad_len, state_seg.shape[1])), state_seg], axis=0)
         state_seg = (state_seg - state_mean) / state_std
         context_seg = np.concatenate(
             [np.zeros((pad_len, context_seg.shape[1])), context_seg], axis=0
@@ -174,10 +172,7 @@ class ICLTrajectoryDatasetBase(Dataset, ABC):
         reward_seg = np.concatenate([np.zeros((pad_len, 1)), reward_seg], axis=0)
         done_seg = np.concatenate([np.ones(pad_len) * 2, done_seg], axis=0)
         rtg_seg = discount_cumsum(traj["rewards"][start:], gamma=1.0)[:tlen].reshape(-1, 1)
-        rtg_seg = (
-            np.concatenate([np.zeros((pad_len, 1)), rtg_seg], axis=0)
-            / self.return_scale
-        )
+        rtg_seg = np.concatenate([np.zeros((pad_len, 1)), rtg_seg], axis=0) / self.return_scale
         ts_seg = np.arange(start, start + tlen, dtype=np.float32)
         ts_seg[ts_seg >= max_ep_len] = max_ep_len - 1
         ts_seg = np.concatenate([np.zeros(pad_len), ts_seg], axis=0)
@@ -618,10 +613,7 @@ class FullTrajectoryICLTrajectoryDataset(ICLTrajectoryDatasetBase):
         ps = (traj["observations"][start : start + T] - state_mean) / state_std
         pa = traj["actions"][start : start + T]
         pr = traj["rewards"][start : start + T].reshape(-1, 1)
-        prtg = (
-            discount_cumsum(traj["rewards"][start:], gamma=1.0)[:T].reshape(-1, 1)
-            / self.scale
-        )
+        prtg = discount_cumsum(traj["rewards"][start:], gamma=1.0)[:T].reshape(-1, 1) / self.scale
         pts = np.arange(start, start + T, dtype=np.float32)
         pm = np.ones(T, dtype=np.float32)
         return ps, pa, pr, prtg, pts, pm

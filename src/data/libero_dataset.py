@@ -62,7 +62,9 @@ def _load_trajectory_from_hdf5(
     try:
         import h5py
     except ImportError:
-        raise ImportError("Install h5py for HDF5 support: pip install h5py (or uv sync --extra icrt)")
+        raise ImportError(
+            "Install h5py for HDF5 support: pip install h5py (or uv sync --extra icrt)"
+        )
     with h5py.File(file_path, "r") as f:
         proprio = np.asarray(f["proprio"], dtype=np.float32)
         actions = np.asarray(f["actions"], dtype=np.float32)
@@ -212,10 +214,7 @@ def load_libero_trajectories(
         train_eps = []
 
     root = Path(data_dir or ".").resolve() / "LIBERO-Cosmos-Policy"
-    use_hdf5 = (
-        bool(train_eps)
-        and ("file" in train_eps[0] or manifest.get("data_source") == "hdf5")
-    )
+    use_hdf5 = bool(train_eps) and ("file" in train_eps[0] or manifest.get("data_source") == "hdf5")
     trajectories = []
     task_to_trajs: Dict[str, List[Dict]] = {}
     task_order: List[str] = []

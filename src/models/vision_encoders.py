@@ -126,9 +126,7 @@ def _build_patch_encoder(
                 self.encoder = enc
                 self.num_views = n_views
                 self.num_tokens_per_view = n_tok
-                self.pool = nn.ModuleList([
-                    AttentionPooling(dim, dim) for _ in range(n_views)
-                ])
+                self.pool = nn.ModuleList([AttentionPooling(dim, dim) for _ in range(n_views)])
                 self.output_dim = n_views * dim
 
             def forward(self, images: List[torch.Tensor]) -> torch.Tensor:
@@ -189,9 +187,9 @@ def _build_dinov2_encoder(
             self.use_attention_pool = use_attention_pool
             self.output_dim = n_views * hidden_size
             if use_attention_pool:
-                self.pool = nn.ModuleList([
-                    AttentionPooling(hidden_size, hidden_size) for _ in range(n_views)
-                ])
+                self.pool = nn.ModuleList(
+                    [AttentionPooling(hidden_size, hidden_size) for _ in range(n_views)]
+                )
 
         def forward(self, images: List[torch.Tensor]) -> torch.Tensor:
             B, T = _ensure_bt(images)
@@ -298,9 +296,9 @@ def _build_crossmae_encoder(
             self.use_attention_pool = use_attention_pool
             self.output_dim = n_views * hidden_size
             if use_attention_pool:
-                self.pool = nn.ModuleList([
-                    AttentionPooling(hidden_size, hidden_size) for _ in range(n_views)
-                ])
+                self.pool = nn.ModuleList(
+                    [AttentionPooling(hidden_size, hidden_size) for _ in range(n_views)]
+                )
 
         def forward(self, images: List[torch.Tensor]) -> torch.Tensor:
             B, T = _ensure_bt(images)

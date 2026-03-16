@@ -24,11 +24,13 @@ dependencies = [
 d4rl = ["minari[all]"]
 # ICRT-style: robot manipulation with language + multi-view images (HuggingFace + HDF5 + viz).
 icrt = ["huggingface_hub>=0.20.0", "h5py>=3.8.0", "matplotlib>=3.5.0", "datasets>=2.0.0"]
-# LIBERO: sim env for eval rollouts (libero_10, libero_spatial, etc.). See https://github.com/Lifelong-Robot-Learning/LIBERO
+# LIBERO: deps for sim env. Pin robosuite 1.4.x for LIBERO compatibility. Clone LIBERO inside this repo, then: uv sync --extra libero
 libero = [
-    "libero @ git+https://github.com/Lifelong-Robot-Learning/LIBERO.git",
-    "robosuite>=1.4.0",
+    "robosuite>=1.4.0,<1.5",
     "bddl>=1.0.1",
+    "easydict>=1.9",
+    "h5py>=3.8.0",
+    "matplotlib>=3.5.0",
 ]
 # DINOv2, SigLIP/PaliGemma, ViT (CrossMAE-style) use transformers. LLaMA 2 needs HuggingFace token for gated models.
 dev = ["pytest", "ruff"]
