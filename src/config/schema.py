@@ -35,6 +35,8 @@ class ModelConfig:
     vision_encoder_pool: bool = True  # if True, output 1 embedding per image (for fusion); if False, per-patch
     # ICRT-style attention pooling over patch tokens (learned query) instead of mean; used for crossmae and optionally patch/dinov2
     vision_encoder_attention_pool: bool = False
+    # ICRT-style: only compute action loss on the query segment (default True). If False, loss on prompt + query.
+    query_loss_only: bool = True
 
 
 @dataclass

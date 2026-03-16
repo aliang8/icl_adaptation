@@ -113,6 +113,8 @@ class ICLTrajectoryDatasetBase(Dataset, ABC):
         self.context_sampling = context_sampling
         self.trajectory_contexts = trajectory_contexts or {}
         self.task_instructions = task_instructions
+        self.prompt_length = None
+        self.max_prompt_trajectory_length = None
         self._lazy = lazy_dataset
         self._max_examples = max_training_examples if lazy_dataset else None
         self._seed = seed
@@ -607,7 +609,7 @@ class FullTrajectoryICLTrajectoryDataset(ICLTrajectoryDatasetBase):
         T = traj["rewards"].shape[0]
         if T == 0:
             raise ValueError("Empty trajectory in _prompt_from_full_trajectory")
-        cap = getattr(self, "max_prompt_trajectory_length", None)
+        cap = self.max_prompt_trajectory_length
         if cap is not None and T > cap:
             start = T - cap
             T = cap

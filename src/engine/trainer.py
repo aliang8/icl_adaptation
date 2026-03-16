@@ -40,7 +40,7 @@ class Trainer:
         self.exp_cfg = cfg.experiment
         self.sys_cfg = cfg.system
         self.optim_cfg = cfg.optim
-        self.save_dir = getattr(self, "_save_dir_override", None) or self.sys_cfg.save_dir
+        self.save_dir = self._save_dir_override or self.sys_cfg.save_dir
         self.rank = self.sys_cfg.rank
         self.best_metric_name = self.exp_cfg.best_metric_name
         self.best_metric_mode = self.exp_cfg.best_metric_mode

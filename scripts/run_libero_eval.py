@@ -132,9 +132,9 @@ def main():
     state_mean = np.zeros(state_dim, dtype=np.float32)
     state_std = np.ones(state_dim, dtype=np.float32)
 
-    horizon = getattr(cfg.data, "horizon", 32)
-    max_ep_len = getattr(cfg.data, "max_episode_steps", 512)
-    return_scale = getattr(cfg.data, "return_scale", 1.0)
+    horizon = cfg.data.horizon
+    max_ep_len = cfg.data.max_episode_steps
+    return_scale = cfg.data.return_scale
 
     results_by_suite = {}
     all_mse = []

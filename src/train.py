@@ -95,7 +95,7 @@ def _print_dataset_stats(dataset, loader, env_name: str = "", data_quality: str 
     table.add_row("Segments (training)", f"{n_segments:,}")
     table.add_row("Total steps", f"{total_steps:,}")
     table.add_row("Traj length (min / max / mean)", f"{min_len} / {max_len} / {mean_len:.1f}")
-    if getattr(dataset, "task_instructions", None):
+    if dataset.task_instructions:
         tasks = dataset.task_instructions
         num_tasks = len(tasks)
         table.add_row("Num tasks", str(num_tasks))
@@ -115,16 +115,16 @@ def _print_dataset_stats(dataset, loader, env_name: str = "", data_quality: str 
     table.add_row("State dim", str(dataset.state_dim))
     table.add_row("Action dim", str(dataset.act_dim))
     table.add_row("Horizon", str(dataset.horizon))
-    k = getattr(dataset, "_query_length", dataset.horizon)
+    k = dataset._query_length
     table.add_row("Query history length (K)", str(k) + (" (OpenVLA-style)" if k == 1 else ""))
     table.add_row("Max episode steps", str(dataset.max_episode_steps))
     table.add_row("Context trajectories", str(dataset.num_context_trajectories))
-    prompt_len = getattr(dataset, "prompt_length", None)
+    prompt_len = dataset.prompt_length
     table.add_row(
         "Prompt length",
         str(prompt_len) if prompt_len is not None else "— (full traj)",
     )
-    max_pt = getattr(dataset, "max_prompt_trajectory_length", None)
+    max_pt = dataset.max_prompt_trajectory_length
     if max_pt is not None:
         table.add_row("Max prompt trajectory length", str(max_pt))
     table.add_row("Total prompt length", str(dataset.total_prompt_len))
@@ -216,13 +216,14 @@ def build_model(cfg, state_dim: int, action_dim: int, num_instructions: Optional
         n_layer=m.n_layer,
         n_head=m.n_head,
         n_inner=n_inner,
-        n_positions=getattr(m, "n_positions", 1024),
+        n_positions=m.n_positions,
         activation_function=m.activation_function,
         resid_pdrop=m.resid_pdrop,
         attn_pdrop=m.attn_pdrop,
         action_tanh=m.action_tanh,
-        transformer_backbone=getattr(m, "transformer_backbone", "gpt2"),
-        llama_model_name=getattr(m, "llama_model_name", None),
+        transformer_backbone=m.transformer_backbone,
+        llama_model_name=m.llama_model_name,
+        query_loss_only=m.query_loss_only,
     )
     if m.use_vision or m.use_language:
         model = VLADecisionTransformer(
@@ -232,9 +233,9 @@ def build_model(cfg, state_dim: int, action_dim: int, num_instructions: Optional
             num_instructions=num_instructions or 0,
             num_views=m.num_views,
             image_embed_dim=m.image_embed_dim,
-            vision_encoder_type=getattr(m, "vision_encoder_type", "patch"),
-            vision_encoder_pool=getattr(m, "vision_encoder_pool", True),
-            vision_encoder_attention_pool=getattr(m, "vision_encoder_attention_pool", False),
+            vision_encoder_type=m.vision_encoder_type,
+            vision_encoder_pool=m.vision_encoder_pool,
+            vision_encoder_attention_pool=m.vision_encoder_attention_pool,
         )
     else:
         model = MetaDecisionTransformer(**common)
@@ -291,7 +292,7 @@ def make_train_step_fn(task_instructions):
 
         # VLA-DT: instruction indices (one per sample) from task_instructions
         instruction_indices = None
-        if getattr(model, "use_language", False) and task_list and instructions is not None:
+        if model.use_language and task_list and instructions is not None:
             device = next(model.parameters()).device
             idx_list = [
                 task_list.index(instr) if instr in task_list else 0 for instr in instructions
@@ -301,14 +302,14 @@ def make_train_step_fn(task_instructions):
         # VLA-DT: image_embeddings when dataset returns images (optional 16th element)
         image_embeddings = None
         if len(batch) > 15 and batch[15] is not None:
-            if getattr(model, "vision_encoder", None) is not None:
+            if model.vision_encoder is not None:
                 image_embeddings = model.vision_encoder(batch[15])
 
         dt_batch = DTBatch(
             states=states,
             contexts=contexts,
             actions=actions,
-            returns_to_go=rtg[:, :-1],
+            returns_to_go=rtg,
             timesteps=timesteps,
             attention_mask=masks,
             prompt=prompt,
@@ -636,7 +637,7 @@ def main():
     )
 
     num_instructions = (
-        len(dataset.task_instructions) if getattr(dataset, "task_instructions", None) else None
+        len(dataset.task_instructions) if dataset.task_instructions else None
     )
     model = build_model(cfg, state_dim, action_dim, num_instructions=num_instructions).to(device)
     _print_model_architecture(model)
@@ -708,7 +709,7 @@ def main():
 
     log.info("Starting training loop (max_steps={})", cfg.experiment.max_steps)
     export_dir = str(run_dir / "artifacts" / "inference")
-    train_step_fn = make_train_step_fn(getattr(dataset, "task_instructions", None) or [])
+    train_step_fn = make_train_step_fn(dataset.task_instructions or [])
     final_step, best_metric = trainer.run_training(
         train_loader=loader,
         global_step_start=global_step_start,

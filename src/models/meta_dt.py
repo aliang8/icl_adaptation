@@ -41,10 +41,12 @@ class MetaDecisionTransformer(nn.Module):
         n_positions: int = 1024,
         transformer_backbone: str = "gpt2",
         llama_model_name: Optional[str] = None,
+        query_loss_only: bool = True,
         **kwargs,
     ):
         super().__init__()
         self.state_dim = state_dim
+        self.query_loss_only = query_loss_only
         self.act_dim = act_dim
         self.context_dim = context_dim
         self.max_length = max_length
@@ -81,6 +83,8 @@ class MetaDecisionTransformer(nn.Module):
             (nn.Tanh() if action_tanh else nn.Identity()),
         )
         self.predict_return = nn.Linear(hidden_size, 1)
+        self.use_language = False
+        self.vision_encoder = None
 
     def forward(self, batch: DTBatch) -> DTOutput:
         B, T = batch.states.shape[0], batch.states.shape[1]
@@ -100,9 +104,26 @@ class MetaDecisionTransformer(nn.Module):
         hidden = self._run_backbone(stacked, stacked_mask)
         pred_returns = self.predict_return(hidden[:, 2])[:, -T:, :]
         pred_states = self.predict_state(hidden[:, 2])[:, -T:, :]
-        pred_actions = self.predict_action(hidden[:, 1])[:, -T:, :]
+        pred_actions_full = self.predict_action(hidden[:, 1])
+        pred_actions = pred_actions_full[:, -T:, :]
 
-        loss = self.compute_loss(pred_actions, batch.actions, mask)
+        if self.query_loss_only:
+            loss = self.compute_loss(pred_actions, batch.actions, mask)
+        else:
+            if batch.prompt is not None:
+                (
+                    _,
+                    prompt_actions,
+                    _,
+                    _,
+                    _,
+                    prompt_attention_mask,
+                ) = batch.prompt
+                full_actions = torch.cat([prompt_actions.to(pred_actions_full.device), batch.actions], dim=1)
+                full_mask = torch.cat([prompt_attention_mask.to(mask.device), mask], dim=1)
+                loss = self.compute_loss(pred_actions_full, full_actions, full_mask)
+            else:
+                loss = self.compute_loss(pred_actions, batch.actions, mask)
         return DTOutput(
             loss=loss,
             pred_actions=pred_actions,

@@ -107,7 +107,7 @@ class VLADecisionTransformer(MetaDecisionTransformer):
                 pool=vision_encoder_pool,
                 attention_pool=vision_encoder_attention_pool,
             )
-            out_dim = getattr(self.vision_encoder, "output_dim", image_embed_dim * num_views)
+            out_dim = self.vision_encoder.output_dim
             self.vision_proj = nn.Linear(out_dim, hidden_size)
         else:
             self.vision_encoder = None
