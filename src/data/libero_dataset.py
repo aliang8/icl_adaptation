@@ -2,15 +2,19 @@
 LIBERO-Cosmos-Policy dataset: load from HuggingFace (or local disk) and produce
 trajectories in the same format as ICLTrajectoryDataset (observations=proprio, actions, rewards, terminals).
 
+Data sources (see https://huggingface.co/datasets/nvidia/LIBERO-Cosmos-Policy):
+- HDF5 (recommended): after "hf download ... --local-dir LIBERO-Cosmos-Policy", the repo has
+  all_episodes/*.hdf5 (one file per episode). Each file has proprio (T,9), actions (T,7) and
+  attributes task_description, success. Manifest lists episodes by "file" path.
+- Parquet/Hub: load_dataset() or auto-converted Parquet have no per-episode metadata, so
+  episode boundaries are lost unless the manifest was built from HDF5.
+
 Expects:
-- Either a manifest at data_dir/LIBERO-Cosmos-Policy/manifest.json with train_episodes (start, end, task_description, success, suite),
-  and data from load_dataset(repo_id) or from data_dir/LIBERO-Cosmos-Policy/data (saved with save_to_disk).
-- Or repo_id only: we load from HF and use full train split as training (no manifest).
+- Manifest at data_dir/LIBERO-Cosmos-Policy/manifest.json. If train_episodes have "file"
+  (and optionally "data_source": "hdf5"), load from HDF5. Else use start/end with a single table.
+- Or no manifest: load from HF and infer episodes if possible.
 
 Returns: (trajectories, prompt_trajectories_per_task, task_instructions)
-- trajectories: list of dicts with observations (T, 9), actions (T, 7), rewards (T), terminals (T)
-- prompt_trajectories_per_task: list of list of trajectory dicts (for in-context prompt)
-- task_instructions: list of unique task description strings
 """
 
 from __future__ import annotations
@@ -20,6 +24,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+from loguru import logger as log
 
 
 def load_libero_manifest(manifest_path: str) -> Dict[str, Any]:
@@ -28,23 +33,105 @@ def load_libero_manifest(manifest_path: str) -> Dict[str, Any]:
         return json.load(f)
 
 
+def _parse_all_episodes_hdf5_filename(filename: str) -> Dict[str, Any]:
+    """Parse episode_data--suite=X--...--task=T--ep=E--success=True|False--regen_demo.hdf5."""
+    out = {"suite": "unknown", "task_id": None, "success": None}
+    if "--suite=" in filename:
+        try:
+            i = filename.index("--suite=") + 7
+            j = filename.index("--", i) if "--" in filename[i:] else len(filename)
+            out["suite"] = filename[i:j].strip()
+        except (ValueError, IndexError):
+            pass
+    if "--success=" in filename:
+        try:
+            i = filename.index("--success=") + 10
+            j = filename.index("--", i) if "--" in filename[i:] else len(filename)
+            out["success"] = filename[i:j].strip().lower() == "true"
+        except (ValueError, IndexError):
+            pass
+    return out
+
+
+def _load_trajectory_from_hdf5(
+    file_path: Path,
+    task_description: Optional[str] = None,
+    success: Optional[bool] = None,
+) -> Dict[str, np.ndarray]:
+    """Load one trajectory from an all_episodes HDF5 file (proprio, actions, rewards, terminals)."""
+    try:
+        import h5py
+    except ImportError:
+        raise ImportError("Install h5py for HDF5 support: pip install h5py (or uv sync --extra icrt)")
+    with h5py.File(file_path, "r") as f:
+        proprio = np.asarray(f["proprio"], dtype=np.float32)
+        actions = np.asarray(f["actions"], dtype=np.float32)
+        if task_description is None and "task_description" in f.attrs:
+            task_description = f.attrs["task_description"]
+            if hasattr(task_description, "decode"):
+                task_description = task_description.decode("utf-8")
+        if success is None and "success" in f.attrs:
+            success = bool(f.attrs["success"])
+    T = proprio.shape[0]
+    if actions.shape[0] != T:
+        T = min(proprio.shape[0], actions.shape[0])
+        proprio = proprio[:T]
+        actions = actions[:T]
+    rewards = np.zeros(T, dtype=np.float32)
+    terminals = np.zeros(T, dtype=np.float32)
+    if success and T > 0:
+        rewards[-1] = 1.0
+        terminals[-1] = 1.0
+    return {
+        "observations": proprio,
+        "actions": actions,
+        "rewards": rewards,
+        "terminals": terminals,
+        "task_description": task_description,
+        "success": success,
+    }
+
+
 def _get_ds_from_cache_or_hf(
     data_dir: Optional[str],
     repo_id: str,
     split: str = "train",
 ):
-    """Load Dataset from local data_dir/LIBERO-Cosmos-Policy/data or from HuggingFace."""
+    """
+    Load Dataset from (in order):
+    1. data_dir/LIBERO-Cosmos-Policy/data (our save_to_disk format)
+    2. data_dir/LIBERO-Cosmos-Policy/*.parquet (hf download --local-dir layout)
+    3. HuggingFace hub (or cache)
+    """
     try:
         from datasets import load_dataset
     except ImportError:
         raise ImportError("Install datasets: pip install datasets")
 
     root = Path(data_dir or ".").resolve() / "LIBERO-Cosmos-Policy"
+    # 1) Our script's save_to_disk format
     local_data = root / "data"
     if local_data.is_dir():
         from datasets import load_from_disk
 
+        log.debug("Loading LIBERO-Cosmos from local data/ (save_to_disk)")
         return load_from_disk(str(local_data))
+
+    # 2) hf download --local-dir layout: parquet file(s) in repo root
+    parquet_train = sorted(root.glob("train*.parquet")) or sorted(root.glob("*.parquet"))
+    if parquet_train:
+        data_files = [str(p) for p in parquet_train]
+        log.info("Loading LIBERO-Cosmos from local parquet (hf download): %s", data_files[:3])
+        if len(data_files) > 3:
+            log.info("  ... and %d more file(s)", len(data_files) - 3)
+        return load_dataset(
+            "parquet",
+            data_files=data_files,
+            split=split,
+            trust_remote_code=True,
+        )
+
+    # 3) HuggingFace hub / cache
     return load_dataset(repo_id, split=split, trust_remote_code=True)
 
 
@@ -124,12 +211,41 @@ def load_libero_trajectories(
     else:
         train_eps = []
 
-    ds = _get_ds_from_cache_or_hf(data_dir, repo_id, split="train")
+    root = Path(data_dir or ".").resolve() / "LIBERO-Cosmos-Policy"
+    use_hdf5 = (
+        bool(train_eps)
+        and ("file" in train_eps[0] or manifest.get("data_source") == "hdf5")
+    )
     trajectories = []
     task_to_trajs: Dict[str, List[Dict]] = {}
     task_order: List[str] = []
 
-    if train_eps:
+    if use_hdf5:
+        log.info("Loading LIBERO-Cosmos from HDF5 (all_episodes/*.hdf5)")
+        for ep in train_eps:
+            if success_only and ep.get("success") is False:
+                continue
+            if max_episodes and len(trajectories) >= max_episodes:
+                break
+            file_path = root / ep["file"]
+            if not file_path.is_file():
+                log.warning("Skipping missing HDF5 file: %s", file_path)
+                continue
+            traj = _load_trajectory_from_hdf5(
+                file_path,
+                ep.get("task_description"),
+                ep.get("success"),
+            )
+            trajectories.append(traj)
+            td = traj.get("task_description") or ""
+            td = str(td).strip()
+            if td and td not in task_to_trajs:
+                task_order.append(td)
+                task_to_trajs[td] = []
+            if td:
+                task_to_trajs[td].append(traj)
+    elif train_eps:
+        ds = _get_ds_from_cache_or_hf(data_dir, repo_id, split="train")
         for ep in train_eps:
             if success_only and ep.get("success") is False:
                 continue
@@ -154,7 +270,8 @@ def load_libero_trajectories(
             if td:
                 task_to_trajs[td].append(traj)
     else:
-        # No manifest: try to use episode_index / episode_id if present
+        # No manifest or no train_eps: load full dataset and infer episodes
+        ds = _get_ds_from_cache_or_hf(data_dir, repo_id, split="train")
         cols = ds.column_names
         if "episode_index" in cols or "episode_id" in cols:
             ep_col = "episode_index" if "episode_index" in cols else "episode_id"
@@ -198,5 +315,14 @@ def load_libero_trajectories(
     prompt_per_task = [task_to_trajs.get(ti, [])[:5] for ti in task_instructions]
     if not any(prompt_per_task):
         prompt_per_task = [trajectories[:5]] * max(1, len(task_instructions))
+
+    if len(trajectories) <= 1:
+        total_steps = sum(t["rewards"].shape[0] for t in trajectories)
+        log.warning(
+            "LIBERO-Cosmos: only %d trajectory(ies) loaded (total steps=%d). "
+            "Re-run: python scripts/download_libero_cosmos.py --output-dir <data_dir> without --streaming to fetch full dataset, then check manifest.json train_episodes.",
+            len(trajectories),
+            total_steps,
+        )
 
     return trajectories, prompt_per_task, task_instructions

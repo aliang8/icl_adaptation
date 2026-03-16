@@ -18,3 +18,5 @@ use_vision: false
 use_language: false
 num_views: 2
 image_embed_dim: 256
+# ICRT-style: only compute action loss on query segment (default true)
+query_loss_only: true

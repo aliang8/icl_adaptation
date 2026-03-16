@@ -139,6 +139,9 @@ class ExperimentConfig:
     eval_every_steps: int = 1000
     num_eval_episodes: int = 5
     num_eval_rollouts: int = 5  # number of env rollouts per eval (for real eval)
+    save_eval_video: bool = False  # if True, wrap eval env with RecordVideo and save to viz/samples/step_XXX/videos/
+    run_action_compare_eval: bool = False  # if True, plot predicted vs GT actions on demos to viz/action_compare/
+    num_action_compare_demos: int = 3  # number of trajectories to use for action-comparison plots
     warm_train_steps: int = 70_000
     zero_shot: bool = False
     # checkpoint types

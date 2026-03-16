@@ -27,6 +27,7 @@ from src.engine.run_dir import (
     write_metrics_summary,
 )
 from src.engine.eval_viz import run_rollouts_and_save_viz
+from src.engine.eval_action_compare import run_action_compare_eval
 from src.engine.trainer import Trainer
 from src.models import MetaDecisionTransformer, RNNContextEncoder, VLADecisionTransformer
 from src.models.types import DTBatch
@@ -74,11 +75,24 @@ def _print_model_architecture(model, title="Model architecture"):
     console.print(Panel(str(model), title="[dim]Full model repr[/dim]", border_style="dim"))
 
 
-def _print_dataset_stats(dataset, loader, env_name: str = "", data_quality: str = ""):
+def _print_dataset_stats(
+    dataset,
+    loader,
+    env_name: str = "",
+    data_quality: str = "",
+    image_keys=None,
+    proprio_keys=None,
+    use_vision: bool = False,
+):
     """Print dataset statistics with rich formatting."""
     from rich.console import Console
     from rich.panel import Panel
     from rich.table import Table
+
+    if image_keys is None:
+        image_keys = []
+    if proprio_keys is None:
+        proprio_keys = []
 
     n_trajectories = len(dataset.trajectories)
     n_segments = len(dataset)
@@ -128,6 +142,9 @@ def _print_dataset_stats(dataset, loader, env_name: str = "", data_quality: str 
     if max_pt is not None:
         table.add_row("Max prompt trajectory length", str(max_pt))
     table.add_row("Total prompt length", str(dataset.total_prompt_len))
+    table.add_row("Use vision", "yes" if use_vision else "no")
+    table.add_row("Image keys (config)", ", ".join(image_keys) if image_keys else "—")
+    table.add_row("Proprio keys (config)", ", ".join(proprio_keys) if proprio_keys else "—")
     table.add_row("Batch size", str(loader.batch_size))
     table.add_row("Batches per epoch", f"{len(loader):,}")
 
@@ -141,14 +158,17 @@ def _print_dataset_stats(dataset, loader, env_name: str = "", data_quality: str 
 
 
 # Env observation/action dims (for known envs)
+from src.envs.libero_env import LIBERO_SUITES
+
 ENV_DIMS = {
     "HalfCheetah-v2": (17, 6),
     "AntDir-v0": (27, 8),
     "ICRT-MT": (8, 8),  # proprio (e.g. 3+1 or 6+1), action same
-    "LIBERO-Cosmos": (9, 7),  # proprio 9, action 7
     "WalkerRandParams-v0": (17, 6),
     "HopperRandParams-v0": (11, 3),
 }
+for _suite in LIBERO_SUITES:
+    ENV_DIMS[_suite] = (9, 7)  # LIBERO proprio 9, action 7
 
 
 def get_config(config_dir: str, overrides: list = None):
@@ -193,14 +213,14 @@ def validate_dataset_paths(env_name: str, paths, data_cfg) -> None:
                 f"Run: python scripts/download_icrt_dataset.py --output-dir {paths.data_root}"
             )
         log.info("ICRT-MT dataset config found: {}", config_path)
-    elif env_name == "LIBERO-Cosmos":
+    elif env_name in LIBERO_SUITES:
         manifest_path = paths.data_root / "LIBERO-Cosmos-Policy" / "manifest.json"
         if not manifest_path.exists():
             raise FileNotFoundError(
-                f"LIBERO-Cosmos manifest not found at {manifest_path}.\n"
+                f"LIBERO manifest not found at {manifest_path}.\n"
                 f"Run: python scripts/download_libero_cosmos.py --output-dir {paths.data_root}"
             )
-        log.info("LIBERO-Cosmos manifest found: {}", manifest_path)
+        log.info("LIBERO manifest found: {}", manifest_path)
 
 
 def build_model(cfg, state_dim: int, action_dim: int, num_instructions: Optional[int] = None):
@@ -472,12 +492,12 @@ def main():
         log.info("Exported model_export.pt to {}", export_dir)
         return
 
-    # Build data: D4RL HalfCheetah, LIBERO-Cosmos, AntDir-style (dataset_task_*.pkl), or dummy
+    # Build data: D4RL HalfCheetah, LIBERO (libero_10 etc.), AntDir-style (dataset_task_*.pkl), or dummy
     data_root = paths.data_root
     data_dir = data_root / data_cfg.env_name
     if data_cfg.data_quality:
         data_dir = data_dir / data_cfg.data_quality
-    if env_name == "LIBERO-Cosmos":
+    if env_name in LIBERO_SUITES:
         data_dir = data_root
     trajectories = []
     prompt_per_task = []
@@ -534,7 +554,7 @@ def main():
             action_dim,
         )
 
-    if env_name == "LIBERO-Cosmos":
+    if env_name in LIBERO_SUITES:
         from src.data.libero_dataset import load_libero_trajectories
 
         manifest_path = data_root / "LIBERO-Cosmos-Policy" / "manifest.json"
@@ -545,7 +565,7 @@ def main():
         )
         if trajectories:
             log.info(
-                "Loaded {} LIBERO-Cosmos trajectories (manifest: {})",
+                "Loaded {} LIBERO trajectories (manifest: {})",
                 len(trajectories),
                 manifest_path.resolve(),
             )
@@ -633,7 +653,13 @@ def main():
         collate_fn=collate_icl_batch,
     )
     _print_dataset_stats(
-        dataset, loader, env_name=data_cfg.env_name, data_quality=data_cfg.data_quality or ""
+        dataset,
+        loader,
+        env_name=data_cfg.env_name,
+        data_quality=data_cfg.data_quality or "",
+        image_keys=data_cfg.image_keys or [],
+        proprio_keys=data_cfg.proprio_keys or [],
+        use_vision=data_cfg.use_vision,
     )
 
     num_instructions = (
@@ -703,7 +729,24 @@ def main():
             num_rollouts=num_rollouts,
             max_episode_steps=data_cfg.max_episode_steps,
             scale=data_cfg.return_scale,
+            save_video=cfg.experiment.save_eval_video,
         )
+        if cfg.experiment.run_action_compare_eval and hasattr(dataset, "trajectories") and dataset.trajectories:
+            action_metrics = run_action_compare_eval(
+                model=model,
+                trajectories=dataset.trajectories,
+                state_mean=state_mean,
+                state_std=state_std,
+                device=device,
+                run_dir=run_dir,
+                step=step,
+                num_demos=cfg.experiment.num_action_compare_demos,
+                max_episode_steps=data_cfg.max_episode_steps,
+                scale=data_cfg.return_scale,
+                use_gt_action=True,
+                warm_train_steps=cfg.experiment.warm_train_steps,
+            )
+            metrics = {**metrics, **action_metrics}
         append_metrics_history(run_dir, step, metrics)
         return metrics
 
