@@ -165,7 +165,7 @@ def _build_dinov2_encoder(
     attention_pool: bool = False,
     **kwargs: Any,
 ) -> nn.Module:
-    """DINOv2: CLS token (default) or all patch tokens + attention pooling."""
+    """DINOv2/DINOv3: CLS token (default) or all patch tokens + attention pooling. Same API for both."""
     from transformers import AutoModel
     backbone = AutoModel.from_pretrained(model_name, **kwargs)
     hidden = backbone.config.hidden_size
@@ -341,8 +341,17 @@ def build_vision_encoder(
             attention_pool=attention_pool,
             **kwargs,
         )
-    if encoder_type in ("dinov2", "dinov3"):
+    if encoder_type == "dinov2":
         model_name = kwargs.pop("model_name", "facebook/dinov2-base")
+        return _build_dinov2_encoder(
+            num_views=num_views,
+            pool=pool,
+            model_name=model_name,
+            attention_pool=attention_pool,
+            **kwargs,
+        )
+    if encoder_type == "dinov3":
+        model_name = kwargs.pop("model_name", "facebook/dinov3-vits16-pretrain-lvd1689m")
         return _build_dinov2_encoder(
             num_views=num_views,
             pool=pool,

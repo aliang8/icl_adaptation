@@ -27,5 +27,7 @@ vision_encoder_type: patch
 vision_encoder_pool: true
 # ICRT-style attention pooling over patch tokens (set true for crossmae/dinov2 to compress patches to one token per view)
 vision_encoder_attention_pool: false
+# Freeze vision encoder (only train vision_proj + transformer); set true for pretrained dinov2/dinov3
+freeze_vision_encoder: false
 # ICRT-style: only compute action loss on query segment (default true)
 query_loss_only: true

@@ -93,9 +93,13 @@ class ICLTrajectoryDatasetBase(Dataset, ABC):
         max_training_examples: int = 500_000,
         seed: int = 0,
         query_history_length: Optional[int] = None,
+        use_vision: bool = False,
+        image_keys: Optional[List[str]] = None,
         **kwargs: Any,
     ):
         self.trajectories = trajectories
+        self.use_vision = use_vision
+        self.image_keys = image_keys or []
         self.horizon = horizon
         # Query = last K steps of current trajectory; K=1 = OpenVLA-style; None = use horizon
         self._query_length = horizon if query_history_length is None else query_history_length
@@ -216,6 +220,21 @@ class ICLTrajectoryDatasetBase(Dataset, ABC):
         instruction = ""
         if self.task_instructions and task_id < len(self.task_instructions):
             instruction = self.task_instructions[task_id] or ""
+        images_out: Optional[List[np.ndarray]] = None
+        if self.use_vision and "images" in traj and isinstance(traj.get("images"), list):
+            K = self._query_length
+            start = max(0, si - K + 1)
+            tlen = si - start + 1
+            pad_len = K - tlen
+            images_out = []
+            for view_arr in traj["images"]:
+                seg = view_arr[start : si + 1]
+                if pad_len > 0:
+                    pad_shape = (pad_len,) + seg.shape[1:]
+                    seg = np.concatenate([np.zeros(pad_shape, dtype=seg.dtype), seg], axis=0)
+                if seg.ndim == 4:
+                    seg = np.transpose(seg, (0, 3, 1, 2))
+                images_out.append(seg)
         return (
             state_seg,
             context_seg,
@@ -232,6 +251,7 @@ class ICLTrajectoryDatasetBase(Dataset, ABC):
             pts,
             pm,
             instruction,
+            images_out,
         )
 
     def _parse_segments(self) -> None:
@@ -355,13 +375,23 @@ class ICLTrajectoryDatasetBase(Dataset, ABC):
             pts,
             pm,
             instruction,
+            images_out,
         ) = out
 
         def _to_t(x: np.ndarray, long_type: bool = False) -> torch.Tensor:
             t = torch.from_numpy(np.asarray(x))
             return t.long().to(self.device) if long_type else t.float().to(self.device)
 
-        return (
+        images_t: Optional[List[torch.Tensor]] = None
+        if images_out is not None:
+            images_t = []
+            for arr in images_out:
+                t = torch.from_numpy(np.asarray(arr)).float().to(self.device)
+                if t.dim() == 4:
+                    t = t.unsqueeze(0)
+                images_t.append(t)
+
+        result: Tuple[Any, ...] = (
             _to_t(state_seg),
             _to_t(context_seg),
             _to_t(action_seg),
@@ -378,6 +408,9 @@ class ICLTrajectoryDatasetBase(Dataset, ABC):
             _to_t(pm),
             instruction,
         )
+        if self.use_vision:
+            result = result + (images_t,)
+        return result
 
     def __getitem__(self, index: int) -> Tuple[Any, ...]:
         if self._lazy:
@@ -391,7 +424,7 @@ class ICLTrajectoryDatasetBase(Dataset, ABC):
             tid = self._task_ids[index]
             if tid < len(self.task_instructions):
                 instruction = self.task_instructions[tid] or ""
-        return (
+        out: Tuple[Any, ...] = (
             self.states[index],
             self.contexts[index],
             self.actions[index],
@@ -408,6 +441,9 @@ class ICLTrajectoryDatasetBase(Dataset, ABC):
             self.prompt_masks[index],
             instruction,
         )
+        if self.use_vision:
+            out = out + (None,)
+        return out
 
 
 class SubsampledICLTrajectoryDataset(ICLTrajectoryDatasetBase):
@@ -663,16 +699,16 @@ def collate_icl_batch(batch: List[Tuple[Any, ...]]) -> Tuple[Any, ...]:
     Collate a list of ICL trajectory samples into a batch. Pads tensors with varying
     first dimension (e.g. prompt length) to the max in the batch so they can be stacked.
     Mask tensors (masks, prompt_m) are padded with 0 so padded positions are ignored.
+    If samples have 16 elements, the 16th is images (list of view tensors); collate pads and stacks per view.
     """
     if not batch:
         return tuple()
     n = len(batch)
-    # 15 elements: 14 tensors + instructions (list of str)
+    num_elems = len(batch[0])
     out: List[Any] = []
     for idx in range(15):
         items = [sample[idx] for sample in batch]
         if idx == 14:
-            # instructions: keep as list of str
             out.append(items)
             continue
         tensors = [t for t in items if isinstance(t, torch.Tensor)]
@@ -684,15 +720,34 @@ def collate_icl_batch(batch: List[Tuple[Any, ...]]) -> Tuple[Any, ...]:
         if len(set(lengths)) == 1:
             out.append(torch.stack(tensors, dim=0))
             continue
-        # Pad mask-like tensors (idx 5=dones, 7=masks, 13=prompt_m) with 0; others with 0
         pad_val = 0.0
         if idx in (5, 7, 13):
             pad_val = 0.0
         elif idx in (8, 9, 10, 11, 12):
-            # prompt tensors: prompt_rtg/rewards use 0; prompt_ts use 0; prompt_m use 0
             pad_val = 0.0
         padded = [_pad_to_length(t, max_len, dim=0, pad_value=pad_val) for t in tensors]
         out.append(torch.stack(padded, dim=0))
+    if num_elems > 15:
+        images_list = [sample[15] for sample in batch]
+        if not all(im is not None and isinstance(im, list) and len(im) > 0 for im in images_list):
+            out.append(None)
+        else:
+            num_views = len(images_list[0])
+            view_batches = []
+            for v in range(num_views):
+                tensors_v = [im[v] for im in images_list]
+                t_len = max(t.shape[1] for t in tensors_v if t.dim() >= 2)
+                padded_v = []
+                for t in tensors_v:
+                    if t.dim() == 5 and t.shape[1] < t_len:
+                        pad_size = t_len - t.shape[1]
+                        t = torch.cat(
+                            [t, torch.zeros(t.shape[0], pad_size, *t.shape[2:], device=t.device, dtype=t.dtype)],
+                            dim=1,
+                        )
+                    padded_v.append(t)
+                view_batches.append(torch.cat(padded_v, dim=0))
+            out.append(view_batches if view_batches else None)
     return tuple(out)
 
 

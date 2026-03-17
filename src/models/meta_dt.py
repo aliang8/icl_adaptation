@@ -87,6 +87,7 @@ class MetaDecisionTransformer(nn.Module):
         self.vision_encoder = None
 
     def forward(self, batch: DTBatch) -> DTOutput:
+        import ipdb; ipdb.set_trace()
         B, T = batch.states.shape[0], batch.states.shape[1]
         mask = batch.attention_mask
         if mask is None:

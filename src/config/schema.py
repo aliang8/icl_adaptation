@@ -39,6 +39,8 @@ class ModelConfig:
     )
     # ICRT-style attention pooling over patch tokens (learned query) instead of mean; used for crossmae and optionally patch/dinov2
     vision_encoder_attention_pool: bool = False
+    # Freeze vision encoder (no gradients); only vision_proj and rest of model are trained
+    freeze_vision_encoder: bool = False
     # ICRT-style: only compute action loss on the query segment (default True). If False, loss on prompt + query.
     query_loss_only: bool = True
 
@@ -53,6 +55,7 @@ class DataConfig:
     horizon: int = 20
     # Query = last K steps of current trajectory; K=1 = OpenVLA-style; None = use horizon
     query_history_length: Optional[int] = None
+    # Used only when context_style=subsampled (steps per context trajectory); ignored when context_style=full_trajectory
     prompt_length: int = 5
     return_scale: float = 500.0
     batch_size: int = 128

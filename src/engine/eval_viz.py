@@ -67,16 +67,28 @@ def _write_trial_video(video_folder: Path, trial: int, frames: List[np.ndarray],
     writer.close()
 
 
-def _add_trial_text(frame: np.ndarray, label: str) -> np.ndarray:
-    """Draw label on frame (copy). Requires cv2."""
+def _write_frames_video(video_folder: Path, filename: str, frames: List[np.ndarray], fps: int = 20) -> None:
+    """Write a list of frames to video_folder/{filename}.mp4."""
+    if not frames:
+        return
+    import imageio
+    path = video_folder / filename
+    writer = imageio.get_writer(str(path), fps=fps)
+    for f in frames:
+        writer.append_data(np.asarray(f))
+    writer.close()
+
+
+def _add_trial_text(frame: np.ndarray, label: str, y_offset: int = 18) -> np.ndarray:
+    """Draw label on frame (copy). Requires cv2. y_offset is vertical position from top."""
     import cv2
     out = np.asarray(frame).copy()
     h, w = out.shape[:2]
     font = cv2.FONT_HERSHEY_SIMPLEX
     scale = max(0.5, min(w, h) / 400.0)
     thick = max(1, int(scale * 2))
-    cv2.putText(out, label, (10, 30), font, scale, (255, 255, 255), thick, cv2.LINE_AA)
-    cv2.putText(out, label, (10, 30), font, scale, (0, 0, 0), max(1, thick - 1), cv2.LINE_AA)
+    cv2.putText(out, label, (10, y_offset), font, scale, (255, 255, 255), thick, cv2.LINE_AA)
+    cv2.putText(out, label, (10, y_offset), font, scale, (0, 0, 0), max(1, thick - 1), cv2.LINE_AA)
     return out
 
 
@@ -310,8 +322,8 @@ def run_rollouts_and_save_viz(
             all_actions_list.append(A)
             if collect_frames and frames:
                 _write_trial_video(video_folder, trial, frames)
-                for f in frames:
-                    all_frames_for_wandb.append(_add_trial_text(f, f"Trial {trial + 1}"))
+                for t, f in enumerate(frames):
+                    all_frames_for_wandb.append(_add_trial_text(f, f"Trial {trial + 1}  t={t}"))
     elif eval_context_mode == "prompt" and prompt_trajectories:
         prompt = build_prompt_tuple(
             prompt_trajectories,
@@ -336,8 +348,8 @@ def run_rollouts_and_save_viz(
             all_actions_list.append(A)
             if collect_frames and frames:
                 _write_trial_video(video_folder, ep, frames)
-                for f in frames:
-                    all_frames_for_wandb.append(_add_trial_text(f, f"Trial {ep + 1}"))
+                for t, f in enumerate(frames):
+                    all_frames_for_wandb.append(_add_trial_text(f, f"Trial {ep + 1}  t={t}"))
     else:
         for ep in range(num_rollouts):
             ep_return, length, S, A, _, frames = _run_one_rollout(
@@ -350,10 +362,13 @@ def run_rollouts_and_save_viz(
             all_actions_list.append(A)
             if collect_frames and frames:
                 _write_trial_video(video_folder, ep, frames)
-                for f in frames:
-                    all_frames_for_wandb.append(_add_trial_text(f, f"Trial {ep + 1}"))
+                for t, f in enumerate(frames):
+                    all_frames_for_wandb.append(_add_trial_text(f, f"Trial {ep + 1}  t={t}"))
 
     env.close()
+    # Save combined video (all trials with labels) to disk so it works with or without wandb
+    if collect_frames and all_frames_for_wandb:
+        _write_frames_video(video_folder, "all_trials.mp4", all_frames_for_wandb, fps=20)
     if logger and all_frames_for_wandb:
         logger.log_video("eval/rollout_video", all_frames_for_wandb, step=step, fps=20)
 

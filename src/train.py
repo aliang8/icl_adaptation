@@ -260,6 +260,7 @@ def build_model(cfg, state_dim: int, action_dim: int, num_instructions: Optional
             vision_encoder_type=m.vision_encoder_type,
             vision_encoder_pool=m.vision_encoder_pool,
             vision_encoder_attention_pool=m.vision_encoder_attention_pool,
+            freeze_vision_encoder=m.freeze_vision_encoder,
         )
     else:
         model = MetaDecisionTransformer(**common)
@@ -557,6 +558,7 @@ def main():
             str(data_root),
             manifest_path=str(manifest_path) if manifest_path.exists() else None,
             repo_id=data_cfg.libero_repo_id,
+            image_keys=data_cfg.image_keys if data_cfg.use_vision else None,
         )
         if trajectories:
             log.info(
@@ -565,50 +567,9 @@ def main():
                 manifest_path.resolve(),
             )
 
-    if not trajectories and data_dir.is_dir():
-        import pickle
-
-        for task_id in range(data_cfg.num_train_tasks):
-            path = data_dir / f"dataset_task_{task_id}.pkl"
-            if path.is_file():
-                with path.open("rb") as f:
-                    d = pickle.load(f)
-                if "states" in d:
-                    d["observations"] = d["states"]
-                    d["next_observations"] = d.get("next_states", d["states"])
-                    d["terminals"] = d.get("dones", d.get("terminals", np.zeros(len(d["rewards"]))))
-                trajs = convert_data_to_trajectories(
-                    d, data_cfg.max_episode_steps, max_trajectories=500
-                )
-                trajectories.extend(trajs)
-        for task_id in range(data_cfg.num_tasks):
-            path = data_dir / f"dataset_task_prompt{task_id}.pkl"
-            if path.is_file():
-                with path.open("rb") as f:
-                    prompt_per_task.append(pickle.load(f))
-            else:
-                prompt_per_task.append(trajectories[:5] if trajectories else [])
-        if trajectories:
-            log.info("Loaded {} trajectories from {}", len(trajectories), data_dir)
-
     if not trajectories:
-        # Dummy data for dry run
-        n_traj = 20
-        T = data_cfg.max_episode_steps
-        trajectories = [
-            {
-                "observations": np.random.randn(T, state_dim).astype(np.float32),
-                "actions": np.random.randn(T, action_dim).astype(np.float32),
-                "rewards": np.random.randn(T).astype(np.float32),
-                "next_observations": np.random.randn(T, state_dim).astype(np.float32),
-                "terminals": np.zeros(T),
-            }
-            for _ in range(n_traj)
-        ]
-        prompt_per_task = [sort_trajectories_by_return(trajectories[:5], ascending=False)] * max(
-            1, data_cfg.num_tasks
-        )
-        log.warning("No dataset found at {}; using dummy data for dry run", data_dir.resolve())
+        log.warning("No dataset found at {}", data_dir.resolve())
+        return
 
     dataset = ICLTrajectoryDataset(
         trajectories=trajectories,
@@ -636,10 +597,17 @@ def main():
         else data_cfg.task_instructions,
         seed=data_cfg.seed,
         query_history_length=data_cfg.query_history_length,
+        use_vision=data_cfg.use_vision,
+        image_keys=data_cfg.image_keys or [],
     )
     state_mean = dataset.state_mean
     state_std = dataset.state_std
     log.info("Dataset size: {} segments, state_mean/std computed", len(dataset))
+    if data_cfg.use_vision and not any(isinstance(t, dict) and t.get("images") for t in dataset.trajectories):
+        log.warning(
+            "use_vision=true but no trajectories have 'images'. "
+            "For LIBERO, use Parquet data with manifest train_episodes that have start/end (not HDF5 file paths) so image_keys are loaded."
+        )
     loader = torch.utils.data.DataLoader(
         dataset,
         batch_size=data_cfg.batch_size,
@@ -711,17 +679,17 @@ def main():
 
     def eval_fn(step):
         num_rollouts = cfg.experiment.num_eval_rollouts
-        eval_mode = getattr(cfg.experiment, "eval_context_mode", "prompt")
-        eval_k = getattr(cfg.experiment, "eval_context_k", None) or data_cfg.num_context_trajectories
+        eval_mode = cfg.experiment.eval_context_mode
+        eval_k = cfg.experiment.eval_context_k or data_cfg.num_context_trajectories
         prompt_trajectories = None
         if eval_mode == "prompt" and hasattr(dataset, "trajectories") and dataset.trajectories:
             prompt_trajectories = sample_context_trajectories(
                 dataset.trajectories,
                 n=eval_k,
                 ascending=True,
-                sampling=getattr(data_cfg, "context_sampling", "random"),
+                sampling=data_cfg.context_sampling,
             )
-        task_desc = (dataset.task_instructions or [None])[0] if getattr(dataset, "task_instructions", None) else None
+        task_desc = (dataset.task_instructions or [None])[0] if dataset.task_instructions else None
         metrics = run_rollouts_and_save_viz(
             model=model,
             env_name=env_name,
@@ -736,12 +704,12 @@ def main():
             save_video=cfg.experiment.save_eval_video,
             eval_context_mode=eval_mode,
             prompt_trajectories=prompt_trajectories,
-            eval_num_trials=getattr(cfg.experiment, "eval_num_trials", 5),
+            eval_num_trials=cfg.experiment.eval_num_trials,
             eval_context_k=eval_k,
-            eval_reward_source=getattr(cfg.experiment, "eval_reward_source", "env"),
-            eval_reward_model=getattr(cfg.experiment, "eval_reward_model", None),
-            total_prompt_len=getattr(dataset, "total_prompt_len", None),
-            max_prompt_trajectory_length=getattr(dataset, "max_prompt_trajectory_length", None),
+            eval_reward_source=cfg.experiment.eval_reward_source,
+            eval_reward_model=cfg.experiment.eval_reward_model,
+            total_prompt_len=dataset.total_prompt_len,
+            max_prompt_trajectory_length=dataset.max_prompt_trajectory_length,
             task_description=task_desc,
             logger=logger,
         )

@@ -108,14 +108,18 @@ Examples (use with a vision-enabled data config, e.g. one that sets `use_vision:
 ```bash
 uv run python -m src.train \
   --override data=[base,libero_cosmos] model=vla_dt data.use_vision=true \
-  model.vision_encoder_type=patch experiment.eval_every_steps=0 --run-name libero_patch_run
+  model.vision_encoder_type=patch --run-name libero_patch_run
 ```
 
-**DINOv2:**
+**DINOv2 / DINOv3** (defaults: `facebook/dinov2-base`, `facebook/dinov3-vits16-pretrain-lvd1689m`):
 ```bash
 uv run python -m src.train \
   --override data=[base,libero_cosmos] model=vla_dt data.use_vision=true \
-  model.vision_encoder_type=dinov2 experiment.eval_every_steps=0 --run-name libero_dinov2_run
+  model.vision_encoder_type=dinov2 --run-name libero_dinov2_run
+
+uv run python -m src.train \
+  --override data=[base,libero_cosmos] model=vla_dt data.use_vision=true \
+  model.vision_encoder_type=dinov3 --run-name libero_dinov3_run
 ```
 
 **CrossMAE with attention pooling:**
@@ -123,14 +127,14 @@ uv run python -m src.train \
 uv run python -m src.train \
   --override data=[base,libero_cosmos] model=vla_dt data.use_vision=true \
   model.vision_encoder_type=crossmae model.vision_encoder_attention_pool=true \
-  experiment.eval_every_steps=0 --run-name libero_crossmae_run
+  --run-name libero_crossmae_run
 ```
 
 **PaliGemma-style SigLIP:**
 ```bash
 uv run python -m src.train \
   --override data=[base,libero_cosmos] model=vla_dt data.use_vision=true \
-  model.vision_encoder_type=paligemma experiment.eval_every_steps=0 --run-name libero_paligemma_run
+  model.vision_encoder_type=paligemma --run-name libero_paligemma_run
 ```
 
 Note: LIBERO-Cosmos as shipped does not load images; the dataset uses proprio only. The above examples assume a vision-enabled data path (e.g. after adding `image_keys` and vision fields to the LIBERO config, or when using the same overrides with another vision dataset).
@@ -167,7 +171,7 @@ Success rate is the fraction of val episodes that were successful (from dataset 
 | Install    | `uv sync --extra icrt` (or `pip install datasets`) |
 | Download   | `uv run python scripts/download_libero_cosmos.py --output-dir datasets` |
 | Train      | `uv run python -m src.train --override data=[base,libero_cosmos] --run-name libero_cosmos_run` |
-| Train (VLA + vision backbone) | `uv run python -m src.train --override data=[base,libero_cosmos] model=vla_dt data.use_vision=true model.vision_encoder_type=dinov2 --run-name libero_dinov2_run` (see §4 for patch/crossmae/paligemma) |
+| Train (VLA + vision backbone) | `uv run python -m src.train --override data=[base,libero_cosmos] model=vla_dt data.use_vision=true model.vision_encoder_type=dinov2 --run-name libero_dinov2_run` (see §4 for patch / dinov2 / dinov3 / crossmae / paligemma) |
 | Eval (ID)  | `uv run python scripts/run_libero_eval.py --ckpt <path-to-ckpt> --manifest datasets/LIBERO-Cosmos-Policy/manifest.json --data-dir datasets` |
 
 Everything is **modular**: download script, `src/data/libero_dataset.py`, config `configs/data/libero_cosmos.yaml`, and `scripts/run_libero_eval.py` can be run and read independently.

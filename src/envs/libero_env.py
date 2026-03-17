@@ -152,4 +152,24 @@ def make_libero_env(
         def close(self):
             self._env.close()
 
+        def render(self, mode: str = "rgb_array"):
+            """Return current frame as (H, W, 3) uint8 for video recording. Uses inner env's agentview_image."""
+            if mode != "rgb_array":
+                return None
+            inner = getattr(self._env, "env", self._env)
+            get_obs = getattr(inner, "_get_observations", None)
+            if get_obs is None:
+                return None
+            obs = get_obs()
+            if not isinstance(obs, dict) or "agentview_image" not in obs:
+                return None
+            img = np.asarray(obs["agentview_image"])
+            if img.dtype == np.float32 or img.dtype == np.float64:
+                img = (np.clip(img, 0.0, 1.0) * 255.0).astype(np.uint8)
+            if img.ndim == 3 and img.shape[0] == 3:
+                img = np.transpose(img, (1, 2, 0))
+            if img.ndim >= 2:
+                img = img[::-1]
+            return np.ascontiguousarray(img)
+
     return LIBEROWrapper(base_env, state_dim, action_dim)

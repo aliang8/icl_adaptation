@@ -129,6 +129,23 @@ def _get_ds_from_cache_or_hf(
     return load_dataset(repo_id, split=split, trust_remote_code=True)
 
 
+def _decode_image_bytes(value: Any) -> np.ndarray:
+    """Decode image from bytes, dict with 'bytes', or PIL Image -> (H, W, C) uint8."""
+    if value is None:
+        return np.zeros((224, 224, 3), dtype=np.uint8)
+    if hasattr(value, "size") and hasattr(value, "mode"):
+        # PIL Image
+        return np.array(value)
+    if isinstance(value, dict) and "bytes" in value:
+        value = value["bytes"]
+    if isinstance(value, (bytes, bytearray)):
+        import io
+        from PIL import Image
+        img = Image.open(io.BytesIO(bytes(value)))
+        return np.array(img.convert("RGB"))
+    return np.asarray(value, dtype=np.uint8)
+
+
 def _row_to_proprio(row: Dict[str, Any]) -> np.ndarray:
     """Extract proprio (9,) from a row. Column name is 'proprio'."""
     p = row.get("proprio")
@@ -155,8 +172,9 @@ def _episode_to_trajectory(
     end: int,
     task_description: Optional[str],
     success: Optional[bool],
-) -> Dict[str, np.ndarray]:
-    """Build one trajectory dict from dataset rows [start, end)."""
+    image_keys: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Build one trajectory dict from dataset rows [start, end). Optionally add 'images' (list of (T,H,W,C) per view)."""
     T = end - start
     observations = np.zeros((T, 9), dtype=np.float32)
     actions = np.zeros((T, 7), dtype=np.float32)
@@ -171,7 +189,7 @@ def _episode_to_trajectory(
     if success and T > 0:
         rewards[-1] = 1.0
         terminals[-1] = 1.0
-    return {
+    out: Dict[str, Any] = {
         "observations": observations,
         "actions": actions,
         "rewards": rewards,
@@ -179,6 +197,20 @@ def _episode_to_trajectory(
         "task_description": task_description,
         "success": success,
     }
+    if image_keys and hasattr(ds, "column_names"):
+        cols = ds.column_names
+        images_per_view: List[List[np.ndarray]] = [[] for _ in image_keys]
+        for k, key in enumerate(image_keys):
+            if key not in cols:
+                break
+            for i in range(T):
+                row = ds[start + i]
+                val = row.get(key) if isinstance(row, dict) else getattr(row, key, None)
+                img = _decode_image_bytes(val)
+                images_per_view[k].append(img)
+        if all(len(v) == T for v in images_per_view):
+            out["images"] = [np.stack(v, axis=0) for v in images_per_view]
+    return out
 
 
 def load_libero_trajectories(
@@ -187,6 +219,7 @@ def load_libero_trajectories(
     repo_id: str = "nvidia/LIBERO-Cosmos-Policy",
     max_episodes: Optional[int] = None,
     success_only: bool = False,
+    image_keys: Optional[List[str]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[List[Dict[str, Any]]], List[str]]:
     """
     Load LIBERO-Cosmos-Policy into (trajectories, prompt_trajectories_per_task, task_instructions).
@@ -251,6 +284,7 @@ def load_libero_trajectories(
                 end,
                 ep.get("task_description"),
                 ep.get("success"),
+                image_keys=image_keys,
             )
             trajectories.append(traj)
             td = traj.get("task_description") or ""
@@ -280,7 +314,7 @@ def load_libero_trajectories(
                     if success_only and succ is False:
                         start = i
                         continue
-                    traj = _episode_to_trajectory(ds, start, end, task, succ)
+                    traj = _episode_to_trajectory(ds, start, end, task, succ, image_keys=image_keys)
                     trajectories.append(traj)
                     td = str(task or "").strip()
                     if td and td not in task_to_trajs:
@@ -293,7 +327,7 @@ def load_libero_trajectories(
             # Fallback: treat full dataset as one trajectory (not ideal)
             T = len(ds)
             if T > 0 and (max_episodes is None or max_episodes >= 1):
-                traj = _episode_to_trajectory(ds, 0, T, None, None)
+                traj = _episode_to_trajectory(ds, 0, T, None, None, image_keys=image_keys)
                 trajectories.append(traj)
                 task_order.append("")
                 task_to_trajs[""] = [traj]

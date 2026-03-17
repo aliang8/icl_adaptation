@@ -58,6 +58,8 @@ class Llama2BackboneWrapper(nn.Module):
         super().__init__()
         from transformers import LlamaModel, LlamaConfig
         self.hidden_size = hidden_size
+        # Load in float32 so inputs from DINOv2/rest of model (float32) match; avoids float vs half mismatch
+        kwargs.setdefault("torch_dtype", torch.float32)
         self._llama = LlamaModel.from_pretrained(llama_model_name, **kwargs)
         llama_hidden = self._llama.config.hidden_size
         self.input_proj = nn.Linear(hidden_size, llama_hidden)
@@ -71,9 +73,12 @@ class Llama2BackboneWrapper(nn.Module):
     ) -> torch.Tensor:
         # inputs_embeds: (B, seq, hidden_size)
         x = self.input_proj(inputs_embeds)
+        # Match Llama dtype so input to q_proj etc. matches (avoids RuntimeError: float != c10::Half)
+        llama_dtype = next(self._llama.parameters()).dtype
+        x = x.to(llama_dtype)
         # LLaMA: attention_mask (B, seq) with 1 = attend, 0 = mask (same as our convention)
         out = self._llama(inputs_embeds=x, attention_mask=attention_mask)
-        return self.output_proj(out.last_hidden_state)
+        return self.output_proj(out.last_hidden_state.float())
 
 
 def build_transformer_backbone(

@@ -72,6 +72,7 @@ class VLADecisionTransformer(MetaDecisionTransformer):
         vision_encoder_type: str = "patch",
         vision_encoder_pool: bool = True,
         vision_encoder_attention_pool: bool = False,
+        freeze_vision_encoder: bool = False,
         **kwargs: Any,
     ):
         super().__init__(
@@ -107,6 +108,9 @@ class VLADecisionTransformer(MetaDecisionTransformer):
                 pool=vision_encoder_pool,
                 attention_pool=vision_encoder_attention_pool,
             )
+            if freeze_vision_encoder:
+                for p in self.vision_encoder.parameters():
+                    p.requires_grad = False
             out_dim = self.vision_encoder.output_dim
             self.vision_proj = nn.Linear(out_dim, hidden_size)
         else:
