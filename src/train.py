@@ -32,7 +32,11 @@ from src.engine.trainer import Trainer
 from src.models import MetaDecisionTransformer, RNNContextEncoder, VLADecisionTransformer
 from src.models.types import DTBatch
 from src.data import ICLTrajectoryDataset, collate_icl_batch
-from src.data.trajectories import convert_data_to_trajectories, sort_trajectories_by_return
+from src.data.trajectories import (
+    convert_data_to_trajectories,
+    sample_context_trajectories,
+    sort_trajectories_by_return,
+)
 
 
 def _print_config(cfg):
@@ -380,13 +384,8 @@ def _batch_stats(
 def main():
     import argparse
 
-    # Use spawn for DataLoader workers so CUDA is not re-initialized in forked subprocesses.
-    try:
-        import torch.multiprocessing as mp
-
-        mp.set_start_method("spawn", force=True)
-    except RuntimeError:
-        pass
+    import torch.multiprocessing as mp
+    mp.set_start_method("spawn", force=True)
     parser = argparse.ArgumentParser()
     parser.add_argument("--config-dir", type=str, default="configs", help="Hydra config directory")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume")
@@ -475,12 +474,8 @@ def main():
         log_dir = str(run_dir / "logs")
         log.info("Run dir: {}", run_dir)
 
-    # Optional: log to run_dir/logs/train.log
     train_log = Path(log_dir) / "train.log"
-    try:
-        log.add(train_log, level="INFO", format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}")
-    except Exception:
-        pass
+    log.add(train_log, level="INFO", format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}")
     _print_config(cfg)
 
     if args.export_only:
@@ -716,6 +711,17 @@ def main():
 
     def eval_fn(step):
         num_rollouts = cfg.experiment.num_eval_rollouts
+        eval_mode = getattr(cfg.experiment, "eval_context_mode", "prompt")
+        eval_k = getattr(cfg.experiment, "eval_context_k", None) or data_cfg.num_context_trajectories
+        prompt_trajectories = None
+        if eval_mode == "prompt" and hasattr(dataset, "trajectories") and dataset.trajectories:
+            prompt_trajectories = sample_context_trajectories(
+                dataset.trajectories,
+                n=eval_k,
+                ascending=True,
+                sampling=getattr(data_cfg, "context_sampling", "random"),
+            )
+        task_desc = (dataset.task_instructions or [None])[0] if getattr(dataset, "task_instructions", None) else None
         metrics = run_rollouts_and_save_viz(
             model=model,
             env_name=env_name,
@@ -728,6 +734,16 @@ def main():
             max_episode_steps=data_cfg.max_episode_steps,
             scale=data_cfg.return_scale,
             save_video=cfg.experiment.save_eval_video,
+            eval_context_mode=eval_mode,
+            prompt_trajectories=prompt_trajectories,
+            eval_num_trials=getattr(cfg.experiment, "eval_num_trials", 5),
+            eval_context_k=eval_k,
+            eval_reward_source=getattr(cfg.experiment, "eval_reward_source", "env"),
+            eval_reward_model=getattr(cfg.experiment, "eval_reward_model", None),
+            total_prompt_len=getattr(dataset, "total_prompt_len", None),
+            max_prompt_trajectory_length=getattr(dataset, "max_prompt_trajectory_length", None),
+            task_description=task_desc,
+            logger=logger,
         )
         if (
             cfg.experiment.run_action_compare_eval

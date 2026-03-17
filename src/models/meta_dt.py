@@ -252,28 +252,38 @@ class MetaDecisionTransformer(nn.Module):
             returns_to_go = returns_to_go[:, -self.max_length :]
             timesteps = timesteps[:, -self.max_length :]
 
-        L = states.shape[1]
-        pad = self.max_length - L
         device = states.device
+        L_s, L_c, L_a, L_r, L_t = (
+            states.shape[1],
+            contexts.shape[1],
+            actions.shape[1],
+            returns_to_go.shape[1],
+            timesteps.shape[1],
+        )
+        pad_s = self.max_length - L_s
+        pad_c = self.max_length - L_c
+        pad_a = self.max_length - L_a
+        pad_r = self.max_length - L_r
+        pad_t = self.max_length - L_t
         states = torch.cat(
-            [torch.zeros(1, pad, self.state_dim, device=device), states], dim=1
+            [torch.zeros(1, pad_s, self.state_dim, device=device), states], dim=1
         ).float()
         contexts = torch.cat(
-            [torch.zeros(1, pad, self.context_dim, device=device), contexts], dim=1
+            [torch.zeros(1, pad_c, self.context_dim, device=device), contexts], dim=1
         ).float()
         actions = torch.cat(
-            [torch.ones(1, pad, self.act_dim, device=device) * -10.0, actions], dim=1
+            [torch.ones(1, pad_a, self.act_dim, device=device) * -10.0, actions], dim=1
         ).float()
         returns_to_go = torch.cat(
-            [torch.zeros(1, pad, 1, device=device), returns_to_go], dim=1
+            [torch.zeros(1, pad_r, 1, device=device), returns_to_go], dim=1
         ).float()
         timesteps = torch.cat(
-            [torch.zeros(1, pad, device=device, dtype=torch.long), timesteps], dim=1
+            [torch.zeros(1, pad_t, device=device, dtype=torch.long), timesteps], dim=1
         )
         attention_mask = torch.cat(
             [
-                torch.zeros(pad, device=device, dtype=torch.long),
-                torch.ones(L, device=device, dtype=torch.long),
+                torch.zeros(pad_s, device=device, dtype=torch.long),
+                torch.ones(L_s, device=device, dtype=torch.long),
             ]
         ).reshape(1, -1)
 

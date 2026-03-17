@@ -25,32 +25,23 @@ class Logger:
     ):
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
-        self._writer = None
-        self._wandb = None
         self.use_wandb = use_wandb
         self._step_timer = time.perf_counter()
         self._step_count = 0
 
-        try:
-            from torch.utils.tensorboard import SummaryWriter
+        from torch.utils.tensorboard import SummaryWriter
+        self._writer = SummaryWriter(log_dir=str(self.log_dir))
 
-            self._writer = SummaryWriter(log_dir=str(self.log_dir))
-        except Exception:
-            pass
-
+        self._wandb = None
         if use_wandb:
-            try:
-                import wandb
-                from omegaconf import OmegaConf
-
-                cfg_dict = (
-                    OmegaConf.to_container(config, resolve=True) if config is not None else {}
-                )
-                self._wandb = wandb.init(
-                    project=project, entity=entity, name=run_name, config=cfg_dict
-                )
-            except Exception:
-                self._wandb = None
+            import wandb
+            from omegaconf import OmegaConf
+            cfg_dict = (
+                OmegaConf.to_container(config, resolve=True) if config is not None else {}
+            )
+            self._wandb = wandb.init(
+                project=project, entity=entity, name=run_name, config=cfg_dict
+            )
 
     def log_metrics(self, metrics: Dict[str, float], step: int) -> None:
         for k, v in metrics.items():
@@ -66,14 +57,30 @@ class Logger:
         if self._wandb is not None:
             self._wandb.log({tag: value}, step=step)
 
+    def log_video(
+        self,
+        tag: str,
+        frames: list,
+        step: int,
+        fps: int = 20,
+        format: str = "mp4",
+    ) -> None:
+        """Log a list of numpy frames (H,W,3) uint8 as a single video to W&B."""
+        if self._wandb is None or not frames:
+            return
+        import numpy as np
+        import wandb
+        arr = np.stack(frames)
+        self._wandb.log(
+            {tag: wandb.Video(arr, fps=fps, format=format)},
+            step=step,
+        )
+
     def flush(self) -> None:
         if self._writer is not None:
             self._writer.flush()
         if self._wandb is not None:
-            try:
-                self._wandb.finish()
-            except Exception:
-                pass
+            self._wandb.finish()
 
     def close(self) -> None:
         if self._writer is not None:

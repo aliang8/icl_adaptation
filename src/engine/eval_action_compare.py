@@ -126,31 +126,26 @@ def run_action_compare_eval(
     out_dir = run_dir / "viz" / "action_compare" / f"step_{step:06d}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    try:
-        import matplotlib
-
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-
-        for demo_idx in range(len(all_pred)):
-            pred_arr = all_pred[demo_idx]
-            gt_arr = all_gt[demo_idx]
-            demo_dir = out_dir / f"demo_{demo_idx}"
-            demo_dir.mkdir(parents=True, exist_ok=True)
-            action_dim = pred_arr.shape[1]
-            for j in range(action_dim):
-                fig, ax = plt.subplots(figsize=(6, 3))
-                ax.plot(gt_arr[:, j], label="GT", color="C0")
-                ax.plot(pred_arr[:, j], label="pred", color="C1", alpha=0.8)
-                ax.set_xlabel("step")
-                ax.set_ylabel(f"action_{j}")
-                ax.legend()
-                ax.set_title(f"Demo {demo_idx} action dim {j}")
-                fig.tight_layout()
-                fig.savefig(demo_dir / f"action_dim_{j}.png", dpi=100)
-                plt.close(fig)
-    except Exception:
-        pass
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    for demo_idx in range(len(all_pred)):
+        pred_arr = all_pred[demo_idx]
+        gt_arr = all_gt[demo_idx]
+        demo_dir = out_dir / f"demo_{demo_idx}"
+        demo_dir.mkdir(parents=True, exist_ok=True)
+        action_dim = pred_arr.shape[1]
+        for j in range(action_dim):
+            fig, ax = plt.subplots(figsize=(6, 3))
+            ax.plot(gt_arr[:, j], label="GT", color="C0")
+            ax.plot(pred_arr[:, j], label="pred", color="C1", alpha=0.8)
+            ax.set_xlabel("step")
+            ax.set_ylabel(f"action_{j}")
+            ax.legend()
+            ax.set_title(f"Demo {demo_idx} action dim {j}")
+            fig.tight_layout()
+            fig.savefig(demo_dir / f"action_dim_{j}.png", dpi=100)
+            plt.close(fig)
 
     return {
         "eval/action_mse_mean": float(np.mean(all_mse)),

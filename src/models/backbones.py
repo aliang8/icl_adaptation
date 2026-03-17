@@ -56,14 +56,7 @@ class Llama2BackboneWrapper(nn.Module):
         **kwargs: Any,
     ):
         super().__init__()
-        try:
-            from transformers import LlamaModel, LlamaConfig
-        except ImportError as e:
-            raise ImportError(
-                "LLaMA backbone requires transformers with Llama support. "
-                "Install with: pip install transformers>=4.31"
-            ) from e
-
+        from transformers import LlamaModel, LlamaConfig
         self.hidden_size = hidden_size
         self._llama = LlamaModel.from_pretrained(llama_model_name, **kwargs)
         llama_hidden = self._llama.config.hidden_size

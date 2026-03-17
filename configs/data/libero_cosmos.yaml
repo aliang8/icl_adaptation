@@ -25,7 +25,7 @@ num_context_trajectories: 3
 context_style: full_trajectory
 lazy_dataset: true
 max_training_examples: 200000
-max_episode_steps: 512
+max_episode_steps: 100
 image_size: [256, 256]
 min_trajectory_length: 10
 max_trajectory_length: 400

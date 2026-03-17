@@ -17,11 +17,13 @@ from omegaconf import OmegaConf
 
 
 def _get_git_commit() -> Optional[str]:
+    """Return full commit hash, or None if git fails (e.g. no commits, not a repo)."""
     try:
-        return subprocess.check_output(
+        out = subprocess.check_output(
             ["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL
         ).strip()
-    except Exception:
+        return out or None
+    except (subprocess.CalledProcessError, FileNotFoundError):
         return None
 
 
@@ -126,10 +128,7 @@ def load_checkpoint(
     Load a training checkpoint. Returns (epoch, global_step, best_metric, config, rng_state).
     If weights_only=True, only model weights are loaded (safer for untrusted checkpoints).
     """
-    try:
-        ckpt = torch.load(path, map_location=device or "cpu", weights_only=weights_only)
-    except TypeError:
-        ckpt = torch.load(path, map_location=device or "cpu")
+    ckpt = torch.load(path, map_location=device or "cpu", weights_only=weights_only)
     model.load_state_dict(ckpt["model"], strict=True)
     if not weights_only and optimizer is not None and ckpt.get("optimizer") is not None:
         optimizer.load_state_dict(ckpt["optimizer"])

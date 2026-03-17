@@ -26,6 +26,7 @@ from omegaconf import OmegaConf
 
 
 def get_git_short_hash(length: int = 7) -> Optional[str]:
+    """Return short commit hash, or None if git fails (e.g. no commits, not a repo)."""
     try:
         out = subprocess.check_output(
             ["git", "rev-parse", "--short", str(length), "HEAD"],
@@ -33,29 +34,31 @@ def get_git_short_hash(length: int = 7) -> Optional[str]:
             stderr=subprocess.DEVNULL,
         )
         return out.strip() or None
-    except Exception:
+    except (subprocess.CalledProcessError, FileNotFoundError):
         return None
 
 
 def get_git_commit() -> Optional[str]:
+    """Return full commit hash, or None if git fails."""
     try:
         return subprocess.check_output(
             ["git", "rev-parse", "HEAD"],
             text=True,
             stderr=subprocess.DEVNULL,
-        ).strip()
-    except Exception:
+        ).strip() or None
+    except (subprocess.CalledProcessError, FileNotFoundError):
         return None
 
 
 def get_git_diff_patch() -> Optional[str]:
+    """Return uncommitted diff patch, or None if git fails."""
     try:
         return subprocess.check_output(
             ["git", "diff", "HEAD"],
             text=True,
             stderr=subprocess.DEVNULL,
-        )
-    except Exception:
+        ) or None
+    except (subprocess.CalledProcessError, FileNotFoundError):
         return None
 
 

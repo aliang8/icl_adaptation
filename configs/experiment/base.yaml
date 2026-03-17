@@ -1,8 +1,13 @@
 max_steps: 500000
 eval_every_steps: 1000
-num_eval_episodes: 5
-num_eval_rollouts: 5  # number of env rollouts per evaluation
-save_eval_video: false  # set true to save eval rollout videos to viz/samples/step_XXX/videos/
+num_eval_episodes: 1
+num_eval_rollouts: 1  # number of env rollouts per evaluation
+eval_context_mode: zero_shot_adaptation  # prompt | zero_shot_adaptation
+eval_num_trials: 5
+eval_context_k: null
+eval_reward_source: env
+eval_reward_model: null
+save_eval_video: true  # set true to save eval rollout videos to viz/samples/step_XXX/videos/
 run_action_compare_eval: false  # set true to save pred vs GT action plots to viz/action_compare/step_XXX/
 num_action_compare_demos: 3
 warm_train_steps: 70000

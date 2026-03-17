@@ -143,6 +143,12 @@ class ExperimentConfig:
     eval_every_steps: int = 1000
     num_eval_episodes: int = 5
     num_eval_rollouts: int = 5  # number of env rollouts per eval (for real eval)
+    # Eval context: "prompt" = use fixed prompt trajectories (like training); "zero_shot_adaptation" = N trials, context = last K trials sorted by return (env or reward model).
+    eval_context_mode: str = "prompt"  # "prompt" | "zero_shot_adaptation"
+    eval_num_trials: int = 5  # for zero_shot_adaptation: number of trials (rollouts) to run, context grows each trial
+    eval_context_k: Optional[int] = None  # max trajectories in context (default: data.num_context_trajectories)
+    eval_reward_source: str = "env"  # "env" | "reward_model" (for zero_shot_adaptation return used to sort context)
+    eval_reward_model: Optional[str] = None  # e.g. "roboreward_8b" | "robometer_4b"; used when eval_reward_source=reward_model
     save_eval_video: bool = (
         False  # if True, wrap eval env with RecordVideo and save to viz/samples/step_XXX/videos/
     )

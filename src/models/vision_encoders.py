@@ -166,10 +166,7 @@ def _build_dinov2_encoder(
     **kwargs: Any,
 ) -> nn.Module:
     """DINOv2: CLS token (default) or all patch tokens + attention pooling."""
-    try:
-        from transformers import AutoModel
-    except ImportError as e:
-        raise ImportError("DINOv2 encoder requires transformers.") from e
+    from transformers import AutoModel
     backbone = AutoModel.from_pretrained(model_name, **kwargs)
     hidden = backbone.config.hidden_size
 
@@ -226,10 +223,7 @@ def _build_paligemma_encoder(
     **kwargs: Any,
 ) -> nn.Module:
     """PaliGemma-style: SigLIP vision tower. Pooled = pooler or mean of patches."""
-    try:
-        from transformers import AutoModel
-    except ImportError as e:
-        raise ImportError("PaliGemma/SigLIP encoder requires transformers.") from e
+    from transformers import AutoModel
     model = AutoModel.from_pretrained(model_name, **kwargs)
     hidden = model.config.hidden_size
 
@@ -275,10 +269,7 @@ def _build_crossmae_encoder(
     **kwargs: Any,
 ) -> nn.Module:
     """CrossMAE-style: ViT per-patch, then attention-pool (ICRT-style) or mean-pool."""
-    try:
-        from transformers import AutoModel
-    except ImportError as e:
-        raise ImportError("CrossMAE-style ViT requires transformers.") from e
+    from transformers import AutoModel
     vit = AutoModel.from_pretrained(pretrained or "google/vit-base-patch16-224", **kwargs)
     hidden = vit.config.hidden_size
 

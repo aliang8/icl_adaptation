@@ -36,20 +36,20 @@ def load_libero_manifest(manifest_path: str) -> Dict[str, Any]:
 def _parse_all_episodes_hdf5_filename(filename: str) -> Dict[str, Any]:
     """Parse episode_data--suite=X--...--task=T--ep=E--success=True|False--regen_demo.hdf5."""
     out = {"suite": "unknown", "task_id": None, "success": None}
-    if "--suite=" in filename:
-        try:
-            i = filename.index("--suite=") + 7
-            j = filename.index("--", i) if "--" in filename[i:] else len(filename)
-            out["suite"] = filename[i:j].strip()
-        except (ValueError, IndexError):
-            pass
-    if "--success=" in filename:
-        try:
-            i = filename.index("--success=") + 10
-            j = filename.index("--", i) if "--" in filename[i:] else len(filename)
-            out["success"] = filename[i:j].strip().lower() == "true"
-        except (ValueError, IndexError):
-            pass
+    i = filename.find("--suite=")
+    if i != -1:
+        i += 7
+        j = filename.find("--", i)
+        if j == -1:
+            j = len(filename)
+        out["suite"] = filename[i:j].strip()
+    i = filename.find("--success=")
+    if i != -1:
+        i += 10
+        j = filename.find("--", i)
+        if j == -1:
+            j = len(filename)
+        out["success"] = filename[i:j].strip().lower() == "true"
     return out
 
 
@@ -59,12 +59,7 @@ def _load_trajectory_from_hdf5(
     success: Optional[bool] = None,
 ) -> Dict[str, np.ndarray]:
     """Load one trajectory from an all_episodes HDF5 file (proprio, actions, rewards, terminals)."""
-    try:
-        import h5py
-    except ImportError:
-        raise ImportError(
-            "Install h5py for HDF5 support: pip install h5py (or uv sync --extra icrt)"
-        )
+    import h5py
     with h5py.File(file_path, "r") as f:
         proprio = np.asarray(f["proprio"], dtype=np.float32)
         actions = np.asarray(f["actions"], dtype=np.float32)
@@ -105,10 +100,7 @@ def _get_ds_from_cache_or_hf(
     2. data_dir/LIBERO-Cosmos-Policy/*.parquet (hf download --local-dir layout)
     3. HuggingFace hub (or cache)
     """
-    try:
-        from datasets import load_dataset
-    except ImportError:
-        raise ImportError("Install datasets: pip install datasets")
+    from datasets import load_dataset
 
     root = Path(data_dir or ".").resolve() / "LIBERO-Cosmos-Policy"
     # 1) Our script's save_to_disk format

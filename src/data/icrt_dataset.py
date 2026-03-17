@@ -77,11 +77,7 @@ def open_icrt_hdf5(config_path: Union[str, Path]):
     Open HDF5 file(s) from dataset config. Returns (list of h5py.File, keys_to_file map).
     Caller must close the files when done. Paths in config are resolved relative to config file's parent.
     """
-    try:
-        import h5py
-    except ImportError:
-        raise ImportError("Install h5py for ICRT dataset: pip install h5py")
-
+    import h5py
     path = Path(config_path).resolve()
     config = load_dataset_config(path)
     config = _resolve_config_paths(config, path.parent)
@@ -196,13 +192,7 @@ def load_icrt_trajectories(
     Load ICRT HDF5 into (trajectories, prompt_trajectories_per_task, task_instructions).
     Each trajectory has observations (proprio only, for ICLTrajectoryDataset), actions, rewards, terminals.
     """
-    try:
-        import h5py
-    except ImportError as e:
-        raise ImportError(
-            "ICRT-MT loading requires h5py. Install with: uv sync --extra icrt  (or: pip install h5py)"
-        ) from e
-
+    import h5py
     path = Path(config_path).resolve()
     config = load_dataset_config(path)
     config = _resolve_config_paths(config, path.parent)

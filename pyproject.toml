@@ -17,6 +17,7 @@ dependencies = [
     "gym>=0.17",
     "transformers>=4.20.0",
     "ipdb",
+    "imageio[ffmpeg]>=2.9.0",
 ]
 
 [project.optional-dependencies]
