@@ -1,353 +1,458 @@
 """
-LIBERO-Cosmos-Policy dataset: load from HuggingFace (or local disk) and produce
-trajectories in the same format as ICLTrajectoryDataset (observations=proprio, actions, rewards, terminals).
+LIBERO-Cosmos-Policy: episode folders + Parquet manifest + sample index for in-context training.
 
-Data sources (see https://huggingface.co/datasets/nvidia/LIBERO-Cosmos-Policy):
-- HDF5 (recommended): after "hf download ... --local-dir LIBERO-Cosmos-Policy", the repo has
-  all_episodes/*.hdf5 (one file per episode). Each file has proprio (T,9), actions (T,7) and
-  attributes task_description, success. Manifest lists episodes by "file" path.
-- Parquet/Hub: load_dataset() or auto-converted Parquet have no per-episode metadata, so
-  episode boundaries are lost unless the manifest was built from HDF5.
+Layout (from convert_libero_hdf5_to_dataset.py):
+  - episodes/{id:06d}/: primary.mp4, wrist.mp4, lowdim.npz
+  - manifest.parquet, sample_index.parquet
 
-Expects:
-- Manifest at data_dir/LIBERO-Cosmos-Policy/manifest.json. If train_episodes have "file"
-  (and optionally "data_source": "hdf5"), load from HDF5. Else use start/end with a single table.
-- Or no manifest: load from HF and infer episodes if possible.
-
-Returns: (trajectories, prompt_trajectories_per_task, task_instructions)
+Training uses the generic in-context index: build_libero_in_context_dataset is registered
+as source "libero" so train.py calls build_in_context_dataset("libero", ...).
+Eval: load_libero_episodes_for_eval(data_dir, ...) loads from manifest.
 """
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
+import torch
 from loguru import logger as log
+from tqdm import tqdm
 
 
-def load_libero_manifest(manifest_path: str) -> Dict[str, Any]:
-    """Load manifest.json (train_episodes, val_episodes, repo_id, etc.)."""
-    with open(manifest_path) as f:
-        return json.load(f)
+def _has_new_format(root: Path) -> bool:
+    """True if manifest.parquet and episodes/ exist (MP4+NPZ layout)."""
+    return (root / "manifest.parquet").is_file() and (root / "episodes").is_dir()
 
 
-def _parse_all_episodes_hdf5_filename(filename: str) -> Dict[str, Any]:
-    """Parse episode_data--suite=X--...--task=T--ep=E--success=True|False--regen_demo.hdf5."""
-    out = {"suite": "unknown", "task_id": None, "success": None}
-    i = filename.find("--suite=")
-    if i != -1:
-        i += 7
-        j = filename.find("--", i)
-        if j == -1:
-            j = len(filename)
-        out["suite"] = filename[i:j].strip()
-    i = filename.find("--success=")
-    if i != -1:
-        i += 10
-        j = filename.find("--", i)
-        if j == -1:
-            j = len(filename)
-        out["success"] = filename[i:j].strip().lower() == "true"
-    return out
-
-
-def _load_trajectory_from_hdf5(
-    file_path: Path,
-    task_description: Optional[str] = None,
-    success: Optional[bool] = None,
-) -> Dict[str, np.ndarray]:
-    """Load one trajectory from an all_episodes HDF5 file (proprio, actions, rewards, terminals)."""
-    import h5py
-    with h5py.File(file_path, "r") as f:
-        proprio = np.asarray(f["proprio"], dtype=np.float32)
-        actions = np.asarray(f["actions"], dtype=np.float32)
-        if task_description is None and "task_description" in f.attrs:
-            task_description = f.attrs["task_description"]
-            if hasattr(task_description, "decode"):
-                task_description = task_description.decode("utf-8")
-        if success is None and "success" in f.attrs:
-            success = bool(f.attrs["success"])
-    T = proprio.shape[0]
-    if actions.shape[0] != T:
-        T = min(proprio.shape[0], actions.shape[0])
-        proprio = proprio[:T]
-        actions = actions[:T]
-    rewards = np.zeros(T, dtype=np.float32)
-    terminals = np.zeros(T, dtype=np.float32)
-    if success and T > 0:
-        rewards[-1] = 1.0
-        terminals[-1] = 1.0
-    return {
-        "observations": proprio,
-        "actions": actions,
-        "rewards": rewards,
-        "terminals": terminals,
-        "task_description": task_description,
-        "success": success,
-    }
-
-
-def _get_ds_from_cache_or_hf(
-    data_dir: Optional[str],
-    repo_id: str,
-    split: str = "train",
-):
-    """
-    Load Dataset from (in order):
-    1. data_dir/LIBERO-Cosmos-Policy/data (our save_to_disk format)
-    2. data_dir/LIBERO-Cosmos-Policy/*.parquet (hf download --local-dir layout)
-    3. HuggingFace hub (or cache)
-    """
-    from datasets import load_dataset
-
-    root = Path(data_dir or ".").resolve() / "LIBERO-Cosmos-Policy"
-    # 1) Our script's save_to_disk format
-    local_data = root / "data"
-    if local_data.is_dir():
-        from datasets import load_from_disk
-
-        log.debug("Loading LIBERO-Cosmos from local data/ (save_to_disk)")
-        return load_from_disk(str(local_data))
-
-    # 2) hf download --local-dir layout: parquet file(s) in repo root
-    parquet_train = sorted(root.glob("train*.parquet")) or sorted(root.glob("*.parquet"))
-    if parquet_train:
-        data_files = [str(p) for p in parquet_train]
-        log.info("Loading LIBERO-Cosmos from local parquet (hf download): %s", data_files[:3])
-        if len(data_files) > 3:
-            log.info("  ... and %d more file(s)", len(data_files) - 3)
-        return load_dataset(
-            "parquet",
-            data_files=data_files,
-            split=split,
-            trust_remote_code=True,
-        )
-
-    # 3) HuggingFace hub / cache
-    return load_dataset(repo_id, split=split, trust_remote_code=True)
-
-
-def _decode_image_bytes(value: Any) -> np.ndarray:
-    """Decode image from bytes, dict with 'bytes', or PIL Image -> (H, W, C) uint8."""
-    if value is None:
-        return np.zeros((224, 224, 3), dtype=np.uint8)
-    if hasattr(value, "size") and hasattr(value, "mode"):
-        # PIL Image
-        return np.array(value)
-    if isinstance(value, dict) and "bytes" in value:
-        value = value["bytes"]
-    if isinstance(value, (bytes, bytearray)):
-        import io
-        from PIL import Image
-        img = Image.open(io.BytesIO(bytes(value)))
-        return np.array(img.convert("RGB"))
-    return np.asarray(value, dtype=np.uint8)
-
-
-def _row_to_proprio(row: Dict[str, Any]) -> np.ndarray:
-    """Extract proprio (9,) from a row. Column name is 'proprio'."""
-    p = row.get("proprio")
-    if p is None:
-        return np.zeros(9, dtype=np.float32)
-    if isinstance(p, (list, tuple)):
-        return np.array(p, dtype=np.float32)
-    return np.asarray(p, dtype=np.float32)
-
-
-def _row_to_actions(row: Dict[str, Any]) -> np.ndarray:
-    """Extract actions (7,) from a row."""
-    a = row.get("actions")
-    if a is None:
-        return np.zeros(7, dtype=np.float32)
-    if isinstance(a, (list, tuple)):
-        return np.array(a, dtype=np.float32)
-    return np.asarray(a, dtype=np.float32)
-
-
-def _episode_to_trajectory(
-    ds,
-    start: int,
-    end: int,
+def _load_episode_from_folder(
+    root: Path,
+    episode_id: int,
     task_description: Optional[str],
-    success: Optional[bool],
+    success: bool,
     image_keys: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """Build one trajectory dict from dataset rows [start, end). Optionally add 'images' (list of (T,H,W,C) per view)."""
-    T = end - start
-    observations = np.zeros((T, 9), dtype=np.float32)
-    actions = np.zeros((T, 7), dtype=np.float32)
-    rewards = np.zeros(T, dtype=np.float32)
-    terminals = np.zeros(T, dtype=np.float32)
-    for i in range(T):
-        row = ds[start + i]
-        observations[i] = _row_to_proprio(row)
-        actions[i] = _row_to_actions(row)
-        rewards[i] = 0.0
-        terminals[i] = 0.0
-    if success and T > 0:
-        rewards[-1] = 1.0
-        terminals[-1] = 1.0
+    """Load one trajectory from episodes/{id:06d}/ (lowdim.npz + optional MP4)."""
+    ep_dir = root / "episodes" / f"{episode_id:06d}"
+    lowdim_path = ep_dir / "lowdim.npz"
+    if not lowdim_path.is_file():
+        raise FileNotFoundError(f"Missing {lowdim_path}")
+    data = np.load(lowdim_path, allow_pickle=False)
+    proprio = data["proprio"]
+    actions = data["actions"]
+    dones = data["dones"] if "dones" in data else np.zeros(len(proprio), dtype=np.float32)
+    rewards = data["rewards"] if "rewards" in data else np.zeros(len(proprio), dtype=np.float32)
+    T = len(proprio)
+    if np.any(dones > 0) and rewards.sum() == 0:
+        rewards[np.argmax(dones > 0)] = 1.0
+
     out: Dict[str, Any] = {
-        "observations": observations,
-        "actions": actions,
-        "rewards": rewards,
-        "terminals": terminals,
+        "observations": np.asarray(proprio, dtype=np.float32),
+        "actions": np.asarray(actions, dtype=np.float32),
+        "rewards": np.asarray(rewards, dtype=np.float32),
+        "terminals": np.asarray(dones, dtype=np.float32),
         "task_description": task_description,
-        "success": success,
+        "success": bool(success),
     }
-    if image_keys and hasattr(ds, "column_names"):
-        cols = ds.column_names
-        images_per_view: List[List[np.ndarray]] = [[] for _ in image_keys]
-        for k, key in enumerate(image_keys):
-            if key not in cols:
+    if image_keys:
+        images_per_view = []
+        key_to_file = {"primary_images_jpeg": "primary.mp4", "wrist_images_jpeg": "wrist.mp4"}
+        for key in image_keys:
+            fname = key_to_file.get(key)
+            if not fname:
+                continue
+            vid_path = ep_dir / fname
+            if not vid_path.is_file():
                 break
-            for i in range(T):
-                row = ds[start + i]
-                val = row.get(key) if isinstance(row, dict) else getattr(row, key, None)
-                img = _decode_image_bytes(val)
-                images_per_view[k].append(img)
-        if all(len(v) == T for v in images_per_view):
-            out["images"] = [np.stack(v, axis=0) for v in images_per_view]
+            frames = _read_mp4_frames(vid_path)
+            if len(frames) != T:
+                frames = frames[:T] if len(frames) >= T else list(frames) + [np.zeros_like(frames[0])] * (T - len(frames))
+            images_per_view.append(np.stack(frames, axis=0))
+        if len(images_per_view) == len(image_keys):
+            out["images"] = images_per_view
     return out
 
 
-def load_libero_trajectories(
-    data_dir: str,
-    manifest_path: Optional[str] = None,
-    repo_id: str = "nvidia/LIBERO-Cosmos-Policy",
-    max_episodes: Optional[int] = None,
-    success_only: bool = False,
-    image_keys: Optional[List[str]] = None,
-) -> Tuple[List[Dict[str, Any]], List[List[Dict[str, Any]]], List[str]]:
-    """
-    Load LIBERO-Cosmos-Policy into (trajectories, prompt_trajectories_per_task, task_instructions).
+def _read_mp4_frames(path: Path) -> List[np.ndarray]:
+    """Read all frames from an MP4 as list of (H,W,3) uint8."""
+    try:
+        import cv2
+        cap = cv2.VideoCapture(str(path))
+        frames = []
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frames.append(frame[:, :, ::-1])  # BGR -> RGB
+        cap.release()
+        return frames
+    except Exception:
+        try:
+            import imageio
+            reader = imageio.get_reader(str(path), "ffmpeg")
+            frames = []
+            i = 0
+            while True:
+                try:
+                    frames.append(np.asarray(reader.get_data(i), dtype=np.uint8))
+                    i += 1
+                except (IndexError, RuntimeError):
+                    break
+            reader.close()
+            return frames
+        except Exception:
+            return []
 
-    - If manifest_path is set, use train_episodes from manifest and optional local/HF dataset.
-    - Otherwise load full train split and build one trajectory per episode if episode_id exists, else one big trajectory (not ideal).
-    - success_only: if True, only include episodes with success=True.
+def get_libero_sample_index(data_dir: str):
     """
-    if manifest_path is None:
-        manifest_path = str(Path(data_dir) / "LIBERO-Cosmos-Policy" / "manifest.json")
-    manifest = None
-    if Path(manifest_path).is_file():
-        manifest = load_libero_manifest(manifest_path)
-        train_eps = manifest.get("train_episodes", [])
-        repo_id = manifest.get("repo_id", repo_id)
-    else:
-        train_eps = []
-
+    Return the precomputed sample index (manifest + episodes/ layout).
+    Columns: query_episode_id, query_start, query_len, prompt_episode_ids, prompt_starts, prompt_lens,
+    task_id, is_success, prompt_len. Returns None if sample_index.parquet is missing.
+    """
     root = Path(data_dir or ".").resolve() / "LIBERO-Cosmos-Policy"
-    use_hdf5 = bool(train_eps) and ("file" in train_eps[0] or manifest.get("data_source") == "hdf5")
+    idx_path = root / "sample_index.parquet"
+    if not idx_path.is_file():
+        return None
+    import pandas as pd
+    return pd.read_parquet(idx_path)
+
+
+def get_libero_task_instructions_from_manifest(data_dir: str) -> Optional[List[str]]:
+    """When using new format (manifest + sample_index), return task_instructions in task_id order."""
+    root = Path(data_dir or ".").resolve() / "LIBERO-Cosmos-Policy"
+    manifest_path = root / "manifest.parquet"
+    if not manifest_path.is_file():
+        return None
+    import pandas as pd
+    df = pd.read_parquet(manifest_path)
+    if "task_description" not in df.columns:
+        return None
+    return list(dict.fromkeys(df["task_description"].tolist()))
+
+
+def load_libero_episodes_for_eval(
+    data_dir: str,
+    last_n_fraction: float = 0.1,
+    max_episodes: int = 500,
+    image_keys: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Load the last N% of episodes from manifest for offline eval. Requires manifest + episodes."""
+    root = Path(data_dir or ".").resolve() / "LIBERO-Cosmos-Policy"
+    if not _has_new_format(root):
+        return []
+    import pandas as pd
+    manifest_df = pd.read_parquet(root / "manifest.parquet")
+    n_val = max(1, int(len(manifest_df) * last_n_fraction))
+    n_val = min(n_val, max_episodes)
+    val_rows = manifest_df.tail(n_val)
     trajectories = []
-    task_to_trajs: Dict[str, List[Dict]] = {}
-    task_order: List[str] = []
+    for _, row in val_rows.iterrows():
+        ep_id = int(row["episode_id"])
+        task_desc = str(row.get("task_description", "")) or None
+        success = bool(row.get("success", False))
+        try:
+            traj = _load_episode_from_folder(root, ep_id, task_desc, success, image_keys=image_keys)
+        except Exception as e:
+            log.warning("Skip episode {}: {}", ep_id, e)
+            continue
+        trajectories.append(traj)
+    return trajectories
 
-    if use_hdf5:
-        log.info("Loading LIBERO-Cosmos from HDF5 (all_episodes/*.hdf5)")
-        for ep in train_eps:
-            if success_only and ep.get("success") is False:
+
+def _load_episode_embedding_segment(
+    root: Path,
+    episode_id: int,
+    start: int,
+    length: int,
+) -> Optional[np.ndarray]:
+    """Load embedding segment [start:start+length] from episodes/{id}/embeddings.npz. Returns (L, D) or None."""
+    ep_dir = root / "episodes" / f"{episode_id:06d}"
+    emb_path = ep_dir / "embeddings.npz"
+    if not emb_path.is_file():
+        return None
+    data = np.load(emb_path, allow_pickle=False)
+    if "embeddings" not in data:
+        return None
+    emb = data["embeddings"]
+    end = min(start + length, emb.shape[0])
+    return np.asarray(emb[start:end], dtype=np.float32)
+
+
+def _load_episode_segment(
+    root: Path,
+    episode_id: int,
+    start: int,
+    length: int,
+    image_keys: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Load a segment [start:start+length] from one episode (NPZ + optional MP4)."""
+    full = _load_episode_from_folder(root, episode_id, None, False, image_keys=image_keys)
+    end = min(start + length, full["observations"].shape[0])
+    s = slice(start, end)
+    L = end - start
+    out = {
+        "observations": np.asarray(full["observations"][s], dtype=np.float32),
+        "actions": np.asarray(full["actions"][s], dtype=np.float32),
+        "rewards": np.asarray(full["rewards"][s], dtype=np.float32),
+        "terminals": np.asarray(full["terminals"][s], dtype=np.float32),
+    }
+    if "images" in full:
+        out["images"] = [v[s].copy() for v in full["images"]]
+    return out
+
+
+def make_libero_index_loader(
+    root: Path,
+    task_instructions: List[str],
+    state_dim: int,
+    act_dim: int,
+    context_dim: int,
+    device: torch.device,
+    return_scale: float,
+    total_prompt_len: int,
+    max_prompt_trajectory_length: Optional[int],
+    use_vision: bool = False,
+    image_keys: Optional[List[str]] = None,
+    use_precomputed_embeddings: bool = False,
+) -> Callable[[Dict[str, Any]], Tuple[Any, ...]]:
+    """
+    Build a loader_fn(row) for IndexBackedDataset. Each row has query_episode_id, query_start,
+    query_len, prompt_episode_ids, prompt_starts, prompt_lens, task_id. Returns the same tuple
+    as ICL dataset __getitem__: (states, context, actions, rewards, dones, rtg, timesteps, masks,
+    prompt_s, prompt_a, prompt_r, prompt_rtg, prompt_ts, prompt_m, instruction [, images]).
+    """
+    from src.data.dataset import _pad_or_trim_prompt
+    from src.data.trajectories import discount_cumsum
+
+    state_mean = np.zeros(state_dim, dtype=np.float32)
+    state_std = np.ones(state_dim, dtype=np.float32)
+    img_keys = list(image_keys) if (use_vision and image_keys) else None
+
+    def loader_fn(row: Dict[str, Any]) -> Tuple[Any, ...]:
+        q_ep = int(row["query_episode_id"])
+        q_start = int(row["query_start"])
+        q_len = int(row["query_len"])
+        task_id = int(row.get("task_id", 0))
+        instruction = ""
+        if 0 <= task_id < len(task_instructions):
+            instruction = task_instructions[task_id] or ""
+
+        # Query segment: q_len steps (s,a pairs for training)
+        q_seg = _load_episode_segment(root, q_ep, q_start, q_len, image_keys=img_keys)
+        obs = q_seg["observations"]
+        actions = q_seg["actions"]
+        rewards = q_seg["rewards"]
+        dones = q_seg["terminals"]
+        seg_len = obs.shape[0]
+        if seg_len < 1:
+            seg_len = 1
+            obs = np.zeros((1, state_dim), dtype=np.float32)
+            actions = np.zeros((1, act_dim), dtype=np.float32)
+            rewards = np.zeros(1, dtype=np.float32)
+            dones = np.zeros(1, dtype=np.float32)
+
+        obs_norm = (obs - state_mean) / state_std
+        rtg = discount_cumsum(rewards, gamma=1.0).reshape(-1, 1) / return_scale
+        timesteps = np.arange(q_start, q_start + seg_len, dtype=np.float32)
+        mask = np.ones(seg_len, dtype=np.float32)
+        context = np.zeros((seg_len, context_dim), dtype=np.float32)
+
+        # Prompt segments from index (Parquet may give list or ndarray)
+        def _to_list(x):
+            if x is None:
+                return []
+            if isinstance(x, (str, bytes)):
+                import json
+                return json.loads(x) if isinstance(x, str) else []
+            return list(x)
+
+        prompt_episode_ids = _to_list(row.get("prompt_episode_ids"))
+        prompt_starts = _to_list(row.get("prompt_starts"))
+        prompt_lens = _to_list(row.get("prompt_lens"))
+
+        segs_ps, segs_pa, segs_pr, segs_prtg, segs_pts, segs_pm = [], [], [], [], [], []
+        for i, (p_ep, p_start, p_len) in enumerate(zip(prompt_episode_ids, prompt_starts, prompt_lens)):
+            p_ep, p_start, p_len = int(p_ep), int(p_start), int(p_len)
+            cap = max_prompt_trajectory_length if max_prompt_trajectory_length else p_len
+            if cap < p_len:
+                p_start = p_start + (p_len - cap)
+                p_len = cap
+            p_seg = _load_episode_segment(root, p_ep, p_start, p_len, image_keys=None)
+            T = p_seg["observations"].shape[0]
+            if T == 0:
                 continue
-            if max_episodes and len(trajectories) >= max_episodes:
-                break
-            file_path = root / ep["file"]
-            if not file_path.is_file():
-                log.warning("Skipping missing HDF5 file: %s", file_path)
-                continue
-            traj = _load_trajectory_from_hdf5(
-                file_path,
-                ep.get("task_description"),
-                ep.get("success"),
+            ps = (p_seg["observations"] - state_mean) / state_std
+            pa = p_seg["actions"]
+            pr = p_seg["rewards"].reshape(-1, 1)
+            prtg = discount_cumsum(p_seg["rewards"], gamma=1.0)[:T].reshape(-1, 1) / return_scale
+            pts = np.arange(p_start, p_start + T, dtype=np.float32)
+            pm = np.ones(T, dtype=np.float32)
+            segs_ps.append(ps)
+            segs_pa.append(pa)
+            segs_pr.append(pr)
+            segs_prtg.append(prtg)
+            segs_pts.append(pts)
+            segs_pm.append(pm)
+        if segs_ps:
+            ps = np.concatenate(segs_ps, axis=0)
+            pa = np.concatenate(segs_pa, axis=0)
+            pr = np.concatenate(segs_pr, axis=0)
+            prtg = np.concatenate(segs_prtg, axis=0)
+            pts = np.concatenate(segs_pts, axis=0)
+            pm = np.concatenate(segs_pm, axis=0)
+            ps, pa, pr, prtg, pts, pm = _pad_or_trim_prompt(
+                ps, pa, pr, prtg, pts, pm, total_prompt_len, state_dim, act_dim, take_last=True
             )
-            trajectories.append(traj)
-            td = traj.get("task_description") or ""
-            td = str(td).strip()
-            if td and td not in task_to_trajs:
-                task_order.append(td)
-                task_to_trajs[td] = []
-            if td:
-                task_to_trajs[td].append(traj)
-    elif train_eps:
-        ds = _get_ds_from_cache_or_hf(data_dir, repo_id, split="train")
-        for ep in train_eps:
-            if success_only and ep.get("success") is False:
-                continue
-            if max_episodes and len(trajectories) >= max_episodes:
-                break
-            start, end = ep["start"], ep["end"]
-            if end <= start:
-                continue
-            traj = _episode_to_trajectory(
-                ds,
-                start,
-                end,
-                ep.get("task_description"),
-                ep.get("success"),
-                image_keys=image_keys,
-            )
-            trajectories.append(traj)
-            td = traj.get("task_description") or ""
-            td = str(td).strip()
-            if td and td not in task_to_trajs:
-                task_order.append(td)
-                task_to_trajs[td] = []
-            if td:
-                task_to_trajs[td].append(traj)
-    else:
-        # No manifest or no train_eps: load full dataset and infer episodes
-        ds = _get_ds_from_cache_or_hf(data_dir, repo_id, split="train")
-        cols = ds.column_names
-        if "episode_index" in cols or "episode_id" in cols:
-            ep_col = "episode_index" if "episode_index" in cols else "episode_id"
-            eps = ds[ep_col]
-            task_col = ds.get("task_description", [None] * len(ds))
-            success_col = ds.get("success", [None] * len(ds))
-            start = 0
-            for i in range(1, len(ds) + 1):
-                if i == len(ds) or (i < len(eps) and eps[i] != eps[i - 1]):
-                    end = i
-                    if max_episodes and len(trajectories) >= max_episodes:
-                        break
-                    task = task_col[start] if start < len(task_col) else None
-                    succ = success_col[start] if start < len(success_col) else None
-                    if success_only and succ is False:
-                        start = i
-                        continue
-                    traj = _episode_to_trajectory(ds, start, end, task, succ, image_keys=image_keys)
-                    trajectories.append(traj)
-                    td = str(task or "").strip()
-                    if td and td not in task_to_trajs:
-                        task_order.append(td)
-                        task_to_trajs[td] = []
-                    if td:
-                        task_to_trajs[td].append(traj)
-                    start = i
         else:
-            # Fallback: treat full dataset as one trajectory (not ideal)
-            T = len(ds)
-            if T > 0 and (max_episodes is None or max_episodes >= 1):
-                traj = _episode_to_trajectory(ds, 0, T, None, None, image_keys=image_keys)
-                trajectories.append(traj)
-                task_order.append("")
-                task_to_trajs[""] = [traj]
+            ps = np.zeros((total_prompt_len, state_dim), dtype=np.float32)
+            pa = np.ones((total_prompt_len, act_dim), dtype=np.float32) * -10.0
+            pr = np.zeros((total_prompt_len, 1), dtype=np.float32)
+            prtg = np.zeros((total_prompt_len, 1), dtype=np.float32)
+            pts = np.zeros(total_prompt_len, dtype=np.float32)
+            pm = np.zeros(total_prompt_len, dtype=np.float32)
 
-    task_instructions = (
-        task_order
-        if task_order
-        else list(dict.fromkeys(str(t.get("task_description") or "") for t in trajectories))
-    )
-    prompt_per_task = [task_to_trajs.get(ti, [])[:5] for ti in task_instructions]
-    if not any(prompt_per_task):
-        prompt_per_task = [trajectories[:5]] * max(1, len(task_instructions))
+        def _t(x: np.ndarray, long_type: bool = False) -> torch.Tensor:
+            t = torch.from_numpy(np.asarray(x))
+            return t.long().to(device) if long_type else t.float().to(device)
 
-    if len(trajectories) <= 1:
-        total_steps = sum(t["rewards"].shape[0] for t in trajectories)
-        log.warning(
-            "LIBERO-Cosmos: only %d trajectory(ies) loaded (total steps=%d). "
-            "Re-run: python scripts/download_libero_cosmos.py --output-dir <data_dir> without --streaming to fetch full dataset, then check manifest.json train_episodes.",
-            len(trajectories),
-            total_steps,
+        result: Tuple[Any, ...] = (
+            _t(obs_norm),
+            _t(context),
+            _t(actions),
+            _t(rewards),
+            _t(dones, True),
+            _t(rtg),
+            _t(timesteps, True),
+            _t(mask),
+            _t(ps),
+            _t(pa),
+            _t(pr),
+            _t(prtg),
+            _t(pts, True),
+            _t(pm),
+            instruction,
         )
+        if use_precomputed_embeddings:
+            emb = _load_episode_embedding_segment(root, q_ep, q_start, q_len)
+            if emb is not None and emb.shape[0] > 0:
+                t = torch.from_numpy(emb).float().to(device).unsqueeze(0)
+                result = result + (t,)
+            else:
+                result = result + (None,)
+        elif use_vision and img_keys and "images" in q_seg:
+            # Vision encoders (DINOv2, etc.) expect (B, T, C, H, W); frames are (T, H, W, C)
+            imgs = []
+            for a in q_seg["images"]:
+                t = torch.from_numpy(np.asarray(a)).float().to(device)
+                if t.dim() == 4 and t.shape[-1] == 3:
+                    t = t.permute(0, 3, 1, 2)
+                if t.dim() == 4:
+                    t = t.unsqueeze(0)
+                imgs.append(t)
+            result = result + (imgs,)
+        else:
+            result = result + (None,)
+        return result
 
-    return trajectories, prompt_per_task, task_instructions
+    return loader_fn
+
+
+def build_libero_in_context_dataset(
+    data_dir,
+    data_cfg,
+    device,
+    state_dim,
+    action_dim,
+    collate_fn,
+):
+    """Build in-context dataset + loader from LIBERO sample index. Returns None if no index."""
+    from src.data.sample_index import (
+        GroupedBatchSampler,
+        IndexBackedDataset,
+        InContextDatasetResult,
+        SampleIndex,
+    )
+
+    root = Path(data_dir).resolve() / "LIBERO-Cosmos-Policy"
+    if not _has_new_format(root):
+        return None
+    index_df = get_libero_sample_index(str(data_dir))
+    if index_df is None:
+        return None
+    task_instructions = get_libero_task_instructions_from_manifest(str(data_dir)) or []
+    index = SampleIndex(index_df, length_bin_columns=["query_len", "prompt_len"])
+    use_precomputed_embeddings = getattr(data_cfg, "use_precomputed_embeddings", False)
+    loader_fn = make_libero_index_loader(
+        root,
+        task_instructions,
+        state_dim,
+        action_dim,
+        data_cfg.context_dim,
+        device,
+        data_cfg.return_scale,
+        data_cfg.max_total_prompt_length or 256,
+        data_cfg.max_prompt_trajectory_length,
+        use_vision=data_cfg.use_vision and not use_precomputed_embeddings,
+        image_keys=data_cfg.image_keys or [],
+        use_precomputed_embeddings=use_precomputed_embeddings,
+    )
+    idx_dataset = IndexBackedDataset(index, loader_fn)
+    total_prompt_len = data_cfg.max_total_prompt_length or 256
+    max_pt = data_cfg.max_prompt_trajectory_length
+
+    class _Wrapper:
+        """Wrapper so index-backed dataset matches the interface expected by train.py (_print_dataset_stats, etc.)."""
+
+        def __init__(self, d, ti, tpl, mpt, sd, ad, cfg):
+            self._d = d
+            self.task_instructions = ti
+            self.total_prompt_len = tpl
+            self.max_prompt_trajectory_length = mpt
+            self.state_mean = np.zeros(sd, dtype=np.float32)
+            self.state_std = np.ones(sd, dtype=np.float32)
+            self.trajectories = []
+            self.state_dim = sd
+            self.act_dim = ad
+            self.horizon = getattr(cfg, "horizon", 32)
+            self._query_length = getattr(cfg, "query_history_length", 1)
+            self.max_episode_steps = getattr(cfg, "max_episode_steps", 100)
+            self.num_context_trajectories = getattr(cfg, "num_context_trajectories", 3)
+            self.prompt_length = getattr(cfg, "prompt_length", None)
+            self.return_min = 0.0
+            self.return_max = 1.0
+            self.return_avg = 0.5
+
+        def __len__(self):
+            return len(self._d)
+
+        def __getitem__(self, i):
+            return self._d[i]
+
+    dataset = _Wrapper(
+        idx_dataset, task_instructions, total_prompt_len, max_pt, state_dim, action_dim, data_cfg
+    )
+    batch_sampler = GroupedBatchSampler(index, data_cfg.batch_size, shuffle=True, seed=data_cfg.seed)
+    loader = torch.utils.data.DataLoader(
+        dataset,
+        batch_sampler=batch_sampler,
+        num_workers=0,
+        collate_fn=collate_fn,
+    )
+    log.info(
+        "LIBERO in-context index: {} rows, grouped batching by query_len/prompt_len",
+        len(index),
+    )
+    return InContextDatasetResult(
+        dataset=dataset,
+        loader=loader,
+        state_mean=dataset.state_mean,
+        state_std=dataset.state_std,
+        task_instructions=task_instructions,
+        total_prompt_len=total_prompt_len,
+        max_prompt_trajectory_length=max_pt,
+    )
+
+
+from src.data.sample_index import register_in_context_builder
+register_in_context_builder("libero", build_libero_in_context_dataset)

@@ -73,6 +73,9 @@ class VLADecisionTransformer(MetaDecisionTransformer):
         vision_encoder_pool: bool = True,
         vision_encoder_attention_pool: bool = False,
         freeze_vision_encoder: bool = False,
+        vision_encoder_chunk_size: Optional[int] = None,
+        use_precomputed_embeddings: bool = False,
+        precomputed_vision_embed_dim: Optional[int] = None,
         **kwargs: Any,
     ):
         super().__init__(
@@ -100,19 +103,25 @@ class VLADecisionTransformer(MetaDecisionTransformer):
         self.vision_fusion = vision_fusion
 
         if use_vision:
-            self.vision_encoder = build_vision_encoder(
-                encoder_type=vision_encoder_type,
-                num_views=num_views,
-                embed_dim=image_embed_dim,
-                img_size=(224, 224),
-                pool=vision_encoder_pool,
-                attention_pool=vision_encoder_attention_pool,
-            )
-            if freeze_vision_encoder:
-                for p in self.vision_encoder.parameters():
-                    p.requires_grad = False
-            out_dim = self.vision_encoder.output_dim
-            self.vision_proj = nn.Linear(out_dim, hidden_size)
+            if use_precomputed_embeddings and precomputed_vision_embed_dim is not None:
+                # Training with precomputed embeddings: skip loading vision encoder (saves memory). vision_proj maps embeddings to hidden_size. For inference, load a checkpoint that includes the encoder or set use_precomputed_embeddings=False.
+                self.vision_encoder = None
+                self.vision_proj = nn.Linear(precomputed_vision_embed_dim, hidden_size)
+            else:
+                self.vision_encoder = build_vision_encoder(
+                    encoder_type=vision_encoder_type,
+                    num_views=num_views,
+                    embed_dim=image_embed_dim,
+                    img_size=(224, 224),
+                    pool=vision_encoder_pool,
+                    attention_pool=vision_encoder_attention_pool,
+                    chunk_size=vision_encoder_chunk_size,
+                )
+                if freeze_vision_encoder:
+                    for p in self.vision_encoder.parameters():
+                        p.requires_grad = False
+                out_dim = self.vision_encoder.output_dim
+                self.vision_proj = nn.Linear(out_dim, hidden_size)
         else:
             self.vision_encoder = None
             self.vision_proj = None

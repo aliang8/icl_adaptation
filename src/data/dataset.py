@@ -728,26 +728,57 @@ def collate_icl_batch(batch: List[Tuple[Any, ...]]) -> Tuple[Any, ...]:
         padded = [_pad_to_length(t, max_len, dim=0, pad_value=pad_val) for t in tensors]
         out.append(torch.stack(padded, dim=0))
     if num_elems > 15:
-        images_list = [sample[15] for sample in batch]
-        if not all(im is not None and isinstance(im, list) and len(im) > 0 for im in images_list):
+        elem_15 = batch[0][15]
+        is_precomputed = any(
+            sample[15] is not None and isinstance(sample[15], torch.Tensor) and sample[15].dim() == 3
+            for sample in batch
+        )
+        if not is_precomputed and (elem_15 is None or not isinstance(elem_15, torch.Tensor) or elem_15.dim() != 3):
+            elem_15 = None
+        if elem_15 is None and not is_precomputed:
             out.append(None)
+        elif is_precomputed:
+            # Precomputed embeddings: each sample (1, T, D) or None; pad T and stack to (B, T_max, D)
+            tensors = [sample[15] for sample in batch]
+            non_none = [t for t in tensors if t is not None]
+            if not non_none:
+                out.append(None)
+            else:
+                t_len = max(t.shape[1] for t in non_none)
+                d_dim = non_none[0].shape[2]
+                device = non_none[0].device
+                dtype = non_none[0].dtype
+                padded = []
+                for t in tensors:
+                    if t is None:
+                        padded.append(torch.zeros(1, t_len, d_dim, device=device, dtype=dtype).squeeze(0))
+                    else:
+                        p = t.squeeze(0)
+                        if p.shape[0] < t_len:
+                            p = _pad_to_length(p, t_len, dim=0, pad_value=0.0)
+                        padded.append(p)
+                out.append(torch.stack(padded, dim=0))
         else:
-            num_views = len(images_list[0])
-            view_batches = []
-            for v in range(num_views):
-                tensors_v = [im[v] for im in images_list]
-                t_len = max(t.shape[1] for t in tensors_v if t.dim() >= 2)
-                padded_v = []
-                for t in tensors_v:
-                    if t.dim() == 5 and t.shape[1] < t_len:
-                        pad_size = t_len - t.shape[1]
-                        t = torch.cat(
-                            [t, torch.zeros(t.shape[0], pad_size, *t.shape[2:], device=t.device, dtype=t.dtype)],
-                            dim=1,
-                        )
-                    padded_v.append(t)
-                view_batches.append(torch.cat(padded_v, dim=0))
-            out.append(view_batches if view_batches else None)
+            images_list = [sample[15] for sample in batch]
+            if not all(im is not None and isinstance(im, list) and len(im) > 0 for im in images_list):
+                out.append(None)
+            else:
+                num_views = len(images_list[0])
+                view_batches = []
+                for v in range(num_views):
+                    tensors_v = [im[v] for im in images_list]
+                    t_len = max(t.shape[1] for t in tensors_v if t.dim() >= 2)
+                    padded_v = []
+                    for t in tensors_v:
+                        if t.dim() == 5 and t.shape[1] < t_len:
+                            pad_size = t_len - t.shape[1]
+                            t = torch.cat(
+                                [t, torch.zeros(t.shape[0], pad_size, *t.shape[2:], device=t.device, dtype=t.dtype)],
+                                dim=1,
+                            )
+                        padded_v.append(t)
+                    view_batches.append(torch.cat(padded_v, dim=0))
+                out.append(view_batches if view_batches else None)
     return tuple(out)
 
 

@@ -3,8 +3,10 @@
 Offline evaluation for LIBERO-Cosmos: load checkpoint, run forward on held-out episodes,
 report action MSE (and optional success-rate proxy) per suite (in-distribution).
 
+Requires the new dataset format: manifest.parquet + episodes/ (from convert_libero_hdf5_to_dataset.py).
+Val episodes = last 10% of episodes from the manifest (by episode_index); use --max-val-episodes to cap.
+
 Usage:
-  python scripts/run_libero_eval.py --ckpt outputs/.../ckpts/best/checkpoint.pt --manifest datasets/LIBERO-Cosmos-Policy/manifest.json
   python scripts/run_libero_eval.py --ckpt path/to/checkpoint.pt --data-dir datasets --output-dir outputs/libero_eval
 """
 
@@ -39,12 +41,6 @@ def main():
     )
     parser.add_argument("--ckpt", type=str, required=True, help="Path to checkpoint.pt")
     parser.add_argument(
-        "--manifest",
-        type=str,
-        default=None,
-        help="Path to manifest.json (default: data_dir/LIBERO-Cosmos-Policy/manifest.json)",
-    )
-    parser.add_argument(
         "--data-dir", type=str, default="datasets", help="Data root (default: datasets)"
     )
     parser.add_argument(
@@ -76,38 +72,24 @@ def main():
         )
 
     data_dir = args.data_dir
-    manifest_path = args.manifest or str(Path(data_dir) / "LIBERO-Cosmos-Policy" / "manifest.json")
-    if not os.path.isfile(manifest_path):
+    from src.data.libero_dataset import _has_new_format, load_libero_episodes_for_eval
+
+    root = Path(data_dir).resolve() / "LIBERO-Cosmos-Policy"
+    if not _has_new_format(root):
         raise SystemExit(
-            "Manifest not found: "
-            + manifest_path
-            + ". Run scripts/download_libero_cosmos.py first."
+            "LIBERO eval requires manifest.parquet + episodes/. "
+            "Run: python scripts/convert_libero_hdf5_to_dataset.py --input-dir <LIBERO-Cosmos-Policy>"
         )
-
-    from src.data.libero_dataset import (
-        load_libero_manifest,
-        _get_ds_from_cache_or_hf,
-        _episode_to_trajectory,
+    trajectories = load_libero_episodes_for_eval(
+        data_dir,
+        last_n_fraction=0.1,
+        max_episodes=args.max_val_episodes,
     )
-
-    manifest = load_libero_manifest(manifest_path)
-    val_episodes = manifest.get("val_episodes", [])[: args.max_val_episodes]
-    if not val_episodes:
-        print("No val_episodes in manifest; nothing to evaluate.")
+    for t in trajectories:
+        t["_suite"] = "unknown"
+    if not trajectories:
+        print("No val episodes to evaluate.")
         return
-
-    repo_id = manifest.get("repo_id", "nvidia/LIBERO-Cosmos-Policy")
-    ds = _get_ds_from_cache_or_hf(data_dir, repo_id, split="train")
-    # Val episodes are indices into the same dataset (we split train/val by episode, not by dataset)
-    # So we need to slice ds by val episode indices. Our manifest has start/end for each episode.
-    trajectories = []
-    for ep in val_episodes:
-        s, e = ep["start"], ep["end"]
-        if e <= s:
-            continue
-        traj = _episode_to_trajectory(ds, s, e, ep.get("task_description"), ep.get("success"))
-        traj["_suite"] = ep.get("suite", "unknown")
-        trajectories.append(traj)
 
     state_dim, act_dim = 9, 7
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")

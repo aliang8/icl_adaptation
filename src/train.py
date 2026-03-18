@@ -98,9 +98,13 @@ def _print_dataset_stats(
     if proprio_keys is None:
         proprio_keys = []
 
-    n_trajectories = len(dataset.trajectories)
+    n_trajectories = len(getattr(dataset, "trajectories", []) or [])
     n_segments = len(dataset)
-    traj_lengths = [t["rewards"].shape[0] for t in dataset.trajectories]
+    traj_lengths = (
+        [t["rewards"].shape[0] for t in (getattr(dataset, "trajectories", None) or [])]
+        if isinstance(getattr(dataset, "trajectories", None), list)
+        else []
+    )
     total_steps = sum(traj_lengths)
     min_len = min(traj_lengths) if traj_lengths else 0
     max_len = max(traj_lengths) if traj_lengths else 0
@@ -127,9 +131,11 @@ def _print_dataset_stats(
                 for t in tasks[:max_examples]
             ]
             table.add_row("Example tasks", "\n".join(examples) if examples else "—")
-    table.add_row("Return (min)", f"{dataset.return_min:.2f}")
-    table.add_row("Return (max)", f"{dataset.return_max:.2f}")
-    table.add_row("Return (mean)", f"{dataset.return_avg:.2f}")
+    return_min = getattr(dataset, "return_min", None)
+    return_max = getattr(dataset, "return_max", None)
+    return_avg = getattr(dataset, "return_avg", None)
+    for label, val in [("Return (min)", return_min), ("Return (max)", return_max), ("Return (mean)", return_avg)]:
+        table.add_row(label, f"{val:.2f}" if val is not None else "—")
     table.add_row("State dim", str(dataset.state_dim))
     table.add_row("Action dim", str(dataset.act_dim))
     table.add_row("Horizon", str(dataset.horizon))
@@ -218,13 +224,7 @@ def validate_dataset_paths(env_name: str, paths, data_cfg) -> None:
             )
         log.info("ICRT-MT dataset config found: {}", config_path)
     elif env_name in LIBERO_SUITES:
-        manifest_path = paths.data_root / "LIBERO-Cosmos-Policy" / "manifest.json"
-        if not manifest_path.exists():
-            raise FileNotFoundError(
-                f"LIBERO manifest not found at {manifest_path}.\n"
-                f"Run: python scripts/download_libero_cosmos.py --output-dir {paths.data_root}"
-            )
-        log.info("LIBERO manifest found: {}", manifest_path)
+        log.info("LIBERO: dataset at data_dir/LIBERO-Cosmos-Policy/data/ (episode_index)")
 
 
 def build_model(cfg, state_dim: int, action_dim: int, num_instructions: Optional[int] = None):
@@ -250,6 +250,9 @@ def build_model(cfg, state_dim: int, action_dim: int, num_instructions: Optional
         query_loss_only=m.query_loss_only,
     )
     if m.use_vision or m.use_language:
+        data_cfg = getattr(cfg, "data", None)
+        use_precomputed = getattr(data_cfg, "use_precomputed_embeddings", False) if data_cfg else False
+        precomputed_dim = getattr(m, "precomputed_vision_embed_dim", None)
         model = VLADecisionTransformer(
             **common,
             use_vision=m.use_vision,
@@ -261,6 +264,9 @@ def build_model(cfg, state_dim: int, action_dim: int, num_instructions: Optional
             vision_encoder_pool=m.vision_encoder_pool,
             vision_encoder_attention_pool=m.vision_encoder_attention_pool,
             freeze_vision_encoder=m.freeze_vision_encoder,
+            vision_encoder_chunk_size=getattr(m, "vision_encoder_chunk_size", None),
+            use_precomputed_embeddings=use_precomputed,
+            precomputed_vision_embed_dim=precomputed_dim,
         )
     else:
         model = MetaDecisionTransformer(**common)
@@ -283,9 +289,49 @@ def build_optimizer_scheduler(model, cfg):
     return optimizer, scheduler
 
 
-def make_train_step_fn(task_instructions):
+def make_train_step_fn(task_instructions, debug_shapes: bool = False, use_precomputed_embeddings: bool = False):
     """Build a train step that passes instruction_indices and optional image_embeddings to VLA-DT."""
     task_list = list(task_instructions) if task_instructions else []
+    _debug_shapes_printed = [False]
+    _vision_encoder_logged = [False]
+
+    _BATCH_NAMES = [
+        "states", "contexts", "actions", "rewards", "dones", "rtg", "timesteps", "masks",
+        "prompt_s", "prompt_a", "prompt_r", "prompt_rtg", "prompt_ts", "prompt_m", "instructions",
+    ]
+
+    def _print_shapes(model, batch, dt_batch, image_embeddings):
+        log.info("[debug_shapes] === Batch / model input shapes (first step) ===")
+        for i, name in enumerate(_BATCH_NAMES):
+            if i >= len(batch):
+                break
+            x = batch[i]
+            if isinstance(x, torch.Tensor):
+                log.info("[debug_shapes]   {}: {} {}", name, x.dtype, tuple(x.shape))
+            elif isinstance(x, (list, tuple)) and x and isinstance(x[0], torch.Tensor):
+                log.info("[debug_shapes]   {}: list of {} tensors {}", name, len(x), [tuple(t.shape) for t in x])
+            else:
+                log.info("[debug_shapes]   {}: type={} len={}", name, type(x).__name__, len(x) if hasattr(x, "__len__") else "?")
+        if len(batch) > 15 and batch[15] is not None:
+            imgs = batch[15]
+            if isinstance(imgs, (list, tuple)):
+                for v, t in enumerate(imgs):
+                    if isinstance(t, torch.Tensor):
+                        log.info("[debug_shapes]   images view[{}]: {}", v, tuple(t.shape))
+            elif isinstance(imgs, torch.Tensor):
+                log.info("[debug_shapes]   image_embeddings (precomputed): {}", tuple(imgs.shape))
+            else:
+                log.info("[debug_shapes]   images/embeddings: {}", type(imgs).__name__)
+        log.info("[debug_shapes]   --- DTBatch ---")
+        log.info("[debug_shapes]   states: {}", tuple(dt_batch.states.shape))
+        log.info("[debug_shapes]   actions: {}", tuple(dt_batch.actions.shape))
+        if dt_batch.prompt and dt_batch.prompt[0] is not None:
+            log.info("[debug_shapes]   prompt (s,a,r,rtg,ts,m): {}", [tuple(p.shape) for p in dt_batch.prompt])
+        if image_embeddings is not None:
+            log.info("[debug_shapes]   image_embeddings: {}", tuple(image_embeddings.shape))
+        if dt_batch.instruction_indices is not None:
+            log.info("[debug_shapes]   instruction_indices: {}", tuple(dt_batch.instruction_indices.shape))
+        log.info("[debug_shapes] === end ===")
 
     def train_step_fn(model, batch):
         """One step: forward, MSE loss on actions. Batch: 15 elements (14 tensors + instructions); optional 16th = images."""
@@ -324,11 +370,26 @@ def make_train_step_fn(task_instructions):
             ]
             instruction_indices = torch.tensor(idx_list, dtype=torch.long, device=device)
 
-        # VLA-DT: image_embeddings when dataset returns images (optional 16th element)
+        # VLA-DT: image_embeddings from precomputed npz or from vision encoder (optional 16th element)
         image_embeddings = None
         if len(batch) > 15 and batch[15] is not None:
-            if model.vision_encoder is not None:
+            if use_precomputed_embeddings:
+                image_embeddings = batch[15]
+            elif model.vision_encoder is not None:
+                imgs = batch[15]
+                if isinstance(imgs, (list, tuple)):
+                    shapes_str = [tuple(t.shape) for t in imgs]
+                    if not _vision_encoder_logged[0]:
+                        log.info("Vision encoder input: {} views, shapes {}", len(imgs), shapes_str)
+                else:
+                    shapes_str = getattr(imgs, "shape", type(imgs))
+                    if not _vision_encoder_logged[0]:
+                        log.info("Vision encoder input: {}", shapes_str)
                 image_embeddings = model.vision_encoder(batch[15])
+                if not _vision_encoder_logged[0]:
+                    if image_embeddings is not None:
+                        log.info("Vision encoder output: {}", tuple(image_embeddings.shape))
+                    _vision_encoder_logged[0] = True
 
         dt_batch = DTBatch(
             states=states,
@@ -341,6 +402,9 @@ def make_train_step_fn(task_instructions):
             image_embeddings=image_embeddings,
             instruction_indices=instruction_indices,
         )
+        if debug_shapes and not _debug_shapes_printed[0]:
+            _print_shapes(model, batch, dt_batch, image_embeddings)
+            _debug_shapes_printed[0] = True
         out = model(dt_batch)
         loss = out.loss if out.loss is not None else torch.tensor(0.0, device=states.device)
         with torch.no_grad():
@@ -550,71 +614,84 @@ def main():
             action_dim,
         )
 
+    in_context_result = None
     if env_name in LIBERO_SUITES:
-        from src.data.libero_dataset import load_libero_trajectories
-
-        manifest_path = data_root / "LIBERO-Cosmos-Policy" / "manifest.json"
-        trajectories, prompt_per_task, task_instructions_from_loader = load_libero_trajectories(
+        import src.data.libero_dataset
+        from src.data.sample_index import build_in_context_dataset
+        in_context_result = build_in_context_dataset(
+            "libero",
             str(data_root),
-            manifest_path=str(manifest_path) if manifest_path.exists() else None,
-            repo_id=data_cfg.libero_repo_id,
-            image_keys=data_cfg.image_keys if data_cfg.use_vision else None,
+            data_cfg,
+            device,
+            state_dim,
+            action_dim,
+            collate_icl_batch,
         )
-        if trajectories:
-            log.info(
-                "Loaded {} LIBERO trajectories (manifest: {})",
-                len(trajectories),
-                manifest_path.resolve(),
+        if in_context_result is None:
+            log.error(
+                "LIBERO requires manifest.parquet + sample_index.parquet + episodes/. "
+                "Run: python scripts/convert_libero_hdf5_to_dataset.py --input-dir <LIBERO-Cosmos-Policy>"
             )
+            return
+        dataset = in_context_result.dataset
+        loader = in_context_result.loader
+        state_mean = in_context_result.state_mean
+        state_std = in_context_result.state_std
 
-    if not trajectories:
+    if in_context_result is None and not trajectories:
         log.warning("No dataset found at {}", data_dir.resolve())
         return
 
-    dataset = ICLTrajectoryDataset(
-        trajectories=trajectories,
-        horizon=data_cfg.horizon,
-        max_episode_steps=data_cfg.max_episode_steps,
-        return_scale=data_cfg.return_scale,
-        device=device,
-        prompt_trajectories_per_task=prompt_per_task,
-        context_dim=data_cfg.context_dim,
-        state_dim=state_dim,
-        act_dim=action_dim,
-        prompt_length=data_cfg.prompt_length,
-        scale=data_cfg.return_scale,
-        total_epi_per_task=max(1, len(trajectories) // max(1, data_cfg.num_train_tasks)),
-        num_context_trajectories=data_cfg.num_context_trajectories,
-        context_sort_ascending=data_cfg.context_sort_ascending,
-        context_sampling=data_cfg.context_sampling,
-        max_total_prompt_length=data_cfg.max_total_prompt_length,
-        max_prompt_trajectory_length=data_cfg.max_prompt_trajectory_length,
-        context_style=data_cfg.context_style,
-        lazy_dataset=data_cfg.lazy_dataset,
-        max_training_examples=data_cfg.max_training_examples,
-        task_instructions=task_instructions_from_loader
-        if task_instructions_from_loader is not None
-        else data_cfg.task_instructions,
-        seed=data_cfg.seed,
-        query_history_length=data_cfg.query_history_length,
-        use_vision=data_cfg.use_vision,
-        image_keys=data_cfg.image_keys or [],
-    )
+    if in_context_result is None:
+        dataset = ICLTrajectoryDataset(
+            trajectories=trajectories,
+            horizon=data_cfg.horizon,
+            max_episode_steps=data_cfg.max_episode_steps,
+            return_scale=data_cfg.return_scale,
+            device=device,
+            prompt_trajectories_per_task=prompt_per_task,
+            context_dim=data_cfg.context_dim,
+            state_dim=state_dim,
+            act_dim=action_dim,
+            prompt_length=data_cfg.prompt_length,
+            scale=data_cfg.return_scale,
+            total_epi_per_task=max(1, len(trajectories) // max(1, data_cfg.num_train_tasks)),
+            num_context_trajectories=data_cfg.num_context_trajectories,
+            context_sort_ascending=data_cfg.context_sort_ascending,
+            context_sampling=data_cfg.context_sampling,
+            max_total_prompt_length=data_cfg.max_total_prompt_length,
+            max_prompt_trajectory_length=data_cfg.max_prompt_trajectory_length,
+            context_style=data_cfg.context_style,
+            lazy_dataset=data_cfg.lazy_dataset,
+            max_training_examples=data_cfg.max_training_examples,
+            task_instructions=task_instructions_from_loader
+            if task_instructions_from_loader is not None
+            else data_cfg.task_instructions,
+            seed=data_cfg.seed,
+            query_history_length=data_cfg.query_history_length,
+            use_vision=data_cfg.use_vision,
+            image_keys=data_cfg.image_keys or [],
+        )
     state_mean = dataset.state_mean
     state_std = dataset.state_std
     log.info("Dataset size: {} segments, state_mean/std computed", len(dataset))
-    if data_cfg.use_vision and not any(isinstance(t, dict) and t.get("images") for t in dataset.trajectories):
+    if (
+        data_cfg.use_vision
+        and getattr(dataset, "trajectories", None)
+        and not any(isinstance(t, dict) and t.get("images") for t in dataset.trajectories)
+    ):
         log.warning(
             "use_vision=true but no trajectories have 'images'. "
-            "For LIBERO, use Parquet data with manifest train_episodes that have start/end (not HDF5 file paths) so image_keys are loaded."
+            "Ensure data/ dataset has image columns (e.g. primary_images_jpeg, wrist_images_jpeg) from convert_libero_hdf5_to_dataset.py."
         )
-    loader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=data_cfg.batch_size,
-        shuffle=True,
-        num_workers=data_cfg.num_workers,
-        collate_fn=collate_icl_batch,
-    )
+    if in_context_result is None:
+        loader = torch.utils.data.DataLoader(
+            dataset,
+            batch_size=data_cfg.batch_size,
+            shuffle=True,
+            num_workers=data_cfg.num_workers,
+            collate_fn=collate_icl_batch,
+        )
     _print_dataset_stats(
         dataset,
         loader,
@@ -738,7 +815,11 @@ def main():
 
     log.info("Starting training loop (max_steps={})", cfg.experiment.max_steps)
     export_dir = str(run_dir / "artifacts" / "inference")
-    train_step_fn = make_train_step_fn(dataset.task_instructions or [])
+    train_step_fn = make_train_step_fn(
+        dataset.task_instructions or [],
+        debug_shapes=cfg.experiment.debug_shapes,
+        use_precomputed_embeddings=getattr(cfg.data, "use_precomputed_embeddings", False),
+    )
     final_step, best_metric = trainer.run_training(
         train_loader=loader,
         global_step_start=global_step_start,

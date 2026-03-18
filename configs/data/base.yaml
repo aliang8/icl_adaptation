@@ -35,6 +35,5 @@ action_keys: null
 min_trajectory_length: 10
 max_trajectory_length: 450
 # LIBERO
-libero_manifest: null
 libero_repo_id: nvidia/LIBERO-Cosmos-Policy
 seed: 0

@@ -1,12 +1,14 @@
 # LIBERO-Cosmos-Policy: nvidia/LIBERO-Cosmos-Policy on HuggingFace
-# Download: python scripts/download_libero_cosmos.py --output-dir datasets
+# 1) Download HDF5: huggingface-cli download nvidia/LIBERO-Cosmos-Policy --repo-type dataset --local-dir <data_dir>/LIBERO-Cosmos-Policy
+# 2) Convert: python scripts/convert_libero_hdf5_to_dataset.py --input-dir <data_dir>/LIBERO-Cosmos-Policy
 # env_name is the LIBERO benchmark suite (libero_10, libero_spatial, libero_object, libero_goal, libero_90)
 env_name: libero_10
 data_quality: ""
-libero_manifest: datasets/LIBERO-Cosmos-Policy/manifest.json
 libero_repo_id: nvidia/LIBERO-Cosmos-Policy
 use_language: true
 use_vision: false  # set true with model=vla_dt when using image-enabled loader (Parquet)
+# Set true after running scripts/precompute_libero_embeddings.py to load embeddings from npz (no vision encoder at train time)
+use_precomputed_embeddings: false
 # Primary and wrist camera keys in Hub/Parquet; HDF5 loader currently provides proprio only
 image_keys:
   - primary_images_jpeg

@@ -29,5 +29,9 @@ vision_encoder_pool: true
 vision_encoder_attention_pool: false
 # Freeze vision encoder (only train vision_proj + transformer); set true for pretrained dinov2/dinov3
 freeze_vision_encoder: false
+# Process vision encoder in chunks of N images (null = no chunking). Default 8 reduces OOM with dinov2.
+vision_encoder_chunk_size: 8
+# When data.use_precomputed_embeddings=true, set to embedding dim (e.g. 1536 for dinov2 2 views). Vision encoder is not loaded at train time; needed for inference.
+precomputed_vision_embed_dim: null
 # ICRT-style: only compute action loss on query segment (default true)
 query_loss_only: true

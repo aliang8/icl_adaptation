@@ -41,6 +41,10 @@ class ModelConfig:
     vision_encoder_attention_pool: bool = False
     # Freeze vision encoder (no gradients); only vision_proj and rest of model are trained
     freeze_vision_encoder: bool = False
+    # Process vision encoder in chunks of this many images (None = no chunking). Default 8 reduces OOM for DINOv2.
+    vision_encoder_chunk_size: Optional[int] = 8
+    # When data.use_precomputed_embeddings=true: vision encoder is not loaded at train time; set this to the embedding dim (e.g. 1536 for dinov2 2 views). Required for inference to load the encoder.
+    precomputed_vision_embed_dim: Optional[int] = None
     # ICRT-style: only compute action loss on the query segment (default True). If False, loss on prompt + query.
     query_loss_only: bool = True
 
@@ -51,7 +55,7 @@ class DataConfig:
 
     env_name: str = "AntDir-v0"
     data_quality: str = "medium"
-    data_dir: str = "datasets"
+    data_dir: str = "all_datasets"
     horizon: int = 20
     # Query = last K steps of current trajectory; K=1 = OpenVLA-style; None = use horizon
     query_history_length: Optional[int] = None
@@ -90,8 +94,9 @@ class DataConfig:
     min_trajectory_length: int = 10
     max_trajectory_length: int = 450
     # LIBERO-Cosmos
-    libero_manifest: Optional[str] = None
     libero_repo_id: str = "nvidia/LIBERO-Cosmos-Policy"
+    # When true, load precomputed embeddings from episodes/{id}/embeddings.npz (run precompute_libero_embeddings.py first)
+    use_precomputed_embeddings: bool = False
     seed: int = 0
 
 
@@ -110,7 +115,7 @@ class OptimConfig:
 class PathsConfig:
     """Path config: resolved to pathlib.Path at runtime. Override paths.data_root etc. from CLI."""
 
-    data_root: str = "datasets"
+    data_root: str = "all_datasets"
     output_root: str = "outputs"
     repo_root: str = "."
 
@@ -125,7 +130,7 @@ class SystemConfig:
     # run directory: outputs/<project_name>/<date>/<run_name>__seed_<X>__<hash>/
     output_dir: str = "outputs"
     project_name: str = "icl_adaptation"
-    # run_name set from CLI or config; used with seed and git hash for run slug
+    run_name: Optional[str] = None  # CLI --run-name or override system.run_name=...
     save_dir: str = (
         "outputs/checkpoints"  # deprecated when run_dir used; ckpts live under run_dir/ckpts
     )
@@ -170,6 +175,8 @@ class ExperimentConfig:
     best_metric_mode: str = "max"  # max or min
     # export
     export_final: bool = True
+    # Debug: print shapes of batch and model inputs on first train step (for OOM / shape debugging)
+    debug_shapes: bool = False
 
 
 @dataclass

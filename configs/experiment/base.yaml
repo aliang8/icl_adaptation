@@ -18,3 +18,4 @@ save_periodic_every_steps: 25000
 best_metric_name: eval/return_mean
 best_metric_mode: max
 export_final: true
+debug_shapes: false  # set true to print batch/model input shapes on first train step

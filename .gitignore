@@ -46,4 +46,4 @@ Thumbs.db
 *.arrow
 
 LIBERO/*
-datasets/*
+all_datasets/*

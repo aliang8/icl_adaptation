@@ -16,6 +16,7 @@ from typing import List, Optional, Tuple, Any
 
 import torch
 import torch.nn as nn
+from tqdm import tqdm
 
 from src.models.vision import MultiViewVisionEncoder
 
@@ -167,6 +168,7 @@ def _build_dinov2_encoder(
 ) -> nn.Module:
     """DINOv2/DINOv3: CLS token (default) or all patch tokens + attention pooling. Same API for both."""
     from transformers import AutoModel
+    chunk_size = kwargs.pop("chunk_size", None)
     backbone = AutoModel.from_pretrained(model_name, **kwargs)
     hidden = backbone.config.hidden_size
 
@@ -177,16 +179,37 @@ def _build_dinov2_encoder(
             n_views: int,
             hidden_size: int,
             use_attention_pool: bool,
+            chunk_size: Optional[int] = None,
         ):
             super().__init__()
             self.backbone = backbone
             self.num_views = n_views
             self.use_attention_pool = use_attention_pool
+            self.chunk_size = chunk_size
             self.output_dim = n_views * hidden_size
             if use_attention_pool:
                 self.pool = nn.ModuleList(
                     [AttentionPooling(hidden_size, hidden_size) for _ in range(n_views)]
                 )
+
+        def _backbone_forward(self, im: torch.Tensor) -> torch.Tensor:
+            """Run backbone on im (N, C, H, W), optionally in chunks."""
+            N = im.shape[0]
+            if self.chunk_size is None or N <= self.chunk_size:
+                return self.backbone(pixel_values=im).last_hidden_state
+            chunks = []
+            for start in tqdm(
+                range(0, N, self.chunk_size),
+                desc="Computing image embeddings",
+                total=(N + self.chunk_size - 1) // self.chunk_size,
+                unit="chunk",
+                leave=False,
+            ):
+                end = min(start + self.chunk_size, N)
+                chunk = im[start:end]
+                h = self.backbone(pixel_values=chunk).last_hidden_state
+                chunks.append(h)
+            return torch.cat(chunks, dim=0)
 
         def forward(self, images: List[torch.Tensor]) -> torch.Tensor:
             B, T = _ensure_bt(images)
@@ -195,7 +218,7 @@ def _build_dinov2_encoder(
                 im = images[v]
                 if im.dim() == 5:
                     im = im.reshape(B * T, *im.shape[2:])
-                h = self.backbone(pixel_values=im).last_hidden_state
+                h = self._backbone_forward(im)
                 if self.use_attention_pool:
                     if T > 1:
                         h = h.reshape(B, T, h.shape[1], h.shape[2])
@@ -213,7 +236,7 @@ def _build_dinov2_encoder(
                 out_list.append(out_list[-1])
             return torch.cat(out_list, dim=-1)
 
-    return DINOv2Encoder(backbone, num_views, hidden, attention_pool)
+    return DINOv2Encoder(backbone, num_views, hidden, attention_pool, chunk_size)
 
 
 def _build_paligemma_encoder(
@@ -331,7 +354,9 @@ def build_vision_encoder(
     """
     Factory: returns encoder with .output_dim and .forward(images) -> (B, T, output_dim).
     attention_pool: use ICRT-style attention pooling over patch tokens (learned query) instead of mean.
+    chunk_size: only used by dinov2/dinov3; popped for other encoders.
     """
+    chunk_size = kwargs.pop("chunk_size", None)
     if encoder_type == "patch":
         return _build_patch_encoder(
             num_views=num_views,
@@ -348,6 +373,7 @@ def build_vision_encoder(
             pool=pool,
             model_name=model_name,
             attention_pool=attention_pool,
+            chunk_size=chunk_size,
             **kwargs,
         )
     if encoder_type == "dinov3":
@@ -357,6 +383,7 @@ def build_vision_encoder(
             pool=pool,
             model_name=model_name,
             attention_pool=attention_pool,
+            chunk_size=chunk_size,
             **kwargs,
         )
     if encoder_type == "paligemma":

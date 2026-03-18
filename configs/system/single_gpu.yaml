@@ -3,6 +3,7 @@ seed: 412
 deterministic: true
 output_dir: outputs
 project_name: icl_adaptation  # run dir: outputs/<project_name>/<date>/<run_name>__seed_<X>__<hash>/
+run_name: null  # override with --run-name or system.run_name=...
 save_dir: outputs/checkpoints  # overridden at runtime to run_dir/ckpts
 world_size: 1
 rank: 0
