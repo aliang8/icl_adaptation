@@ -25,6 +25,7 @@ def _try_make_env(env_name: str, render_both_views: bool = True):
         )
 
     import gymnasium as gym
+
     return gym.make(env_name)
 
 
@@ -51,21 +52,23 @@ class _GymnasiumToGymStepAdapter:
 def _wrap_record_video(env: Any, video_folder: Path) -> Tuple[Any, bool]:
     """Wrap env with RecordVideo (Gymnasium). Returns (wrapped_env, success)."""
     import gymnasium as gym
+
     if hasattr(gym, "wrappers") and hasattr(gym.wrappers, "RecordVideo"):
         return (
-            gym.wrappers.RecordVideo(
-                env, str(video_folder), episode_trigger=lambda ep: True
-            ),
+            gym.wrappers.RecordVideo(env, str(video_folder), episode_trigger=lambda ep: True),
             True,
         )
     return env, False
 
 
-def _write_trial_video(video_folder: Path, trial: int, frames: List[np.ndarray], fps: int = 20) -> None:
+def _write_trial_video(
+    video_folder: Path, trial: int, frames: List[np.ndarray], fps: int = 20
+) -> None:
     """Write frames to video_folder/trial_{trial}.mp4."""
     if not frames:
         return
     import imageio
+
     path = video_folder / f"trial_{trial}.mp4"
     writer = imageio.get_writer(str(path), fps=fps)
     for f in frames:
@@ -73,11 +76,14 @@ def _write_trial_video(video_folder: Path, trial: int, frames: List[np.ndarray],
     writer.close()
 
 
-def _write_frames_video(video_folder: Path, filename: str, frames: List[np.ndarray], fps: int = 20) -> None:
+def _write_frames_video(
+    video_folder: Path, filename: str, frames: List[np.ndarray], fps: int = 20
+) -> None:
     """Write a list of frames to video_folder/{filename}.mp4."""
     if not frames:
         return
     import imageio
+
     path = video_folder / filename
     writer = imageio.get_writer(str(path), fps=fps)
     for f in frames:
@@ -88,6 +94,7 @@ def _write_frames_video(video_folder: Path, filename: str, frames: List[np.ndarr
 def _add_trial_text(frame: np.ndarray, label: str, y_offset: int = 18) -> np.ndarray:
     """Draw label on frame (copy). Requires cv2. y_offset is vertical position from top."""
     import cv2
+
     out = np.asarray(frame).copy()
     h, w = out.shape[:2]
     font = cv2.FONT_HERSHEY_SIMPLEX
@@ -105,11 +112,13 @@ def _preprocess_frames_for_encoder(
 ) -> Any:
     """Convert list of (H, W, 3) uint8 to (1, T, 3, H, W) float, ImageNet normalized. Matches precompute_libero_embeddings."""
     import torch
+
     if not frames:
         return None
     h, w = size
     try:
         import cv2
+
         resized = np.stack(
             [cv2.resize(f, (w, h), interpolation=cv2.INTER_LINEAR) for f in frames],
             axis=0,
@@ -134,6 +143,7 @@ def _encode_rollout_images(
 ) -> Optional[Any]:
     """Build (1, T, D) image embeddings from list of (primary, wrist) frames. Returns None if no encoder or no images."""
     import torch
+
     vision_encoder = getattr(model, "vision_encoder", None)
     if vision_encoder is None or not image_list:
         return None
@@ -176,6 +186,7 @@ def _run_one_rollout(
 ) -> Tuple[float, int, np.ndarray, np.ndarray, Dict[str, np.ndarray], List[np.ndarray]]:
     """Run one episode; return (return, length, states, actions, trajectory_dict, frames)."""
     import torch
+
     obs, _ = env.reset(seed=step + ep)
     if isinstance(obs, tuple):
         obs = obs[0]
@@ -298,6 +309,7 @@ def run_rollouts_and_save_viz(
     env = _try_make_env(env_name, render_both_views=eval_render_both_views)
     if env is None:
         from src.envs.libero_env import LIBERO_SUITES
+
         if env_name in LIBERO_SUITES:
             print(
                 f"Eval rollouts skipped: LIBERO not installed for '{env_name}'. "
@@ -321,9 +333,7 @@ def run_rollouts_and_save_viz(
         if video_ok:
             print(f"Eval rollout videos will be saved to: {video_folder.resolve()}")
         else:
-            print(
-                "Warning: save_eval_video=true but no RecordVideo/Monitor wrapper available."
-            )
+            print("Warning: save_eval_video=true but no RecordVideo/Monitor wrapper available.")
     all_frames_for_wandb: List[np.ndarray] = []
 
     state_mean_t = state_mean
@@ -392,8 +402,17 @@ def run_rollouts_and_save_viz(
                     trajectory_returns=returns_for_prompt or None,
                 )
             ep_return, length, S, A, traj_dict, frames = _run_one_rollout(
-                model, env, state_mean_t, state_std_t, device, scale, max_episode_steps,
-                step, trial, prompt, collect_frames=collect_frames,
+                model,
+                env,
+                state_mean_t,
+                state_std_t,
+                device,
+                scale,
+                max_episode_steps,
+                step,
+                trial,
+                prompt,
+                collect_frames=collect_frames,
             )
             ret = _return_for_traj(traj_dict, ep_return)
             context_list.append((traj_dict, ret))
@@ -422,8 +441,17 @@ def run_rollouts_and_save_viz(
         )
         for ep in range(num_rollouts):
             ep_return, length, S, A, _, frames = _run_one_rollout(
-                model, env, state_mean_t, state_std_t, device, scale, max_episode_steps,
-                step, ep, prompt, collect_frames=collect_frames,
+                model,
+                env,
+                state_mean_t,
+                state_std_t,
+                device,
+                scale,
+                max_episode_steps,
+                step,
+                ep,
+                prompt,
+                collect_frames=collect_frames,
             )
             all_returns.append(ep_return)
             all_lengths.append(length)
@@ -436,8 +464,17 @@ def run_rollouts_and_save_viz(
     else:
         for ep in range(num_rollouts):
             ep_return, length, S, A, _, frames = _run_one_rollout(
-                model, env, state_mean_t, state_std_t, device, scale, max_episode_steps,
-                step, ep, None, collect_frames=collect_frames,
+                model,
+                env,
+                state_mean_t,
+                state_std_t,
+                device,
+                scale,
+                max_episode_steps,
+                step,
+                ep,
+                None,
+                collect_frames=collect_frames,
             )
             all_returns.append(ep_return)
             all_lengths.append(length)
@@ -467,8 +504,10 @@ def run_rollouts_and_save_viz(
     viz_dir = run_dir / "viz" / "samples" / f"step_{step:06d}"
     viz_dir.mkdir(parents=True, exist_ok=True)
     import matplotlib
+
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+
     n_eps = len(all_states_list)
     for i in range(min(n_eps, 20)):
         fig, axes = plt.subplots(2, 1, figsize=(8, 6), sharex=True)
@@ -492,6 +531,7 @@ def run_rollouts_and_save_viz(
         fig.savefig(viz_dir / f"rollout_{i}.png", dpi=100)
         plt.close(fig)
     from matplotlib.ticker import MaxNLocator
+
     _font = {"family": "serif", "serif": ["Palatino", "Palatino Linotype", "DejaVu Serif"]}
     with plt.rc_context({"font.family": "serif", "font.serif": _font["serif"]}):
         fig2, ax = plt.subplots(figsize=(4, 3))

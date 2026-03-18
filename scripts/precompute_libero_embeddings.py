@@ -27,35 +27,7 @@ if _project_root not in sys.path:
     sys.path.insert(0, str(_project_root))
 
 
-def _read_mp4_frames(path: Path):
-    """Read all frames from MP4 as list of (H,W,3) uint8."""
-    try:
-        import cv2
-        cap = cv2.VideoCapture(str(path))
-        frames = []
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            frames.append(frame[:, :, ::-1])
-        cap.release()
-        return frames
-    except Exception:
-        try:
-            import imageio
-            reader = imageio.get_reader(str(path), "ffmpeg")
-            frames = []
-            i = 0
-            while True:
-                try:
-                    frames.append(np.asarray(reader.get_data(i), dtype=np.uint8))
-                    i += 1
-                except (IndexError, RuntimeError):
-                    break
-            reader.close()
-            return frames
-        except Exception:
-            return []
+from src.utils import read_mp4_frames
 
 
 def main():
@@ -124,7 +96,10 @@ def main():
     manifest_path = root / "manifest.parquet"
     episodes_dir = root / "episodes"
     if not manifest_path.is_file() or not episodes_dir.is_dir():
-        print("Requires manifest.parquet and episodes/. Run convert_libero_hdf5_to_dataset.py first.", file=sys.stderr)
+        print(
+            "Requires manifest.parquet and episodes/. Run convert_libero_hdf5_to_dataset.py first.",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     df = pd.read_parquet(manifest_path)
@@ -135,11 +110,13 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     h, w = args.resize[0], args.resize[1]
     model_name = args.model_name or (
-        "facebook/dinov2-base" if args.encoder == "dinov2"
+        "facebook/dinov2-base"
+        if args.encoder == "dinov2"
         else "facebook/dinov3-vits16-pretrain-lvd1689m"
     )
 
     from transformers import AutoModel
+
     backbone = AutoModel.from_pretrained(model_name).to(device)
     backbone.eval()
     hidden_size = backbone.config.hidden_size
@@ -154,6 +131,7 @@ def main():
         T, H, W, C = frames_arr.shape
         if (H, W) != (h, w):
             import cv2
+
             resized = np.stack([cv2.resize(frames_arr[t], (w, h)) for t in range(T)], axis=0)
         else:
             resized = frames_arr
@@ -184,7 +162,10 @@ def main():
             raise ValueError(
                 f"Primary and wrist frame count mismatch: primary={T}, wrist={wrist_frames.shape[0]}"
             )
-        views = [encode_one_view(primary_frames, chunk_size), encode_one_view(wrist_frames, chunk_size)]
+        views = [
+            encode_one_view(primary_frames, chunk_size),
+            encode_one_view(wrist_frames, chunk_size),
+        ]
         return np.concatenate(views, axis=-1)
 
     for ep_id in tqdm(episode_ids, desc="Precomputing embeddings", unit="ep"):
@@ -202,11 +183,11 @@ def main():
         primary_frames = None
         wrist_frames = None
         if primary_path.is_file():
-            frames = _read_mp4_frames(primary_path)
+            frames = read_mp4_frames(primary_path)
             if frames:
                 primary_frames = np.stack(frames, axis=0)
         if wrist_path.is_file():
-            frames = _read_mp4_frames(wrist_path)
+            frames = read_mp4_frames(wrist_path)
             if frames:
                 wrist_frames = np.stack(frames, axis=0)
         if primary_frames is None and wrist_frames is None:

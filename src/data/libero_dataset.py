@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
+from src.utils import read_mp4_frames
 import torch
 import sys
 from loguru import logger as log
@@ -66,44 +67,18 @@ def _load_episode_from_folder(
             vid_path = ep_dir / fname
             if not vid_path.is_file():
                 break
-            frames = _read_mp4_frames(vid_path)
+            frames = read_mp4_frames(vid_path)
             if len(frames) != T:
-                frames = frames[:T] if len(frames) >= T else list(frames) + [np.zeros_like(frames[0])] * (T - len(frames))
+                frames = (
+                    frames[:T]
+                    if len(frames) >= T
+                    else list(frames) + [np.zeros_like(frames[0])] * (T - len(frames))
+                )
             images_per_view.append(np.stack(frames, axis=0))
         if len(images_per_view) == len(image_keys):
             out["images"] = images_per_view
     return out
 
-
-def _read_mp4_frames(path: Path) -> List[np.ndarray]:
-    """Read all frames from an MP4 as list of (H,W,3) uint8."""
-    try:
-        import cv2
-        cap = cv2.VideoCapture(str(path))
-        frames = []
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            frames.append(frame[:, :, ::-1])  # BGR -> RGB
-        cap.release()
-        return frames
-    except Exception:
-        try:
-            import imageio
-            reader = imageio.get_reader(str(path), "ffmpeg")
-            frames = []
-            i = 0
-            while True:
-                try:
-                    frames.append(np.asarray(reader.get_data(i), dtype=np.uint8))
-                    i += 1
-                except (IndexError, RuntimeError):
-                    break
-            reader.close()
-            return frames
-        except Exception:
-            return []
 
 def get_libero_sample_index(data_dir: str):
     """
@@ -116,6 +91,7 @@ def get_libero_sample_index(data_dir: str):
     if not idx_path.is_file():
         return None
     import pandas as pd
+
     return pd.read_parquet(idx_path)
 
 
@@ -126,6 +102,7 @@ def get_libero_task_instructions_from_manifest(data_dir: str) -> Optional[List[s
     if not manifest_path.is_file():
         return None
     import pandas as pd
+
     df = pd.read_parquet(manifest_path)
     if "task_description" not in df.columns:
         return None
@@ -143,6 +120,7 @@ def load_libero_episodes_for_eval(
     if not _has_new_format(root):
         return []
     import pandas as pd
+
     manifest_df = pd.read_parquet(root / "manifest.parquet")
     n_val = max(1, int(len(manifest_df) * last_n_fraction))
     n_val = min(n_val, max_episodes)
@@ -265,6 +243,7 @@ def make_libero_index_loader(
                 return []
             if isinstance(x, (str, bytes)):
                 import json
+
                 return json.loads(x) if isinstance(x, str) else []
             return list(x)
 
@@ -273,7 +252,9 @@ def make_libero_index_loader(
         prompt_lens = _to_list(row.get("prompt_lens"))
 
         segs_ps, segs_pa, segs_pr, segs_prtg, segs_pts, segs_pm = [], [], [], [], [], []
-        for i, (p_ep, p_start, p_len) in enumerate(zip(prompt_episode_ids, prompt_starts, prompt_lens)):
+        for i, (p_ep, p_start, p_len) in enumerate(
+            zip(prompt_episode_ids, prompt_starts, prompt_lens)
+        ):
             p_ep, p_start, p_len = int(p_ep), int(p_start), int(p_len)
             cap = max_prompt_trajectory_length if max_prompt_trajectory_length else p_len
             if cap < p_len:
@@ -462,7 +443,9 @@ def build_libero_in_context_dataset(
     dataset = _Wrapper(
         idx_dataset, task_instructions, total_prompt_len, max_pt, state_dim, action_dim, data_cfg
     )
-    batch_sampler = GroupedBatchSampler(index, data_cfg.batch_size, shuffle=True, seed=data_cfg.seed)
+    batch_sampler = GroupedBatchSampler(
+        index, data_cfg.batch_size, shuffle=True, seed=data_cfg.seed
+    )
     loader = torch.utils.data.DataLoader(
         dataset,
         batch_sampler=batch_sampler,
@@ -485,4 +468,5 @@ def build_libero_in_context_dataset(
 
 
 from src.data.sample_index import register_in_context_builder
+
 register_in_context_builder("libero", build_libero_in_context_dataset)

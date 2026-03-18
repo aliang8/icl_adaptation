@@ -30,18 +30,16 @@ class Logger:
         self._step_count = 0
 
         from torch.utils.tensorboard import SummaryWriter
+
         self._writer = SummaryWriter(log_dir=str(self.log_dir))
 
         self._wandb = None
         if use_wandb:
             import wandb
             from omegaconf import OmegaConf
-            cfg_dict = (
-                OmegaConf.to_container(config, resolve=True) if config is not None else {}
-            )
-            self._wandb = wandb.init(
-                project=project, entity=entity, name=run_name, config=cfg_dict
-            )
+
+            cfg_dict = OmegaConf.to_container(config, resolve=True) if config is not None else {}
+            self._wandb = wandb.init(project=project, entity=entity, name=run_name, config=cfg_dict)
 
     def log_metrics(self, metrics: Dict[str, float], step: int) -> None:
         for k, v in metrics.items():
@@ -70,6 +68,7 @@ class Logger:
             return
         import numpy as np
         import wandb
+
         arr = np.stack(frames)
         if arr.dtype != np.uint8:
             arr = np.clip(arr, 0, 255).astype(np.uint8)
@@ -86,6 +85,7 @@ class Logger:
         if self._wandb is None:
             return
         import wandb
+
         path = Path(path)
         if not path.exists():
             return
@@ -99,12 +99,15 @@ class Logger:
         if self._wandb is None:
             return
         import wandb
+
         if hasattr(image, "savefig"):
             import io
+
             buf = io.BytesIO()
             image.savefig(buf, format="png", dpi=100, bbox_inches="tight")
             buf.seek(0)
             from PIL import Image
+
             img = Image.open(buf)
             self._wandb.log({tag: wandb.Image(img)}, step=step)
         elif isinstance(image, (str, Path)) and Path(image).exists():
@@ -157,7 +160,7 @@ def log_metrics(
     checkpoint_path: Optional[str] = None,
 ) -> None:
     metrics = {
-        "train/loss": train_loss,
+        "train/action_loss": train_loss,
         "train/lr": lr,
     }
     if grad_norm is not None:

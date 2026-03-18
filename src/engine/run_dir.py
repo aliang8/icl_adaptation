@@ -41,11 +41,14 @@ def get_git_short_hash(length: int = 7) -> Optional[str]:
 def get_git_commit() -> Optional[str]:
     """Return full commit hash, or None if git fails."""
     try:
-        return subprocess.check_output(
-            ["git", "rev-parse", "HEAD"],
-            text=True,
-            stderr=subprocess.DEVNULL,
-        ).strip() or None
+        return (
+            subprocess.check_output(
+                ["git", "rev-parse", "HEAD"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+            or None
+        )
     except (subprocess.CalledProcessError, FileNotFoundError):
         return None
 
@@ -53,11 +56,14 @@ def get_git_commit() -> Optional[str]:
 def get_git_diff_patch() -> Optional[str]:
     """Return uncommitted diff patch, or None if git fails."""
     try:
-        return subprocess.check_output(
-            ["git", "diff", "HEAD"],
-            text=True,
-            stderr=subprocess.DEVNULL,
-        ) or None
+        return (
+            subprocess.check_output(
+                ["git", "diff", "HEAD"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+            or None
+        )
     except (subprocess.CalledProcessError, FileNotFoundError):
         return None
 

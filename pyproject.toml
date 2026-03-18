@@ -19,6 +19,7 @@ dependencies = [
     "ipdb",
     "imageio[ffmpeg]>=2.9.0",
     "datasets>=4.5.0",
+    "einops"
 ]
 
 [project.optional-dependencies]
@@ -33,6 +34,18 @@ libero = [
     "easydict>=1.9",
     "h5py>=3.8.0",
     "matplotlib>=3.5.0",
+]
+# Reward relabeling (compute_dense_rewards.py): Robometer-4B / RoboDopamine-8B. Robometer is not on PyPI; install from GitHub without deps: uv pip install "git+https://github.com/robometer/robometer.git" --no-deps (then uv sync --extra reward-relabel).
+reward-relabel = [
+    "pandas",
+    "uvicorn",
+    "fastapi",
+    "codetiming",
+    "sentence_transformers",
+    "accelerate",
+    "peft",
+    "unsloth",
+    "qwen-vl-utils"
 ]
 # DINOv2, SigLIP/PaliGemma, ViT (CrossMAE-style) use transformers. LLaMA 2 needs HuggingFace token for gated models.
 dev = ["pytest", "ruff"]

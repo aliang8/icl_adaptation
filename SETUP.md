@@ -51,10 +51,11 @@ pip install -e .
 
 | Goal | What to install | Command |
 |------|-----------------|--------|
-| **HalfCheetah (Minari)** | Minari + Gymnasium + MuJoCo 2 | `uv sync --extra d4rl` |
+| **HalfCheetah (Minari)** | Minarie2e + Gymnasium + MuJoCo 2 | `uv sync --extra d4rl` |
 | **ICRT-MT dataset + viz** | HuggingFace Hub + HDF5 + matplotlib | `uv sync --extra icrt` |
+| **Reward relabeling** (Robometer-4B / RoboDopamine-8B) | robometer from GitHub, without its full dependency tree | `uv pip install "git+https://github.com/robometer/robometer.git" --no-deps` then `uv sync --extra reward-relabel` |
 
-You can install both if you plan to use HalfCheetah and ICRT-style data.
+You can install both if you plan to use HalfCheetah and ICRT-style data. **Robometer is not on PyPI**; install it from [GitHub](https://github.com/robometer/robometer). Using `--no-deps` avoids pulling in all of its requirements (e.g. vLLM); the project’s existing torch/transformers deps are enough for the reward model code paths.
 
 ---
 

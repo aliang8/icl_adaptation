@@ -88,6 +88,7 @@ def build_in_context_dataset(
     builder = _IN_CONTEXT_BUILDERS.get(source)
     if builder is None and source == "libero":
         import src.data.libero_dataset
+
         builder = _IN_CONTEXT_BUILDERS.get("libero")
     if builder is None:
         return None
@@ -147,7 +148,12 @@ class SampleIndex:
                 spec = length_bin_bins[col]
                 if isinstance(spec, int):
                     try:
-                        ser = pd.qcut(ser.astype(float), q=min(spec, max(2, ser.nunique())), labels=False, duplicates="drop")
+                        ser = pd.qcut(
+                            ser.astype(float),
+                            q=min(spec, max(2, ser.nunique())),
+                            labels=False,
+                            duplicates="drop",
+                        )
                     except Exception:
                         ser = pd.Series(0, index=df.index)
                 else:
@@ -319,5 +325,3 @@ class WeightedIndexSampler(Sampler[int]):
 
     def __len__(self) -> int:
         return self.num_samples
-
-

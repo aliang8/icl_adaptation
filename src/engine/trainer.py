@@ -14,7 +14,11 @@ from tqdm import tqdm
 
 def log_gpu_vram(device: torch.device, prefix: str = "GPU VRAM") -> None:
     """Log current and peak GPU memory to the terminal (for debugging)."""
-    if not torch.cuda.is_available() or not isinstance(device, torch.device) or device.type != "cuda":
+    if (
+        not torch.cuda.is_available()
+        or not isinstance(device, torch.device)
+        or device.type != "cuda"
+    ):
         return
     torch.cuda.synchronize(device)
     alloc = torch.cuda.memory_allocated(device) / 1024**3
@@ -29,6 +33,7 @@ def log_gpu_vram(device: torch.device, prefix: str = "GPU VRAM") -> None:
         reserved,
         max_alloc,
     )
+
 
 from src.engine.checkpointing import save_checkpoint, load_checkpoint, save_inference_artifact
 from src.engine.logging import Logger, log_metrics

@@ -752,13 +752,8 @@ def collate_icl_batch(batch: List[Tuple[Any, ...]]) -> Tuple[Any, ...]:
             and sample[15].dim() in (2, 3)
             for sample in batch
         )
-        if (
-            not is_precomputed
-            and (
-                elem_15 is None
-                or not isinstance(elem_15, torch.Tensor)
-                or elem_15.dim() not in (2, 3)
-            )
+        if not is_precomputed and (
+            elem_15 is None or not isinstance(elem_15, torch.Tensor) or elem_15.dim() not in (2, 3)
         ):
             elem_15 = None
         if elem_15 is None and not is_precomputed:
@@ -777,7 +772,9 @@ def collate_icl_batch(batch: List[Tuple[Any, ...]]) -> Tuple[Any, ...]:
                 devices = set()
                 for t in non_none:
                     if not isinstance(t, torch.Tensor):
-                        raise TypeError(f"Expected torch.Tensor for precomputed embeddings, got {type(t)}")
+                        raise TypeError(
+                            f"Expected torch.Tensor for precomputed embeddings, got {type(t)}"
+                        )
                     if t.dim() == 2:
                         # Support legacy (T, D) by unsqueezing to (1, T, D)
                         raise ValueError(
@@ -802,9 +799,13 @@ def collate_icl_batch(batch: List[Tuple[Any, ...]]) -> Tuple[Any, ...]:
                 if len(d_dims) != 1:
                     raise ValueError(f"Inconsistent embedding D across batch: {sorted(d_dims)}")
                 if len(dtype_set) != 1:
-                    raise ValueError(f"Inconsistent embedding dtype across batch: {sorted([str(x) for x in dtype_set])}")
+                    raise ValueError(
+                        f"Inconsistent embedding dtype across batch: {sorted([str(x) for x in dtype_set])}"
+                    )
                 if len(devices) != 1:
-                    raise ValueError(f"Inconsistent embedding device across batch: {sorted(devices)}")
+                    raise ValueError(
+                        f"Inconsistent embedding device across batch: {sorted(devices)}"
+                    )
 
                 t_len = max(int(t.shape[1]) for t in non_none)
                 d_dim = int(next(iter(d_dims)))
@@ -813,7 +814,9 @@ def collate_icl_batch(batch: List[Tuple[Any, ...]]) -> Tuple[Any, ...]:
                 padded = []
                 for t in tensors:
                     if t is None:
-                        padded.append(torch.zeros(1, t_len, d_dim, device=device, dtype=dtype).squeeze(0))
+                        padded.append(
+                            torch.zeros(1, t_len, d_dim, device=device, dtype=dtype).squeeze(0)
+                        )
                     else:
                         p = t.squeeze(0)
                         if p.dim() != 2:
@@ -830,7 +833,9 @@ def collate_icl_batch(batch: List[Tuple[Any, ...]]) -> Tuple[Any, ...]:
                 out.append(torch.stack(padded, dim=0))
         else:
             images_list = [sample[15] for sample in batch]
-            if not all(im is not None and isinstance(im, list) and len(im) > 0 for im in images_list):
+            if not all(
+                im is not None and isinstance(im, list) and len(im) > 0 for im in images_list
+            ):
                 out.append(None)
             else:
                 num_views = len(images_list[0])
@@ -843,7 +848,16 @@ def collate_icl_batch(batch: List[Tuple[Any, ...]]) -> Tuple[Any, ...]:
                         if t.dim() == 5 and t.shape[1] < t_len:
                             pad_size = t_len - t.shape[1]
                             t = torch.cat(
-                                [t, torch.zeros(t.shape[0], pad_size, *t.shape[2:], device=t.device, dtype=t.dtype)],
+                                [
+                                    t,
+                                    torch.zeros(
+                                        t.shape[0],
+                                        pad_size,
+                                        *t.shape[2:],
+                                        device=t.device,
+                                        dtype=t.dtype,
+                                    ),
+                                ],
                                 dim=1,
                             )
                         padded_v.append(t)

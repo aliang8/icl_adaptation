@@ -222,6 +222,7 @@ def _build_dinov2_encoder(
 ) -> nn.Module:
     """DINOv2/DINOv3: CLS token (default) or all patch tokens + attention pooling. Same API for both."""
     from transformers import AutoModel
+
     chunk_size = kwargs.pop("chunk_size", None)
     backbone = AutoModel.from_pretrained(model_name, **kwargs)
     hidden = backbone.config.hidden_size
@@ -301,6 +302,7 @@ def _build_paligemma_encoder(
 ) -> nn.Module:
     """PaliGemma-style: SigLIP vision tower. Pooled = pooler or mean of patches."""
     from transformers import AutoModel
+
     model = AutoModel.from_pretrained(model_name, **kwargs)
     hidden = model.config.hidden_size
 
@@ -347,6 +349,7 @@ def _build_crossmae_encoder(
 ) -> nn.Module:
     """CrossMAE-style: ViT per-patch, then attention-pool (ICRT-style) or mean-pool."""
     from transformers import AutoModel
+
     vit = AutoModel.from_pretrained(pretrained or "google/vit-base-patch16-224", **kwargs)
     hidden = vit.config.hidden_size
 

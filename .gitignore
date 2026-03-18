@@ -48,3 +48,4 @@ Thumbs.db
 LIBERO/*
 all_datasets/*
 libero_datasets/*
+unsloth_compiled_cache/*

@@ -78,12 +78,15 @@ def main():
         if frame.dtype == np.uint8 and frame.ndim == 1:
             import io
             from PIL import Image
+
             img = Image.open(io.BytesIO(frame.tobytes()))
             return np.array(img.convert("RGB"), dtype=np.uint8)
         return np.asarray(frame, dtype=np.uint8)
 
     input_root = Path(args.input_dir).resolve()
-    output_root = (Path(args.output_dir).resolve() if args.output_dir else input_root) / "LIBERO-Cosmos-Policy"
+    output_root = (
+        Path(args.output_dir).resolve() if args.output_dir else input_root
+    ) / "LIBERO-Cosmos-Policy"
     episodes_dir = output_root / "episodes"
     episodes_dir.mkdir(parents=True, exist_ok=True)
 
@@ -108,93 +111,103 @@ def main():
             succ = bool(f.attrs.get("success", False))
             has_primary = "primary_images_jpeg" in f
             has_wrist = "wrist_images_jpeg" in f
-        meta.append({
-            "episode_id": ep_id,
-            "task_description": task_desc or "",
-            "success": succ,
-            "n_steps": T,
-            "has_primary": has_primary,
-            "has_wrist": has_wrist,
-        })
+        meta.append(
+            {
+                "episode_id": ep_id,
+                "task_description": task_desc or "",
+                "success": succ,
+                "n_steps": T,
+                "has_primary": has_primary,
+                "has_wrist": has_wrist,
+            }
+        )
 
-    # Second pass: write episode folders (MP4 + NPZ) and collect manifest rows
+    # Second pass: write episode folders (MP4 + NPZ) and collect manifest rows; skip if already exist
     manifest_rows = []
     for ep_id, path in enumerate(tqdm(hdf5_files[:200], desc="Converting episodes", unit="file")):
         ep_dir = episodes_dir / f"{ep_id:06d}"
-        ep_dir.mkdir(parents=True, exist_ok=True)
-        with h5py.File(path, "r") as f:
-            proprio = np.asarray(f["proprio"], dtype=np.float32)
-            actions = np.asarray(f["actions"], dtype=np.float32)
-            T = proprio.shape[0]
-            if actions.shape[0] != T:
-                T = min(proprio.shape[0], actions.shape[0])
-                proprio = proprio[:T]
-                actions = actions[:T]
-            if "dones" in f:
-                dones = np.asarray(f["dones"], dtype=np.float32).ravel()[:T]
-            else:
-                dones = np.zeros(T, dtype=np.float32)
-                if T > 0:
-                    dones[-1] = 1.0
-            success = bool(f.attrs.get("success", False))
-            rewards = np.zeros(T, dtype=np.float32)
-            if success and np.any(dones > 0):
-                rewards[np.argmax(dones > 0)] = 1.0
+        lowdim_path = ep_dir / "lowdim.npz"
+        skip = lowdim_path.is_file()
 
-            # NPZ: lowdim only (task/success in manifest)
-            lowdim_path = ep_dir / "lowdim.npz"
-            np.savez_compressed(
-                lowdim_path,
-                proprio=proprio,
-                actions=actions,
-                dones=dones,
-                rewards=rewards,
-            )
+        rel_primary = f"episodes/{ep_id:06d}/primary.mp4"
+        rel_wrist = f"episodes/{ep_id:06d}/wrist.mp4"
+        rel_lowdim = f"episodes/{ep_id:06d}/lowdim.npz"
 
-            primary_path = ep_dir / "primary.mp4"
-            wrist_path = ep_dir / "wrist.mp4"
-            rel_primary = f"episodes/{ep_id:06d}/primary.mp4"
-            rel_wrist = f"episodes/{ep_id:06d}/wrist.mp4"
-            rel_lowdim = f"episodes/{ep_id:06d}/lowdim.npz"
-
-            if "primary_images_jpeg" in f and imageio is not None:
-                frames = []
-                raw = f["primary_images_jpeg"]
-                for t in range(T):
-                    frames.append(_frame_to_rgb(raw[t]))
-                if frames:
-                    writer = imageio.get_writer(str(primary_path), "mp4", fps=args.fps)
-                    for fr in frames:
-                        writer.append_data(fr)
-                    writer.close()
-            else:
-                primary_path = None
+        if skip:
+            # Use existing paths if files exist
+            if not (ep_dir / "primary.mp4").is_file():
                 rel_primary = None
-
-            if "wrist_images_jpeg" in f and imageio is not None:
-                frames = []
-                raw = f["wrist_images_jpeg"]
-                for t in range(T):
-                    frames.append(_frame_to_rgb(raw[t]))
-                if frames:
-                    writer = imageio.get_writer(str(wrist_path), "mp4", fps=args.fps)
-                    for fr in frames:
-                        writer.append_data(fr)
-                    writer.close()
-            else:
-                wrist_path = None
+            if not (ep_dir / "wrist.mp4").is_file():
                 rel_wrist = None
+        else:
+            ep_dir.mkdir(parents=True, exist_ok=True)
+            with h5py.File(path, "r") as f:
+                proprio = np.asarray(f["proprio"], dtype=np.float32)
+                actions = np.asarray(f["actions"], dtype=np.float32)
+                T = proprio.shape[0]
+                if actions.shape[0] != T:
+                    T = min(proprio.shape[0], actions.shape[0])
+                    proprio = proprio[:T]
+                    actions = actions[:T]
+                if "dones" in f:
+                    dones = np.asarray(f["dones"], dtype=np.float32).ravel()[:T]
+                else:
+                    dones = np.zeros(T, dtype=np.float32)
+                    if T > 0:
+                        dones[-1] = 1.0
+                success = bool(f.attrs.get("success", False))
+                rewards = np.zeros(T, dtype=np.float32)
+                if success and np.any(dones > 0):
+                    rewards[np.argmax(dones > 0)] = 1.0
+
+                np.savez_compressed(
+                    lowdim_path,
+                    proprio=proprio,
+                    actions=actions,
+                    dones=dones,
+                    rewards=rewards,
+                )
+
+                primary_path = ep_dir / "primary.mp4"
+                wrist_path = ep_dir / "wrist.mp4"
+                if "primary_images_jpeg" in f and imageio is not None:
+                    frames = []
+                    raw = f["primary_images_jpeg"]
+                    for t in range(T):
+                        frames.append(_frame_to_rgb(raw[t]))
+                    if frames:
+                        writer = imageio.get_writer(str(primary_path), "mp4", fps=args.fps)
+                        for fr in frames:
+                            writer.append_data(fr)
+                        writer.close()
+                else:
+                    rel_primary = None
+
+                if "wrist_images_jpeg" in f and imageio is not None:
+                    frames = []
+                    raw = f["wrist_images_jpeg"]
+                    for t in range(T):
+                        frames.append(_frame_to_rgb(raw[t]))
+                    if frames:
+                        writer = imageio.get_writer(str(wrist_path), "mp4", fps=args.fps)
+                        for fr in frames:
+                            writer.append_data(fr)
+                        writer.close()
+                else:
+                    rel_wrist = None
 
         m = meta[ep_id]
-        manifest_rows.append({
-            "episode_id": ep_id,
-            "task_description": m["task_description"],
-            "success": m["success"],
-            "n_steps": m["n_steps"],
-            "primary_path": rel_primary,
-            "wrist_path": rel_wrist,
-            "lowdim_path": rel_lowdim,
-        })
+        manifest_rows.append(
+            {
+                "episode_id": ep_id,
+                "task_description": m["task_description"],
+                "success": m["success"],
+                "n_steps": m["n_steps"],
+                "primary_path": rel_primary,
+                "wrist_path": rel_wrist,
+                "lowdim_path": rel_lowdim,
+            }
+        )
 
     manifest_df = pd.DataFrame(manifest_rows)
 
@@ -203,9 +216,15 @@ def main():
 
     print(f"Saved manifest to {manifest_path} ({len(manifest_df)} episodes)", flush=True)
     print(f"Episodes under {episodes_dir}", flush=True)
-    print("Next: python scripts/build_libero_sample_index.py --data-dir " + str(output_root.parent), flush=True)
+    print(
+        "Next: python scripts/build_libero_sample_index.py --data-dir " + str(output_root.parent),
+        flush=True,
+    )
     if imageio is None:
-        print("Note: imageio not installed; images not written to MP4. pip install imageio imageio-ffmpeg", flush=True)
+        print(
+            "Note: imageio not installed; images not written to MP4. pip install imageio imageio-ffmpeg",
+            flush=True,
+        )
 
 
 if __name__ == "__main__":

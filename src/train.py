@@ -147,7 +147,11 @@ def _print_dataset_stats(
     return_min = getattr(dataset, "return_min", None)
     return_max = getattr(dataset, "return_max", None)
     return_avg = getattr(dataset, "return_avg", None)
-    for label, val in [("Return (min)", return_min), ("Return (max)", return_max), ("Return (mean)", return_avg)]:
+    for label, val in [
+        ("Return (min)", return_min),
+        ("Return (max)", return_max),
+        ("Return (mean)", return_avg),
+    ]:
         table.add_row(label, f"{val:.2f}" if val is not None else "—")
     table.add_row("State dim", str(dataset.state_dim))
     table.add_row("Action dim", str(dataset.act_dim))
@@ -267,7 +271,9 @@ def build_model(cfg, state_dim: int, action_dim: int, num_instructions: Optional
     )
     if m.use_vision or m.use_language:
         data_cfg = getattr(cfg, "data", None)
-        use_precomputed = getattr(data_cfg, "use_precomputed_embeddings", False) if data_cfg else False
+        use_precomputed = (
+            getattr(data_cfg, "use_precomputed_embeddings", False) if data_cfg else False
+        )
         precomputed_dim = m.precomputed_vision_embed_dim
         model = VLADecisionTransformer(
             **common,
@@ -307,15 +313,30 @@ def build_optimizer_scheduler(model, cfg):
     return optimizer, scheduler
 
 
-def make_train_step_fn(task_instructions, debug_shapes: bool = False, use_precomputed_embeddings: bool = False):
+def make_train_step_fn(
+    task_instructions, debug_shapes: bool = False, use_precomputed_embeddings: bool = False
+):
     """Build a train step that passes instruction_indices and optional image_embeddings to VLA-DT."""
     task_list = list(task_instructions) if task_instructions else []
     _debug_shapes_printed = [False]
     _vision_encoder_logged = [False]
 
     _BATCH_NAMES = [
-        "states", "contexts", "actions", "rewards", "dones", "rtg", "timesteps", "masks",
-        "prompt_s", "prompt_a", "prompt_r", "prompt_rtg", "prompt_ts", "prompt_m", "instructions",
+        "states",
+        "contexts",
+        "actions",
+        "rewards",
+        "dones",
+        "rtg",
+        "timesteps",
+        "masks",
+        "prompt_s",
+        "prompt_a",
+        "prompt_r",
+        "prompt_rtg",
+        "prompt_ts",
+        "prompt_m",
+        "instructions",
     ]
 
     def _print_shapes(model, batch, dt_batch, image_embeddings):
@@ -332,9 +353,19 @@ def make_train_step_fn(task_instructions, debug_shapes: bool = False, use_precom
             if isinstance(x, torch.Tensor):
                 log.info("[debug_shapes]   {}: {} {}", name, x.dtype, tuple(x.shape))
             elif isinstance(x, (list, tuple)) and x and isinstance(x[0], torch.Tensor):
-                log.info("[debug_shapes]   {}: list of {} tensors {}", name, len(x), [tuple(t.shape) for t in x])
+                log.info(
+                    "[debug_shapes]   {}: list of {} tensors {}",
+                    name,
+                    len(x),
+                    [tuple(t.shape) for t in x],
+                )
             else:
-                log.info("[debug_shapes]   {}: type={} len={}", name, type(x).__name__, len(x) if hasattr(x, "__len__") else "?")
+                log.info(
+                    "[debug_shapes]   {}: type={} len={}",
+                    name,
+                    type(x).__name__,
+                    len(x) if hasattr(x, "__len__") else "?",
+                )
         if len(batch) > 15 and batch[15] is not None:
             imgs = batch[15]
             if isinstance(imgs, (list, tuple)):
@@ -349,11 +380,17 @@ def make_train_step_fn(task_instructions, debug_shapes: bool = False, use_precom
         log.info("[debug_shapes]   states: {}", tuple(dt_batch.states.shape))
         log.info("[debug_shapes]   actions: {}", tuple(dt_batch.actions.shape))
         if dt_batch.prompt and dt_batch.prompt[0] is not None:
-            log.info("[debug_shapes]   prompt (s,a,r,rtg,ts,m): {}", [tuple(p.shape) for p in dt_batch.prompt])
+            log.info(
+                "[debug_shapes]   prompt (s,a,r,rtg,ts,m): {}",
+                [tuple(p.shape) for p in dt_batch.prompt],
+            )
         if image_embeddings is not None:
             log.info("[debug_shapes]   image_embeddings: {}", tuple(image_embeddings.shape))
         if dt_batch.instruction_indices is not None:
-            log.info("[debug_shapes]   instruction_indices: {}", tuple(dt_batch.instruction_indices.shape))
+            log.info(
+                "[debug_shapes]   instruction_indices: {}",
+                tuple(dt_batch.instruction_indices.shape),
+            )
         if len(batch) > 16 and batch[16] is not None:
             log.info("[debug_shapes]   --- Sample index (first 2 in batch) ---")
             for b_idx, row in enumerate(batch[16][:2]):
@@ -489,6 +526,7 @@ def main():
     import argparse
 
     import torch.multiprocessing as mp
+
     mp.set_start_method("spawn", force=True)
     parser = argparse.ArgumentParser()
     parser.add_argument("--config-dir", type=str, default="configs", help="Hydra config directory")
@@ -657,6 +695,7 @@ def main():
     if env_name in LIBERO_SUITES:
         import src.data.libero_dataset
         from src.data.sample_index import build_in_context_dataset
+
         in_context_result = build_in_context_dataset(
             "libero",
             str(data_root),

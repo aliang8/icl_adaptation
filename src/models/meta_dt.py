@@ -264,8 +264,18 @@ class MetaDecisionTransformer(nn.Module):
         """Transformer forward; return last_hidden_state reshaped to [B, tokens_per_step, seq, H]."""
         B, seq_len, _ = stacked.shape
         if mask.shape[0] != B or mask.shape[1] != seq_len:
-            mask = mask[:, :seq_len] if mask.shape[1] >= seq_len else torch.cat(
-                [mask, torch.zeros(B, seq_len - mask.shape[1], device=mask.device, dtype=mask.dtype)], dim=1
+            mask = (
+                mask[:, :seq_len]
+                if mask.shape[1] >= seq_len
+                else torch.cat(
+                    [
+                        mask,
+                        torch.zeros(
+                            B, seq_len - mask.shape[1], device=mask.device, dtype=mask.dtype
+                        ),
+                    ],
+                    dim=1,
+                )
             )
         out = self.transformer(inputs_embeds=stacked, attention_mask=mask)
         x = out.last_hidden_state

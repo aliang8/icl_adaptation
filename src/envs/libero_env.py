@@ -174,6 +174,7 @@ def make_libero_env(
             if (h1, w1) != (h2, w2):
                 try:
                     import cv2
+
                     wrist = cv2.resize(wrist, (w1, h1), interpolation=cv2.INTER_LINEAR)
                 except Exception:
                     return primary  # fallback: single view if resize unavailable

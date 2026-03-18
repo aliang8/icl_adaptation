@@ -32,8 +32,7 @@ def get_return_from_reward_model(
     if model_name in ("robometer_4b", "robometer/Robometer-4B"):
         return _robometer_score(task_description, video_path, frames, **kwargs)
     raise NotImplementedError(
-        f"Reward model '{model_name}' not implemented. "
-        "Use eval_reward_source=env for env return."
+        f"Reward model '{model_name}' not implemented. Use eval_reward_source=env for env return."
     )
 
 

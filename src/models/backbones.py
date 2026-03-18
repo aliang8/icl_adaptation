@@ -57,6 +57,7 @@ class Llama2BackboneWrapper(nn.Module):
     ):
         super().__init__()
         from transformers import LlamaModel, LlamaConfig
+
         self.hidden_size = hidden_size
         # Load in float32 so inputs from DINOv2/rest of model (float32) match; avoids float vs half mismatch
         kwargs.setdefault("torch_dtype", torch.float32)

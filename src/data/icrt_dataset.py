@@ -78,6 +78,7 @@ def open_icrt_hdf5(config_path: Union[str, Path]):
     Caller must close the files when done. Paths in config are resolved relative to config file's parent.
     """
     import h5py
+
     path = Path(config_path).resolve()
     config = load_dataset_config(path)
     config = _resolve_config_paths(config, path.parent)
@@ -193,6 +194,7 @@ def load_icrt_trajectories(
     Each trajectory has observations (proprio only, for ICLTrajectoryDataset), actions, rewards, terminals.
     """
     import h5py
+
     path = Path(config_path).resolve()
     config = load_dataset_config(path)
     config = _resolve_config_paths(config, path.parent)

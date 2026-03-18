@@ -80,19 +80,24 @@ def main():
     if "episode_id" not in df.columns or "n_steps" not in df.columns:
         print("Manifest must have episode_id and n_steps.", flush=True)
         sys.exit(1)
-    task_col = df["task_description"] if "task_description" in df.columns else pd.Series([""] * len(df))
+    task_col = (
+        df["task_description"] if "task_description" in df.columns else pd.Series([""] * len(df))
+    )
     success_col = df["success"] if "success" in df.columns else pd.Series([False] * len(df))
 
     meta = []
     for i in range(len(df)):
-        meta.append({
-            "episode_id": int(df["episode_id"].iloc[i]),
-            "task_description": str(task_col.iloc[i]) if pd.notna(task_col.iloc[i]) else "",
-            "success": bool(success_col.iloc[i]) if pd.notna(success_col.iloc[i]) else False,
-            "n_steps": int(df["n_steps"].iloc[i]),
-        })
+        meta.append(
+            {
+                "episode_id": int(df["episode_id"].iloc[i]),
+                "task_description": str(task_col.iloc[i]) if pd.notna(task_col.iloc[i]) else "",
+                "success": bool(success_col.iloc[i]) if pd.notna(success_col.iloc[i]) else False,
+                "n_steps": int(df["n_steps"].iloc[i]),
+            }
+        )
 
     from collections import defaultdict
+
     ep_id_to_meta = {m["episode_id"]: m for m in meta}
     task_to_eps: dict[str, list[tuple[int, bool]]] = defaultdict(list)
     for m in meta:
@@ -118,7 +123,7 @@ def main():
             continue
         candidates = sorted(candidates, key=lambda x: (x[1], x[0]))
         for query_start in range(0, n_steps - horizon + 1):
-            chosen = candidates[: num_context] if len(candidates) >= num_context else candidates
+            chosen = candidates[:num_context] if len(candidates) >= num_context else candidates
             if not chosen:
                 prompt_episode_ids = []
                 prompt_starts = []
@@ -134,17 +139,19 @@ def main():
                     prompt_starts.append(start)
                     prompt_lens.append(min(cap, N - start))
             prompt_len_total = sum(prompt_lens) if prompt_lens else 0
-            sample_rows.append({
-                "query_episode_id": ep_id,
-                "query_start": query_start,
-                "query_len": horizon,
-                "prompt_episode_ids": prompt_episode_ids,
-                "prompt_starts": prompt_starts,
-                "prompt_lens": prompt_lens,
-                "task_id": task_id,
-                "is_success": is_success,
-                "prompt_len": prompt_len_total,
-            })
+            sample_rows.append(
+                {
+                    "query_episode_id": ep_id,
+                    "query_start": query_start,
+                    "query_len": horizon,
+                    "prompt_episode_ids": prompt_episode_ids,
+                    "prompt_starts": prompt_starts,
+                    "prompt_lens": prompt_lens,
+                    "task_id": task_id,
+                    "is_success": is_success,
+                    "prompt_len": prompt_len_total,
+                }
+            )
 
     sample_index_df = pd.DataFrame(sample_rows)
     out_path = root / "sample_index.parquet"

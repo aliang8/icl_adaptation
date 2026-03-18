@@ -127,8 +127,10 @@ def run_action_compare_eval(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     import matplotlib
+
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+
     for demo_idx in range(len(all_pred)):
         pred_arr = all_pred[demo_idx]
         gt_arr = all_gt[demo_idx]
