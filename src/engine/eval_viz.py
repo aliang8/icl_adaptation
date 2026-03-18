@@ -11,13 +11,19 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 
-def _try_make_env(env_name: str):
+def _try_make_env(env_name: str, render_both_views: bool = True):
     """Create env: LIBERO suite (libero_10, ...) via make_libero_env, else Gymnasium/gym. Returns None if env or deps missing."""
     from src.envs.libero_env import LIBERO_SUITES, make_libero_env
 
     if env_name in LIBERO_SUITES:
-        return make_libero_env(suite_name=env_name, task_id=0, state_dim=9, action_dim=7)
-    
+        return make_libero_env(
+            suite_name=env_name,
+            task_id=0,
+            state_dim=9,
+            action_dim=7,
+            render_both_views=render_both_views,
+        )
+
     import gymnasium as gym
     return gym.make(env_name)
 
@@ -92,6 +98,69 @@ def _add_trial_text(frame: np.ndarray, label: str, y_offset: int = 18) -> np.nda
     return out
 
 
+def _preprocess_frames_for_encoder(
+    frames: List[np.ndarray],
+    device: Any,
+    size: Tuple[int, int] = (224, 224),
+) -> Any:
+    """Convert list of (H, W, 3) uint8 to (1, T, 3, H, W) float, ImageNet normalized. Matches precompute_libero_embeddings."""
+    import torch
+    if not frames:
+        return None
+    h, w = size
+    try:
+        import cv2
+        resized = np.stack(
+            [cv2.resize(f, (w, h), interpolation=cv2.INTER_LINEAR) for f in frames],
+            axis=0,
+        )
+    except Exception:
+        resized = np.stack([np.asarray(f) for f in frames], axis=0)
+        if resized.shape[1:3] != (h, w):
+            return None
+    x = torch.from_numpy(resized).float().to(device)
+    x = x.permute(0, 3, 1, 2)
+    x = x / 255.0
+    mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+    x = (x - mean) / std
+    return x.unsqueeze(0)
+
+
+def _encode_rollout_images(
+    image_list: List[Tuple[Any, Any]],
+    model: Any,
+    device: Any,
+) -> Optional[Any]:
+    """Build (1, T, D) image embeddings from list of (primary, wrist) frames. Returns None if no encoder or no images."""
+    import torch
+    vision_encoder = getattr(model, "vision_encoder", None)
+    if vision_encoder is None or not image_list:
+        return None
+    primary_frames = []
+    wrist_frames = []
+    for p, w in image_list:
+        if p is not None:
+            primary_frames.append(p)
+        if w is not None:
+            wrist_frames.append(w)
+    if not primary_frames and not wrist_frames:
+        return None
+    if not primary_frames:
+        primary_frames = wrist_frames
+    if not wrist_frames:
+        wrist_frames = primary_frames
+    v0 = _preprocess_frames_for_encoder(primary_frames, device)
+    v1 = _preprocess_frames_for_encoder(wrist_frames, device)
+    if v0 is None or v1 is None:
+        return None
+    with torch.no_grad():
+        emb = vision_encoder([v0, v1])
+    if emb is not None and emb.dim() == 3:
+        return emb
+    return None
+
+
 def _run_one_rollout(
     model: Any,
     env: Any,
@@ -115,6 +184,12 @@ def _run_one_rollout(
         frame = env.render(mode="rgb_array")
         if frame is not None and isinstance(frame, np.ndarray):
             frames.append(np.asarray(frame))
+    use_vision = getattr(model, "vision_encoder", None) is not None
+    get_images = getattr(env, "get_current_images", None)
+    image_list: List[Tuple[Any, Any]] = []
+    if use_vision and get_images is not None:
+        prim, wrist = get_images()
+        image_list.append((prim, wrist))
     context_dim = model.context_dim
     states = torch.from_numpy(obs).float().reshape(1, -1).to(device)
     contexts = torch.zeros(1, context_dim, device=device)
@@ -127,6 +202,9 @@ def _run_one_rollout(
     ep_rewards: List[float] = []
     ep_return = 0.0
     for t in range(max_episode_steps):
+        image_embeddings = None
+        if use_vision and image_list:
+            image_embeddings = _encode_rollout_images(image_list, model, device)
         action = model.get_action(
             (states - torch.from_numpy(state_mean_t).to(device))
             / torch.from_numpy(state_std_t).to(device),
@@ -138,6 +216,7 @@ def _run_one_rollout(
             prompt=prompt,
             warm_train_steps=0,
             current_step=step,
+            image_embeddings=image_embeddings,
         )
         if action.dim() == 1:
             action = action.unsqueeze(0)
@@ -148,6 +227,9 @@ def _run_one_rollout(
         else:
             next_obs, reward, done, _ = step_out[:4]
             truncated = False
+        if use_vision and get_images is not None:
+            prim, wrist = get_images()
+            image_list.append((prim, wrist))
         if collect_frames and hasattr(env, "render"):
             frame = env.render(mode="rgb_array")
             if frame is not None and isinstance(frame, np.ndarray):
@@ -207,12 +289,13 @@ def run_rollouts_and_save_viz(
     max_prompt_trajectory_length: Optional[int] = None,
     task_description: Optional[str] = None,
     logger: Optional[Any] = None,
+    eval_render_both_views: bool = True,
 ) -> Dict[str, float]:
     """
     Run one eval rollout (N trials). Each trial can be saved as trial_0.mp4, trial_1.mp4, ...
     For wandb: log one continuous video with "Trial 1", "Trial 2", ... overlaid.
     """
-    env = _try_make_env(env_name)
+    env = _try_make_env(env_name, render_both_views=eval_render_both_views)
     if env is None:
         from src.envs.libero_env import LIBERO_SUITES
         if env_name in LIBERO_SUITES:

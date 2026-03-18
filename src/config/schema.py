@@ -25,6 +25,8 @@ class ModelConfig:
     # VLA-DT (vision-language-action): set true in model=vla_dt
     use_vision: bool = False
     use_language: bool = False
+    # If true, fuse language (instruction) into state; default false = no language conditioning.
+    use_language_input: bool = False
     num_views: int = 2
     image_embed_dim: int = 256
     # Transformer backbone: "gpt2" (custom) or "llama2" (HuggingFace pretrained)
@@ -45,8 +47,15 @@ class ModelConfig:
     vision_encoder_chunk_size: Optional[int] = 8
     # When data.use_precomputed_embeddings=true: vision encoder is not loaded at train time; set this to the embedding dim (e.g. 1536 for dinov2 2 views). Required for inference to load the encoder.
     precomputed_vision_embed_dim: Optional[int] = None
+    # ICRT-style: attention over [view0, view1, proprio] (or [view0, proprio] if 1 view) to fuse vision + proprio. Default True.
+    vision_proprio_attention_fusion: bool = True
     # ICRT-style: only compute action loss on the query segment (default True). If False, loss on prompt + query.
     query_loss_only: bool = True
+    # Predict return-to-go and next state; default False = only predict actions.
+    predict_returns: bool = False
+    predict_state: bool = False
+    # Condition on return-to-go in the input (RTG embedding in sequence). If False, input is (state, action) only.
+    condition_rtg: bool = True
 
 
 @dataclass
@@ -159,6 +168,9 @@ class ExperimentConfig:
     eval_reward_model: Optional[str] = None  # e.g. "roboreward_8b" | "robometer_4b"; used when eval_reward_source=reward_model
     save_eval_video: bool = (
         False  # if True, wrap eval env with RecordVideo and save to viz/samples/step_XXX/videos/
+    )
+    eval_render_both_views: bool = (
+        True  # if True, LIBERO eval video shows [primary | wrist] horizontally
     )
     run_action_compare_eval: bool = (
         False  # if True, plot predicted vs GT actions on demos to viz/action_compare/

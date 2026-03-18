@@ -526,7 +526,7 @@ class SubsampledICLTrajectoryDataset(ICLTrajectoryDatasetBase):
         ps = (traj["observations"][p_start : p_start + plen] - state_mean) / state_std
         pa = traj["actions"][p_start : p_start + plen]
         pr = traj["rewards"][p_start : p_start + plen].reshape(-1, 1)
-        pts = np.arange(p_start, p_start + plen)
+        pts = np.arange(p_start, p_start + plen, dtype=np.float32)
         prtg = discount_cumsum(traj["rewards"][p_start:], gamma=1.0)[: plen + 1].reshape(-1, 1)
         if prtg.shape[0] <= plen:
             prtg = np.concatenate([prtg, np.zeros((1, 1))], axis=0)
@@ -636,7 +636,7 @@ class FullTrajectoryICLTrajectoryDataset(ICLTrajectoryDatasetBase):
         state_mean: np.ndarray,
         state_std: np.ndarray,
     ) -> PromptArrays:
-        """Full trajectory arrays; capped to last max_prompt_trajectory_length steps when set."""
+        """Full trajectory arrays; capped to last max_prompt_trajectory_length steps when set. Timesteps independent per trajectory: start..start+T."""
         T = traj["rewards"].shape[0]
         if T == 0:
             raise ValueError("Empty trajectory in _prompt_from_full_trajectory")
@@ -694,6 +694,19 @@ def _pad_to_length(
     return torch.cat([t, pad], dim=dim)
 
 
+def _pad_to_length_left(
+    t: torch.Tensor, target_len: int, dim: int = 0, pad_value: float = 0.0
+) -> torch.Tensor:
+    """Pad tensor along dim to target_len at the beginning. Used for prompt so valid content is right-aligned (contiguous with query) for causal attention."""
+    if t.shape[dim] >= target_len:
+        return t
+    pad_size = target_len - t.shape[dim]
+    pad_shape = list(t.shape)
+    pad_shape[dim] = pad_size
+    pad = torch.full(pad_shape, pad_value, dtype=t.dtype, device=t.device)
+    return torch.cat([pad, t], dim=dim)
+
+
 def collate_icl_batch(batch: List[Tuple[Any, ...]]) -> Tuple[Any, ...]:
     """
     Collate a list of ICL trajectory samples into a batch. Pads tensors with varying
@@ -725,15 +738,28 @@ def collate_icl_batch(batch: List[Tuple[Any, ...]]) -> Tuple[Any, ...]:
             pad_val = 0.0
         elif idx in (8, 9, 10, 11, 12):
             pad_val = 0.0
-        padded = [_pad_to_length(t, max_len, dim=0, pad_value=pad_val) for t in tensors]
+        # Prompt tensors (8–13): left-pad so valid content is right-aligned with query (correct for causal attention)
+        if idx in (8, 9, 10, 11, 12, 13):
+            padded = [_pad_to_length_left(t, max_len, dim=0, pad_value=pad_val) for t in tensors]
+        else:
+            padded = [_pad_to_length(t, max_len, dim=0, pad_value=pad_val) for t in tensors]
         out.append(torch.stack(padded, dim=0))
     if num_elems > 15:
         elem_15 = batch[0][15]
         is_precomputed = any(
-            sample[15] is not None and isinstance(sample[15], torch.Tensor) and sample[15].dim() == 3
+            sample[15] is not None
+            and isinstance(sample[15], torch.Tensor)
+            and sample[15].dim() in (2, 3)
             for sample in batch
         )
-        if not is_precomputed and (elem_15 is None or not isinstance(elem_15, torch.Tensor) or elem_15.dim() != 3):
+        if (
+            not is_precomputed
+            and (
+                elem_15 is None
+                or not isinstance(elem_15, torch.Tensor)
+                or elem_15.dim() not in (2, 3)
+            )
+        ):
             elem_15 = None
         if elem_15 is None and not is_precomputed:
             out.append(None)
@@ -744,8 +770,44 @@ def collate_icl_batch(batch: List[Tuple[Any, ...]]) -> Tuple[Any, ...]:
             if not non_none:
                 out.append(None)
             else:
-                t_len = max(t.shape[1] for t in non_none)
-                d_dim = non_none[0].shape[2]
+                # Validate embedding tensor shapes early to avoid hard-to-debug CUDA asserts.
+                # Expected loader output: (1, T, D) where 1 is a dummy view/batch dim.
+                d_dims = set()
+                dtype_set = set()
+                devices = set()
+                for t in non_none:
+                    if not isinstance(t, torch.Tensor):
+                        raise TypeError(f"Expected torch.Tensor for precomputed embeddings, got {type(t)}")
+                    if t.dim() == 2:
+                        # Support legacy (T, D) by unsqueezing to (1, T, D)
+                        raise ValueError(
+                            "Found precomputed embeddings with shape (T, D) (dim=2). "
+                            "Expected shape (1, T, D). Please regenerate embeddings.npz."
+                        )
+                    if t.dim() != 3:
+                        raise ValueError(
+                            f"Expected precomputed embeddings dim=3 (1, T, D), got dim={t.dim()} with shape={tuple(t.shape)}"
+                        )
+                    if t.shape[0] != 1:
+                        raise ValueError(
+                            f"Expected precomputed embeddings shape[0]==1 (1, T, D), got shape={tuple(t.shape)}"
+                        )
+                    if t.shape[1] <= 0 or t.shape[2] <= 0:
+                        raise ValueError(
+                            f"Expected precomputed embeddings with positive (T, D); got shape={tuple(t.shape)}"
+                        )
+                    d_dims.add(int(t.shape[2]))
+                    dtype_set.add(t.dtype)
+                    devices.add(str(t.device))
+                if len(d_dims) != 1:
+                    raise ValueError(f"Inconsistent embedding D across batch: {sorted(d_dims)}")
+                if len(dtype_set) != 1:
+                    raise ValueError(f"Inconsistent embedding dtype across batch: {sorted([str(x) for x in dtype_set])}")
+                if len(devices) != 1:
+                    raise ValueError(f"Inconsistent embedding device across batch: {sorted(devices)}")
+
+                t_len = max(int(t.shape[1]) for t in non_none)
+                d_dim = int(next(iter(d_dims)))
                 device = non_none[0].device
                 dtype = non_none[0].dtype
                 padded = []
@@ -754,6 +816,14 @@ def collate_icl_batch(batch: List[Tuple[Any, ...]]) -> Tuple[Any, ...]:
                         padded.append(torch.zeros(1, t_len, d_dim, device=device, dtype=dtype).squeeze(0))
                     else:
                         p = t.squeeze(0)
+                        if p.dim() != 2:
+                            raise ValueError(
+                                f"Expected squeezed embeddings to be (T, D) with dim=2, got shape={tuple(p.shape)}"
+                            )
+                        if p.shape[1] != d_dim:
+                            raise ValueError(
+                                f"Embedding D mismatch: expected {d_dim}, got {p.shape[1]} (shape={tuple(p.shape)})"
+                            )
                         if p.shape[0] < t_len:
                             p = _pad_to_length(p, t_len, dim=0, pad_value=0.0)
                         padded.append(p)

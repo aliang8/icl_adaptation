@@ -11,7 +11,7 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional, Tuple
 
 import numpy as np
 
@@ -53,6 +53,7 @@ def make_libero_env(
     camera_widths: int = 128,
     state_dim: int = 9,
     action_dim: int = 7,
+    render_both_views: bool = True,
 ) -> Any:
     """
     Create a gym-like LIBERO env for the given benchmark suite and task.
@@ -62,6 +63,7 @@ def make_libero_env(
         task_id: Task index within the suite (0 to n_tasks-1).
         camera_heights, camera_widths: OffScreenRenderEnv camera size.
         state_dim, action_dim: Observation and action size (9 and 7 for LIBERO-Cosmos).
+        render_both_views: If True (default), render() returns [primary | wrist] horizontally for video.
 
     Returns:
         Env with observation_space (state_dim,), action_space (action_dim,);
@@ -113,10 +115,11 @@ def make_libero_env(
     )
 
     class LIBEROWrapper:
-        def __init__(self, env, state_dim: int, action_dim: int):
+        def __init__(self, env, state_dim: int, action_dim: int, render_both_views: bool = True):
             self._env = env
             self._state_dim = state_dim
             self._action_dim = action_dim
+            self._render_both_views = render_both_views
             self.observation_space = observation_space
             self.action_space = action_space
 
@@ -153,23 +156,53 @@ def make_libero_env(
             self._env.close()
 
         def render(self, mode: str = "rgb_array"):
-            """Return current frame as (H, W, 3) uint8 for video recording. Uses inner env's agentview_image."""
+            """Return current frame as (H, W, 3) uint8. If render_both_views: [primary | wrist] horizontally."""
             if mode != "rgb_array":
                 return None
+            primary, wrist = self.get_current_images()
+            if not self._render_both_views:
+                return primary
+            if primary is None and wrist is None:
+                return None
+            if primary is None:
+                return wrist
+            if wrist is None:
+                return primary
+            # Same height for horizontal stack; resize wrist to primary size if needed
+            h1, w1 = primary.shape[:2]
+            h2, w2 = wrist.shape[:2]
+            if (h1, w1) != (h2, w2):
+                try:
+                    import cv2
+                    wrist = cv2.resize(wrist, (w1, h1), interpolation=cv2.INTER_LINEAR)
+                except Exception:
+                    return primary  # fallback: single view if resize unavailable
+            return np.concatenate([primary, wrist], axis=1)
+
+        def get_current_images(self) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+            """Return (primary, wrist) as (H, W, 3) uint8 for current timestep. Matches dataset order: agentview=primary, robot0_eye_in_hand=wrist."""
             inner = getattr(self._env, "env", self._env)
             get_obs = getattr(inner, "_get_observations", None)
             if get_obs is None:
-                return None
+                return None, None
             obs = get_obs()
-            if not isinstance(obs, dict) or "agentview_image" not in obs:
-                return None
-            img = np.asarray(obs["agentview_image"])
-            if img.dtype == np.float32 or img.dtype == np.float64:
-                img = (np.clip(img, 0.0, 1.0) * 255.0).astype(np.uint8)
-            if img.ndim == 3 and img.shape[0] == 3:
-                img = np.transpose(img, (1, 2, 0))
-            if img.ndim >= 2:
-                img = img[::-1]
-            return np.ascontiguousarray(img)
+            if not isinstance(obs, dict):
+                return None, None
 
-    return LIBEROWrapper(base_env, state_dim, action_dim)
+            def _to_uint8_hwc(img: np.ndarray) -> np.ndarray:
+                img = np.asarray(img)
+                if img.dtype in (np.float32, np.float64):
+                    img = (np.clip(img, 0.0, 1.0) * 255.0).astype(np.uint8)
+                if img.ndim == 3 and img.shape[0] == 3:
+                    img = np.transpose(img, (1, 2, 0))
+                if img.ndim >= 2:
+                    img = img[::-1]
+                return np.ascontiguousarray(img)
+
+            primary = obs.get("agentview_image")
+            wrist = obs.get("robot0_eye_in_hand_image")
+            out_primary = _to_uint8_hwc(primary) if primary is not None else None
+            out_wrist = _to_uint8_hwc(wrist) if wrist is not None else None
+            return out_primary, out_wrist
+
+    return LIBEROWrapper(base_env, state_dim, action_dim, render_both_views=render_both_views)

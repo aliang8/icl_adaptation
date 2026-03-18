@@ -17,6 +17,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+import sys
 from loguru import logger as log
 from tqdm import tqdm
 
@@ -210,7 +211,7 @@ def make_libero_index_loader(
     context_dim: int,
     device: torch.device,
     return_scale: float,
-    total_prompt_len: int,
+    total_prompt_len: Optional[int],
     max_prompt_trajectory_length: Optional[int],
     use_vision: bool = False,
     image_keys: Optional[List[str]] = None,
@@ -301,16 +302,19 @@ def make_libero_index_loader(
             prtg = np.concatenate(segs_prtg, axis=0)
             pts = np.concatenate(segs_pts, axis=0)
             pm = np.concatenate(segs_pm, axis=0)
+            actual_len = ps.shape[0]
+            plen = min(actual_len, total_prompt_len) if total_prompt_len is not None else actual_len
             ps, pa, pr, prtg, pts, pm = _pad_or_trim_prompt(
-                ps, pa, pr, prtg, pts, pm, total_prompt_len, state_dim, act_dim, take_last=True
+                ps, pa, pr, prtg, pts, pm, plen, state_dim, act_dim, take_last=True
             )
         else:
-            ps = np.zeros((total_prompt_len, state_dim), dtype=np.float32)
-            pa = np.ones((total_prompt_len, act_dim), dtype=np.float32) * -10.0
-            pr = np.zeros((total_prompt_len, 1), dtype=np.float32)
-            prtg = np.zeros((total_prompt_len, 1), dtype=np.float32)
-            pts = np.zeros(total_prompt_len, dtype=np.float32)
-            pm = np.zeros(total_prompt_len, dtype=np.float32)
+            plen = total_prompt_len if total_prompt_len is not None else 256
+            ps = np.zeros((plen, state_dim), dtype=np.float32)
+            pa = np.ones((plen, act_dim), dtype=np.float32) * -10.0
+            pr = np.zeros((plen, 1), dtype=np.float32)
+            prtg = np.zeros((plen, 1), dtype=np.float32)
+            pts = np.zeros(plen, dtype=np.float32)
+            pm = np.zeros(plen, dtype=np.float32)
 
         def _t(x: np.ndarray, long_type: bool = False) -> torch.Tensor:
             t = torch.from_numpy(np.asarray(x))
@@ -335,9 +339,24 @@ def make_libero_index_loader(
         )
         if use_precomputed_embeddings:
             emb = _load_episode_embedding_segment(root, q_ep, q_start, q_len)
-            if emb is not None and emb.shape[0] > 0:
-                t = torch.from_numpy(emb).float().to(device).unsqueeze(0)
-                result = result + (t,)
+            # Expected embeddings: (T, D). We wrap as (1, T, D) for collate.
+            if emb is not None:
+                if not isinstance(emb, np.ndarray):
+                    emb = np.asarray(emb)
+                if emb.ndim != 2:
+                    print(
+                        f"[precomputed_embeddings] Bad embeddings.ndim for episode={q_ep} "
+                        f"query_start={q_start} query_len={q_len}: emb.shape={getattr(emb, 'shape', None)}; "
+                        "regenerate embeddings.npz.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    result = result + (None,)
+                elif emb.shape[0] > 0 and emb.shape[1] > 0:
+                    t = torch.from_numpy(emb).float().to(device).unsqueeze(0)  # (1, T, D)
+                    result = result + (t,)
+                else:
+                    result = result + (None,)
             else:
                 result = result + (None,)
         elif use_vision and img_keys and "images" in q_seg:
@@ -402,14 +421,14 @@ def build_libero_in_context_dataset(
         data_cfg.context_dim,
         device,
         data_cfg.return_scale,
-        data_cfg.max_total_prompt_length or 256,
+        data_cfg.max_total_prompt_length,
         data_cfg.max_prompt_trajectory_length,
         use_vision=data_cfg.use_vision and not use_precomputed_embeddings,
         image_keys=data_cfg.image_keys or [],
         use_precomputed_embeddings=use_precomputed_embeddings,
     )
     idx_dataset = IndexBackedDataset(index, loader_fn)
-    total_prompt_len = data_cfg.max_total_prompt_length or 256
+    total_prompt_len = data_cfg.max_total_prompt_length
     max_pt = data_cfg.max_prompt_trajectory_length
 
     class _Wrapper:

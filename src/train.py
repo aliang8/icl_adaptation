@@ -52,7 +52,7 @@ def _print_config(cfg):
 
 
 def _print_model_architecture(model, title="Model architecture"):
-    """Print model summary (param counts and top-level structure) with rich."""
+    """Print model summary (param counts, trainable status, and top-level structure) with rich."""
     from rich.console import Console
     from rich.panel import Panel
     from rich.table import Table
@@ -60,17 +60,30 @@ def _print_model_architecture(model, title="Model architecture"):
     def _count_params(module):
         return sum(p.numel() for p in module.parameters())
 
+    def _trainable_status(module):
+        params = list(module.parameters())
+        if not params:
+            return "—"
+        n_train = sum(1 for p in params if p.requires_grad)
+        if n_train == 0:
+            return "[dim]no[/dim]"
+        if n_train == len(params):
+            return "[green]yes[/green]"
+        return "[yellow]partial[/yellow]"
+
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    # Top-level modules and their param counts
+    # Top-level modules: param counts and trainable status
     table = Table(show_header=True, header_style="bold")
     table.add_column("Module", style="cyan")
     table.add_column("Parameters", justify="right", style="green")
+    table.add_column("Trainable", justify="center", style="blue")
     for name, child in model.named_children():
         n = _count_params(child)
-        table.add_row(name, f"{n:,}")
-    table.add_row("[bold]Total[/bold]", f"[bold]{total:,}[/bold]")
-    table.add_row("Trainable", f"{trainable:,}")
+        status = _trainable_status(child)
+        table.add_row(name, f"{n:,}", status)
+    table.add_row("[bold]Total[/bold]", f"[bold]{total:,}[/bold]", "—")
+    table.add_row("Trainable", f"{trainable:,}", "—")
     console = Console()
     console.print(
         Panel(table, title=f"[bold]{title}[/bold] (MetaDecisionTransformer)", border_style="green")
@@ -248,15 +261,19 @@ def build_model(cfg, state_dim: int, action_dim: int, num_instructions: Optional
         transformer_backbone=m.transformer_backbone,
         llama_model_name=m.llama_model_name,
         query_loss_only=m.query_loss_only,
+        predict_returns=m.predict_returns,
+        predict_state=m.predict_state,
+        condition_rtg=m.condition_rtg,
     )
     if m.use_vision or m.use_language:
         data_cfg = getattr(cfg, "data", None)
         use_precomputed = getattr(data_cfg, "use_precomputed_embeddings", False) if data_cfg else False
-        precomputed_dim = getattr(m, "precomputed_vision_embed_dim", None)
+        precomputed_dim = m.precomputed_vision_embed_dim
         model = VLADecisionTransformer(
             **common,
             use_vision=m.use_vision,
             use_language=m.use_language,
+            use_language_input=m.use_language_input,
             num_instructions=num_instructions or 0,
             num_views=m.num_views,
             image_embed_dim=m.image_embed_dim,
@@ -264,9 +281,10 @@ def build_model(cfg, state_dim: int, action_dim: int, num_instructions: Optional
             vision_encoder_pool=m.vision_encoder_pool,
             vision_encoder_attention_pool=m.vision_encoder_attention_pool,
             freeze_vision_encoder=m.freeze_vision_encoder,
-            vision_encoder_chunk_size=getattr(m, "vision_encoder_chunk_size", None),
+            vision_encoder_chunk_size=m.vision_encoder_chunk_size,
             use_precomputed_embeddings=use_precomputed,
             precomputed_vision_embed_dim=precomputed_dim,
+            vision_proprio_attention_fusion=m.vision_proprio_attention_fusion,
         )
     else:
         model = MetaDecisionTransformer(**common)
@@ -810,6 +828,7 @@ def main():
             max_prompt_trajectory_length=dataset.max_prompt_trajectory_length,
             task_description=task_desc,
             logger=logger,
+            eval_render_both_views=cfg.experiment.eval_render_both_views,
         )
         if (
             cfg.experiment.run_action_compare_eval

@@ -18,7 +18,7 @@ from torch import Tensor
 
 from src.models.meta_dt import MetaDecisionTransformer
 from src.models.types import DTBatch, DTOutput
-from src.models.vision_encoders import build_vision_encoder
+from src.models.vision_encoders import build_vision_encoder, VisionProprioAttentionFusion
 
 
 class LanguageEmbedder(nn.Module):
@@ -63,6 +63,7 @@ class VLADecisionTransformer(MetaDecisionTransformer):
         n_positions: int = 1024,
         use_vision: bool = False,
         use_language: bool = False,
+        use_language_input: bool = False,
         num_instructions: int = 0,
         num_views: int = 2,
         image_embed_dim: int = 256,
@@ -76,6 +77,7 @@ class VLADecisionTransformer(MetaDecisionTransformer):
         vision_encoder_chunk_size: Optional[int] = None,
         use_precomputed_embeddings: bool = False,
         precomputed_vision_embed_dim: Optional[int] = None,
+        vision_proprio_attention_fusion: bool = True,
         **kwargs: Any,
     ):
         super().__init__(
@@ -100,13 +102,25 @@ class VLADecisionTransformer(MetaDecisionTransformer):
 
         self.use_vision = use_vision
         self.use_language = use_language
+        self._use_language_input = use_language_input
         self.vision_fusion = vision_fusion
+        self.vision_proprio_attention_fusion = vision_proprio_attention_fusion
 
         if use_vision:
             if use_precomputed_embeddings and precomputed_vision_embed_dim is not None:
-                # Training with precomputed embeddings: skip loading vision encoder (saves memory). vision_proj maps embeddings to hidden_size. For inference, load a checkpoint that includes the encoder or set use_precomputed_embeddings=False.
                 self.vision_encoder = None
-                self.vision_proj = nn.Linear(precomputed_vision_embed_dim, hidden_size)
+                vision_embed_dim = precomputed_vision_embed_dim
+                if vision_proprio_attention_fusion:
+                    self.vision_proj = None
+                    self.vision_fusion_module = VisionProprioAttentionFusion(
+                        vision_embed_dim=vision_embed_dim,
+                        state_dim=state_dim,
+                        num_views=num_views,
+                        hidden_size=hidden_size,
+                    )
+                else:
+                    self.vision_fusion_module = None
+                    self.vision_proj = nn.Linear(vision_embed_dim, hidden_size)
             else:
                 self.vision_encoder = build_vision_encoder(
                     encoder_type=vision_encoder_type,
@@ -120,13 +134,24 @@ class VLADecisionTransformer(MetaDecisionTransformer):
                 if freeze_vision_encoder:
                     for p in self.vision_encoder.parameters():
                         p.requires_grad = False
-                out_dim = self.vision_encoder.output_dim
-                self.vision_proj = nn.Linear(out_dim, hidden_size)
+                vision_embed_dim = self.vision_encoder.output_dim
+                if vision_proprio_attention_fusion:
+                    self.vision_proj = None
+                    self.vision_fusion_module = VisionProprioAttentionFusion(
+                        vision_embed_dim=vision_embed_dim,
+                        state_dim=state_dim,
+                        num_views=num_views,
+                        hidden_size=hidden_size,
+                    )
+                else:
+                    self.vision_fusion_module = None
+                    self.vision_proj = nn.Linear(vision_embed_dim, hidden_size)
         else:
             self.vision_encoder = None
             self.vision_proj = None
+            self.vision_fusion_module = None
 
-        if use_language:
+        if use_language_input:
             self.language_proj = nn.Linear(hidden_size, hidden_size)
             n_instr = max(1, num_instructions)
             self.instruction_embed = nn.Embedding(n_instr, hidden_size)
@@ -138,11 +163,19 @@ class VLADecisionTransformer(MetaDecisionTransformer):
         """State + context + timestep; then fuse image and language when present."""
         state_emb = super().encode_state(batch)
 
-        if batch.image_embeddings is not None and self.vision_proj is not None:
-            v = self.vision_proj(batch.image_embeddings)
-            state_emb = state_emb + v
+        if batch.image_embeddings is not None:
+            if self.vision_fusion_module is not None:
+                v = self.vision_fusion_module(batch.image_embeddings, batch.states)
+                state_emb = state_emb + v
+            elif self.vision_proj is not None:
+                v = self.vision_proj(batch.image_embeddings)
+                state_emb = state_emb + v
 
-        if batch.instruction_indices is not None and self.instruction_embed is not None:
+        if (
+            self._use_language_input
+            and batch.instruction_indices is not None
+            and self.instruction_embed is not None
+        ):
             lang = self.instruction_embed(batch.instruction_indices)
             if self.language_proj is not None:
                 lang = self.language_proj(lang).unsqueeze(1)

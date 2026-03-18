@@ -5,18 +5,20 @@ act_dim: 8
 context_dim: 16
 hidden_size: 128
 max_length: 32
-max_ep_len: 512
+max_ep_len: 4096  # timestep embedding size; must cover max episode step (query_start + query_len and prompt step indices)
 n_layer: 3
 n_head: 1
 n_inner: null
 activation_function: relu
 resid_pdrop: 0.1
 attn_pdrop: 0.1
-n_positions: 1024
+n_positions: 4096  # must be >= 3*(max_prompt_len + query_len); 1024 too small for uncapped prompts
 action_tanh: true
 # VLA
 use_vision: true
 use_language: true
+# If true, fuse instruction embedding into state; default false = no language conditioning
+use_language_input: false
 num_views: 2
 image_embed_dim: 256
 # Transformer: gpt2 (custom) or llama2 (set llama_model_name e.g. meta-llama/Llama-2-7b-hf)
@@ -27,6 +29,8 @@ vision_encoder_type: patch
 vision_encoder_pool: true
 # ICRT-style attention pooling over patch tokens (set true for crossmae/dinov2 to compress patches to one token per view)
 vision_encoder_attention_pool: false
+# ICRT-style: attention over [view0, view1, proprio] (or [view0, proprio] if 1 view) to fuse vision + proprio. Default on.
+vision_proprio_attention_fusion: true
 # Freeze vision encoder (only train vision_proj + transformer); set true for pretrained dinov2/dinov3
 freeze_vision_encoder: false
 # Process vision encoder in chunks of N images (null = no chunking). Default 8 reduces OOM with dinov2.
@@ -35,3 +39,8 @@ vision_encoder_chunk_size: 8
 precomputed_vision_embed_dim: null
 # ICRT-style: only compute action loss on query segment (default true)
 query_loss_only: true
+# Only predict actions by default; set true to also predict return-to-go or next state
+predict_returns: false
+predict_state: false
+# If true, condition on return-to-go in input (RTG in sequence). If false, input is (state, action) only.
+condition_rtg: true

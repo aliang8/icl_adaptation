@@ -3,6 +3,8 @@
 Precompute vision embeddings for LIBERO episodes and save to episodes/{id:06d}/embeddings.npz.
 
 Requires the converted dataset (manifest.parquet + episodes/ with primary.mp4, wrist.mp4).
+Both views are required; episodes missing either view are skipped and an error is printed.
+Encodes both views in order [primary, wrist]; output shape (T, 2*hidden_size).
 Uses the same encoder as training (e.g. DINOv2) so training can load embeddings with
 data.use_precomputed_embeddings=true and skip the vision encoder.
 
@@ -105,6 +107,11 @@ def main():
         metavar=("H", "W"),
         help="Resize frames to HxW (default: 224 224 for DINOv2)",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Reprocess all episodes even if embeddings.npz already exists",
+    )
     args = parser.parse_args()
 
     import torch
@@ -136,43 +143,48 @@ def main():
     backbone = AutoModel.from_pretrained(model_name).to(device)
     backbone.eval()
     hidden_size = backbone.config.hidden_size
+    # Always output both views: [primary, wrist]. Order must match training (libero primary=0, wrist=1).
     num_views = 2
     output_dim = num_views * hidden_size
 
-    def encode_frames(images_list, chunk_size):
-        """images_list: list of 2 arrays each (T, H, W, 3). Return (T, output_dim)."""
-        views = []
-        for v in range(num_views):
-            if v >= len(images_list):
-                break
-            arr = images_list[v]
-            if arr.size == 0:
-                continue
-            T, H, W, C = arr.shape
-            if (H, W) != (h, w):
-                import cv2
-                resized = np.stack([cv2.resize(arr[t], (w, h)) for t in range(T)], axis=0)
-            else:
-                resized = arr
-            x = torch.from_numpy(resized).float().to(device)
-            x = x.permute(0, 3, 1, 2)
-            x = x / 255.0
-            mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
-            std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
-            x = (x - mean) / std
-            out_list = []
-            for start in range(0, T, chunk_size):
-                end = min(start + chunk_size, T)
-                chunk = x[start:end]
-                with torch.no_grad():
-                    h_out = backbone(pixel_values=chunk).last_hidden_state
-                cls_token = h_out[:, 0]
-                out_list.append(cls_token.cpu().numpy())
-            views.append(np.concatenate(out_list, axis=0))
-        if len(views) == 0:
+    def encode_one_view(frames_arr, chunk_size):
+        """Encode one view (T, H, W, 3) -> (T, hidden_size). Returns zeros if empty."""
+        if frames_arr is None or frames_arr.size == 0:
             return None
-        while len(views) < num_views:
-            views.append(views[-1])
+        T, H, W, C = frames_arr.shape
+        if (H, W) != (h, w):
+            import cv2
+            resized = np.stack([cv2.resize(frames_arr[t], (w, h)) for t in range(T)], axis=0)
+        else:
+            resized = frames_arr
+        x = torch.from_numpy(resized).float().to(device)
+        x = x.permute(0, 3, 1, 2)
+        x = x / 255.0
+        mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+        x = (x - mean) / std
+        out_list = []
+        for start in range(0, T, chunk_size):
+            end = min(start + chunk_size, T)
+            chunk = x[start:end]
+            with torch.no_grad():
+                h_out = backbone(pixel_values=chunk).last_hidden_state
+            cls_token = h_out[:, 0]
+            out_list.append(cls_token.cpu().numpy())
+        return np.concatenate(out_list, axis=0)
+
+    def encode_frames(primary_frames, wrist_frames, chunk_size):
+        """Encode both views in order [primary, wrist]. Both views required."""
+        if primary_frames is None or primary_frames.size == 0:
+            raise ValueError("Primary view (primary.mp4) is missing or empty")
+        if wrist_frames is None or wrist_frames.size == 0:
+            raise ValueError("Wrist view (wrist.mp4) is missing or empty")
+        T = primary_frames.shape[0]
+        if wrist_frames.shape[0] != T:
+            raise ValueError(
+                f"Primary and wrist frame count mismatch: primary={T}, wrist={wrist_frames.shape[0]}"
+            )
+        views = [encode_one_view(primary_frames, chunk_size), encode_one_view(wrist_frames, chunk_size)]
         return np.concatenate(views, axis=-1)
 
     for ep_id in tqdm(episode_ids, desc="Precomputing embeddings", unit="ep"):
@@ -181,28 +193,36 @@ def main():
         wrist_path = ep_dir / "wrist.mp4"
         lowdim_path = ep_dir / "lowdim.npz"
         out_path = ep_dir / "embeddings.npz"
-        if out_path.is_file():
+        if out_path.is_file() and not args.force:
             continue
         T_expected = None
         if lowdim_path.is_file():
             lowdim = np.load(lowdim_path, allow_pickle=False)
             T_expected = lowdim["proprio"].shape[0]
-        images_list = []
+        primary_frames = None
+        wrist_frames = None
         if primary_path.is_file():
             frames = _read_mp4_frames(primary_path)
             if frames:
-                images_list.append(np.stack(frames, axis=0))
+                primary_frames = np.stack(frames, axis=0)
         if wrist_path.is_file():
             frames = _read_mp4_frames(wrist_path)
             if frames:
-                images_list.append(np.stack(frames, axis=0))
-        if not images_list:
+                wrist_frames = np.stack(frames, axis=0)
+        if primary_frames is None and wrist_frames is None:
             continue
-        T = images_list[0].shape[0]
-        if T_expected is not None and T != T_expected:
-            T = min(T, T_expected)
-            images_list = [v[:T] for v in images_list]
-        emb = encode_frames(images_list, args.batch_size)
+        try:
+            T = primary_frames.shape[0] if primary_frames is not None else wrist_frames.shape[0]
+            if T_expected is not None and T != T_expected:
+                T = min(T, T_expected)
+                if primary_frames is not None:
+                    primary_frames = primary_frames[:T]
+                if wrist_frames is not None:
+                    wrist_frames = wrist_frames[:T]
+            emb = encode_frames(primary_frames, wrist_frames, args.batch_size)
+        except ValueError as e:
+            print(f"Episode {ep_id}: {e}", file=sys.stderr)
+            continue
         if emb is not None:
             np.savez_compressed(out_path, embeddings=emb.astype(np.float32))
 

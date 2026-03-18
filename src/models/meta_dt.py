@@ -42,11 +42,18 @@ class MetaDecisionTransformer(nn.Module):
         transformer_backbone: str = "gpt2",
         llama_model_name: Optional[str] = None,
         query_loss_only: bool = True,
+        predict_returns: bool = False,
+        predict_state: bool = False,
+        condition_rtg: bool = True,
         **kwargs,
     ):
         super().__init__()
         self.state_dim = state_dim
         self.query_loss_only = query_loss_only
+        # Keep flags under different names so they aren't overwritten by the layer attributes below
+        self._predict_returns = predict_returns
+        self._predict_state = predict_state
+        self._condition_rtg = condition_rtg
         self.act_dim = act_dim
         self.context_dim = context_dim
         self.max_length = max_length
@@ -66,6 +73,7 @@ class MetaDecisionTransformer(nn.Module):
             **kwargs,
         )
 
+        self.max_ep_len = max_ep_len
         self.embed_timestep = nn.Embedding(max_ep_len, hidden_size)
         self.embed_return = nn.Linear(1, hidden_size)
         self.embed_action = nn.Linear(act_dim, hidden_size)
@@ -83,6 +91,13 @@ class MetaDecisionTransformer(nn.Module):
             (nn.Tanh() if action_tanh else nn.Identity()),
         )
         self.predict_return = nn.Linear(hidden_size, 1)
+        # Freeze return/state heads when disabled so they don't train and table shows "no"
+        if not self._predict_returns:
+            for p in self.predict_return.parameters():
+                p.requires_grad = False
+        if not self._predict_state:
+            for p in self.predict_state.parameters():
+                p.requires_grad = False
         self.use_language = False
         self.vision_encoder = None
 
@@ -94,18 +109,28 @@ class MetaDecisionTransformer(nn.Module):
             mask = torch.ones((B, T), dtype=torch.long, device=batch.states.device)
 
         state_emb = self.encode_state(batch)
-        return_emb = self.embed_return(batch.returns_to_go) + self.embed_timestep(
-            batch.timesteps.long()
-        )
+        return_emb = None
+        if self._condition_rtg:
+            return_emb = self.embed_return(batch.returns_to_go) + self.embed_timestep(
+                batch.timesteps.long()
+            )
         action_emb = self.embed_action(batch.actions) + self.embed_timestep(batch.timesteps.long())
 
-        stacked, stacked_mask = self._stack_with_prompt(
+        stacked, stacked_mask, tokens_per_step = self._stack_with_prompt(
             return_emb, state_emb, action_emb, mask, batch.prompt, T
         )
-        hidden = self._run_backbone(stacked, stacked_mask)
-        pred_returns = self.predict_return(hidden[:, 2])[:, -T:, :]
-        pred_states = self.predict_state(hidden[:, 2])[:, -T:, :]
-        pred_actions_full = self.predict_action(hidden[:, 1])
+        hidden = self._run_backbone(stacked, stacked_mask, tokens_per_step)
+        action_index = tokens_per_step - 1  # 2 when (r,s,a), 1 when (s,a)
+        pred_returns = None
+        pred_states = None
+        if tokens_per_step == 3:
+            pred_returns = (
+                self.predict_return(hidden[:, 2])[:, -T:, :] if self._predict_returns else None
+            )
+            pred_states = (
+                self.predict_state(hidden[:, 2])[:, -T:, :] if self._predict_state else None
+            )
+        pred_actions_full = self.predict_action(hidden[:, action_index])
         pred_actions = pred_actions_full[:, -T:, :]
 
         if self.query_loss_only:
@@ -144,23 +169,35 @@ class MetaDecisionTransformer(nn.Module):
 
     def _stack_with_prompt(
         self,
-        return_emb: Tensor,
+        return_emb: Optional[Tensor],
         state_emb: Tensor,
         action_emb: Tensor,
         mask: Tensor,
         prompt: Optional[Tuple[Tensor, ...]],
         seq_length: int,
-    ) -> Tuple[Tensor, Tensor]:
+    ) -> Tuple[Tensor, Tensor, int]:
         B = state_emb.shape[0]
-        stacked = (
-            torch.stack((return_emb, state_emb, action_emb), dim=1)
-            .permute(0, 2, 1, 3)
-            .reshape(B, 3 * seq_length, self.hidden_size)
-        )
+        if return_emb is not None:
+            tokens_per_step = 3
+            stacked = (
+                torch.stack((return_emb, state_emb, action_emb), dim=1)
+                .permute(0, 2, 1, 3)
+                .reshape(B, 3 * seq_length, self.hidden_size)
+            )
+            stacked_mask = (
+                torch.stack((mask, mask, mask), dim=1).permute(0, 2, 1).reshape(B, 3 * seq_length)
+            )
+        else:
+            tokens_per_step = 2
+            stacked = (
+                torch.stack((state_emb, action_emb), dim=1)
+                .permute(0, 2, 1, 3)
+                .reshape(B, 2 * seq_length, self.hidden_size)
+            )
+            stacked_mask = (
+                torch.stack((mask, mask), dim=1).permute(0, 2, 1).reshape(B, 2 * seq_length)
+            )
         stacked = self.embed_ln(stacked)
-        stacked_mask = (
-            torch.stack((mask, mask, mask), dim=1).permute(0, 2, 1).reshape(B, 3 * seq_length)
-        )
 
         if prompt is not None:
             (
@@ -171,31 +208,48 @@ class MetaDecisionTransformer(nn.Module):
                 prompt_timesteps,
                 prompt_attention_mask,
             ) = prompt
+            # If RTG has one extra element (e.g. data quirk), drop last step from all prompt tensors so lengths align
+            if prompt_returns_to_go.shape[1] % 10 == 1 and prompt_returns_to_go.shape[1] > 1:
+                prompt_states = prompt_states[:, :-1]
+                prompt_actions = prompt_actions[:, :-1]
+                prompt_returns_to_go = prompt_returns_to_go[:, :-1]
+                prompt_timesteps = prompt_timesteps[:, :-1]
+                prompt_attention_mask = prompt_attention_mask[:, :-1]
             prompt_ts = prompt_timesteps.long()
             prompt_T = prompt_states.shape[1]
-            if prompt_returns_to_go.shape[1] % 10 == 1:
-                prtg = self.prompt_embed_return(prompt_returns_to_go[:, :-1])
-            else:
-                prtg = self.prompt_embed_return(prompt_returns_to_go)
             ps_emb = self.prompt_embed_state(prompt_states) + self.prompt_embed_timestep(prompt_ts)
             pa_emb = self.prompt_embed_action(prompt_actions) + self.prompt_embed_timestep(
                 prompt_ts
             )
-            prtg_emb = prtg + self.prompt_embed_timestep(prompt_ts)
-            prompt_stacked = (
-                torch.stack((prtg_emb, ps_emb, pa_emb), dim=1)
-                .permute(0, 2, 1, 3)
-                .reshape(prompt_states.shape[0], 3 * prompt_T, self.hidden_size)
-            )
-            prompt_stacked_mask = (
-                torch.stack(
-                    (prompt_attention_mask, prompt_attention_mask, prompt_attention_mask),
-                    dim=1,
+            if return_emb is not None:
+                prtg = self.prompt_embed_return(prompt_returns_to_go)
+                prtg_emb = prtg + self.prompt_embed_timestep(prompt_ts)
+                prompt_stacked = (
+                    torch.stack((prtg_emb, ps_emb, pa_emb), dim=1)
+                    .permute(0, 2, 1, 3)
+                    .reshape(prompt_states.shape[0], 3 * prompt_T, self.hidden_size)
                 )
-                .permute(0, 2, 1)
-                .reshape(prompt_states.shape[0], 3 * prompt_T)
-            )
-            if prompt_stacked.shape[1] == 3 * seq_length:
+                prompt_stacked_mask = (
+                    torch.stack(
+                        (prompt_attention_mask, prompt_attention_mask, prompt_attention_mask),
+                        dim=1,
+                    )
+                    .permute(0, 2, 1)
+                    .reshape(prompt_states.shape[0], 3 * prompt_T)
+                )
+            else:
+                prompt_stacked = (
+                    torch.stack((ps_emb, pa_emb), dim=1)
+                    .permute(0, 2, 1, 3)
+                    .reshape(prompt_states.shape[0], 2 * prompt_T, self.hidden_size)
+                )
+                prompt_stacked_mask = (
+                    torch.stack((prompt_attention_mask, prompt_attention_mask), dim=1)
+                    .permute(0, 2, 1)
+                    .reshape(prompt_states.shape[0], 2 * prompt_T)
+                )
+            query_len = tokens_per_step * seq_length
+            if prompt_stacked.shape[1] == query_len:
                 prompt_stacked = prompt_stacked.reshape(1, -1, self.hidden_size)
                 prompt_stacked_mask = prompt_stacked_mask.reshape(1, -1)
                 stacked = torch.cat((prompt_stacked.repeat(B, 1, 1), stacked), dim=1)
@@ -204,15 +258,22 @@ class MetaDecisionTransformer(nn.Module):
                 stacked = torch.cat((prompt_stacked, stacked), dim=1)
                 stacked_mask = torch.cat((prompt_stacked_mask, stacked_mask), dim=1)
 
-        return stacked, stacked_mask
+        return stacked, stacked_mask, tokens_per_step
 
-    def _run_backbone(self, stacked: Tensor, mask: Tensor) -> Tensor:
-        """Transformer forward; return last_hidden_state reshaped to [B, 3, seq, H]."""
+    def _run_backbone(self, stacked: Tensor, mask: Tensor, tokens_per_step: int = 3) -> Tensor:
+        """Transformer forward; return last_hidden_state reshaped to [B, tokens_per_step, seq, H]."""
+        B, seq_len, _ = stacked.shape
+        if mask.shape[0] != B or mask.shape[1] != seq_len:
+            mask = mask[:, :seq_len] if mask.shape[1] >= seq_len else torch.cat(
+                [mask, torch.zeros(B, seq_len - mask.shape[1], device=mask.device, dtype=mask.dtype)], dim=1
+            )
         out = self.transformer(inputs_embeds=stacked, attention_mask=mask)
         x = out.last_hidden_state
         B = stacked.shape[0]
         seq_total = x.shape[1]
-        x = x.reshape(B, seq_total // 3, 3, self.hidden_size).permute(0, 2, 1, 3)
+        x = x.reshape(B, seq_total // tokens_per_step, tokens_per_step, self.hidden_size).permute(
+            0, 2, 1, 3
+        )
         return x
 
     def compute_loss(self, pred_actions: Tensor, actions: Tensor, mask: Tensor) -> Optional[Tensor]:
@@ -288,6 +349,24 @@ class MetaDecisionTransformer(nn.Module):
             ]
         ).reshape(1, -1)
 
+        image_embeddings = kwargs.get("image_embeddings")
+        instruction_indices = kwargs.get("instruction_indices")
+        if image_embeddings is not None:
+            image_embeddings = image_embeddings.to(device)
+            L_img = image_embeddings.shape[1]
+            D_img = image_embeddings.shape[2]
+            if L_img >= self.max_length:
+                image_embeddings = image_embeddings[:, -self.max_length :, :]
+            else:
+                pad_img = self.max_length - L_img
+                image_embeddings = torch.cat(
+                    [
+                        torch.zeros(1, pad_img, D_img, device=device, dtype=image_embeddings.dtype),
+                        image_embeddings,
+                    ],
+                    dim=1,
+                )
+
         use_prompt = prompt is not None and current_step > warm_train_steps
         batch = DTBatch(
             states=states,
@@ -297,6 +376,8 @@ class MetaDecisionTransformer(nn.Module):
             timesteps=timesteps,
             attention_mask=attention_mask,
             prompt=prompt if use_prompt else None,
+            image_embeddings=image_embeddings,
+            instruction_indices=instruction_indices,
         )
         out = self.forward(batch)
         return out.pred_actions[0, -1]

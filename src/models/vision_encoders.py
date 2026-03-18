@@ -79,6 +79,60 @@ class AttentionPooling(nn.Module):
         return out
 
 
+class VisionProprioAttentionFusion(nn.Module):
+    """
+    ICRT-style: treat view embeddings + proprio as tokens, attention-pool to one vector.
+    If num_views=2: tokens = [view0, view1, proprio]. If num_views=1: tokens = [view0, proprio].
+    Uses learned query to attend over tokens; output projected to hidden_size.
+    """
+
+    def __init__(
+        self,
+        vision_embed_dim: int,
+        state_dim: int,
+        num_views: int,
+        hidden_size: int,
+    ):
+        super().__init__()
+        self.num_views = num_views
+        if vision_embed_dim % num_views != 0:
+            raise ValueError(
+                f"vision_embed_dim ({vision_embed_dim}) must be divisible by num_views ({num_views})."
+            )
+        self.d_per_view = vision_embed_dim // num_views
+        self.state_proj = nn.Linear(state_dim, self.d_per_view)
+        self.pool = AttentionPooling(
+            patch_dim=self.d_per_view,
+            output_dim=self.d_per_view,
+            query_dim=None,
+        )
+        self.out_proj = nn.Linear(self.d_per_view, hidden_size)
+
+    def forward(
+        self,
+        vision_emb: torch.Tensor,
+        state: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        vision_emb: (B, T, vision_embed_dim) = [view0, view1, ...] concatenated.
+        state: (B, T, state_dim) = proprio.
+        Returns: (B, T, hidden_size).
+        """
+        B, T, D = vision_emb.shape
+        num_views = self.num_views
+        d = self.d_per_view
+        if D != num_views * d:
+            raise ValueError(
+                f"VisionProprioAttentionFusion expected vision_emb last dim "
+                f"{num_views * d} (num_views={num_views}, d_per_view={d}), got D={D}."
+            )
+        views = vision_emb.reshape(B, T, num_views, d)
+        proprio = self.state_proj(state).unsqueeze(2)
+        tokens = torch.cat([views, proprio], dim=2)
+        pooled = self.pool(tokens)
+        return self.out_proj(pooled)
+
+
 def _ensure_bt(images: List[torch.Tensor]) -> Tuple[int, int]:
     """Infer B, T from list of tensors (each (B,T,C,H,W) or (B,C,H,W))."""
     im = images[0]

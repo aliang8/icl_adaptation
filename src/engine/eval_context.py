@@ -23,7 +23,7 @@ def _prompt_segment_from_traj(
     state_dim: int,
     act_dim: int,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """One trajectory as prompt segment (last max_prompt_trajectory_length steps)."""
+    """One trajectory as prompt segment (last max_prompt_trajectory_length steps). Timesteps independent per trajectory: start..start+T."""
     T = traj["rewards"].shape[0]
     if T == 0:
         raise ValueError("Empty trajectory")
