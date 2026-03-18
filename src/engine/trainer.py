@@ -11,6 +11,25 @@ from torch.utils.data import DataLoader
 from loguru import logger as loguru_logger
 from tqdm import tqdm
 
+
+def log_gpu_vram(device: torch.device, prefix: str = "GPU VRAM") -> None:
+    """Log current and peak GPU memory to the terminal (for debugging)."""
+    if not torch.cuda.is_available() or not isinstance(device, torch.device) or device.type != "cuda":
+        return
+    torch.cuda.synchronize(device)
+    alloc = torch.cuda.memory_allocated(device) / 1024**3
+    reserved = torch.cuda.memory_reserved(device) / 1024**3
+    max_alloc = torch.cuda.max_memory_allocated(device) / 1024**3
+    dev_id = device.index if device.index is not None else 0
+    loguru_logger.info(
+        "{} | cuda:{} allocated={:.2f} GiB reserved={:.2f} GiB peak_allocated={:.2f} GiB",
+        prefix,
+        dev_id,
+        alloc,
+        reserved,
+        max_alloc,
+    )
+
 from src.engine.checkpointing import save_checkpoint, load_checkpoint, save_inference_artifact
 from src.engine.logging import Logger, log_metrics
 
@@ -119,6 +138,7 @@ class Trainer:
             eval_every,
             save_latest_every,
         )
+        log_gpu_vram(self.device, "GPU VRAM (after init)")
 
         pbar = tqdm(
             total=max_steps,
@@ -129,6 +149,7 @@ class Trainer:
             desc="Train",
         )
 
+        first_step_done = False
         while global_step <= max_steps:
             try:
                 batch = next(iter_loader)
@@ -136,8 +157,17 @@ class Trainer:
                 epoch += 1
                 iter_loader = iter(train_loader)
                 batch = next(iter_loader)
+                loguru_logger.info(
+                    "Dataset pass finished; starting epoch {} (step {} / {}).",
+                    epoch,
+                    global_step,
+                    max_steps,
+                )
             batch = tuple(x.to(self.device) if isinstance(x, torch.Tensor) else x for x in batch)
             loss_val, grad_norm_val, batch_metrics = self.train_step(batch, step_fn)
+            if not first_step_done:
+                log_gpu_vram(self.device, "GPU VRAM (after first train step)")
+                first_step_done = True
             lr = self.optimizer.param_groups[0]["lr"]
             gpu_mem = (
                 torch.cuda.max_memory_allocated(self.device) / 1e6
@@ -162,6 +192,7 @@ class Trainer:
             if eval_fn and eval_every > 0 and global_step % eval_every == 0 and global_step > 0:
                 pbar.write(f"Evaluating at step {global_step}...")
                 eval_metrics = eval_fn(global_step)
+                log_gpu_vram(self.device, f"GPU VRAM (step {global_step}, after eval)")
                 log_metrics(self.logger, global_step, loss_val, lr, eval_metrics=eval_metrics)
                 current = eval_metrics.get(self.best_metric_name)
                 if current is not None:

@@ -76,7 +76,7 @@ class DataConfig:
     context_sort_ascending: bool = True
     context_sampling: str = "random"
     max_total_prompt_length: Optional[int] = None
-    # full_trajectory only: max steps per context trajectory (each demo capped to this; then concatenated and capped by max_total_prompt_length)
+    # full_trajectory: None = use full trajectory per demo; int = cap each context demo to last N steps
     max_prompt_trajectory_length: Optional[int] = None
     # "subsampled" = prompt_length steps per context traj; "full_trajectory" = full traj per demo (capped per traj, then total)
     context_style: str = "subsampled"
@@ -148,7 +148,7 @@ class ExperimentConfig:
     """Training loop: steps, eval, checkpoint policy."""
 
     max_steps: int = 500_000
-    eval_every_steps: int = 1000
+    eval_every_steps: int = 5000
     num_eval_episodes: int = 5
     num_eval_rollouts: int = 5  # number of env rollouts per eval (for real eval)
     # Eval context: "prompt" = use fixed prompt trajectories (like training); "zero_shot_adaptation" = N trials, context = last K trials sorted by return (env or reward model).

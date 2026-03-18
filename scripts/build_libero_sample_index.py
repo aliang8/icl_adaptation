@@ -51,8 +51,9 @@ def main():
     parser.add_argument(
         "--max-prompt-steps",
         type=int,
-        default=85,
-        help="Max steps per prompt trajectory, last N steps (default: 85)",
+        default=None,
+        metavar="N",
+        help="Max steps per prompt trajectory (last N steps). Default: use all steps in the trajectory.",
     )
     parser.add_argument(
         "--success-mix",
@@ -101,7 +102,7 @@ def main():
 
     horizon = max(1, args.horizon)
     num_context = max(0, args.num_context)
-    max_prompt_steps = max(1, args.max_prompt_steps) if args.max_prompt_steps else 9999
+    max_prompt_steps = args.max_prompt_steps  # None = use all steps in each prompt trajectory
 
     sample_rows = []
     for m in meta:
@@ -128,7 +129,7 @@ def main():
                 prompt_lens = []
                 for eid in prompt_episode_ids:
                     N = ep_id_to_meta[eid]["n_steps"]
-                    cap = min(N, max_prompt_steps)
+                    cap = N if max_prompt_steps is None else min(N, max_prompt_steps)
                     start = max(0, N - cap)
                     prompt_starts.append(start)
                     prompt_lens.append(min(cap, N - start))

@@ -779,6 +779,8 @@ def collate_icl_batch(batch: List[Tuple[Any, ...]]) -> Tuple[Any, ...]:
                         padded_v.append(t)
                     view_batches.append(torch.cat(padded_v, dim=0))
                 out.append(view_batches if view_batches else None)
+    if num_elems > 16:
+        out.append([sample[16] for sample in batch])
     return tuple(out)
 
 

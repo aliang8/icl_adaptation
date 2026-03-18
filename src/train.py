@@ -302,6 +302,11 @@ def make_train_step_fn(task_instructions, debug_shapes: bool = False, use_precom
 
     def _print_shapes(model, batch, dt_batch, image_embeddings):
         log.info("[debug_shapes] === Batch / model input shapes (first step) ===")
+        log.info(
+            "[debug_shapes] Batch layout: [0-7] query segment (states,contexts,actions,rewards,dones,rtg,timesteps,masks); "
+            "[8-13] in-context prompt (prompt_s,a,r,rtg,ts,m); [14] instructions; [15] images or precomputed embeddings; "
+            "[16] sample index rows (index-backed dataset only: query_episode_id, query_start, prompt_episode_ids, etc.)."
+        )
         for i, name in enumerate(_BATCH_NAMES):
             if i >= len(batch):
                 break
@@ -331,6 +336,22 @@ def make_train_step_fn(task_instructions, debug_shapes: bool = False, use_precom
             log.info("[debug_shapes]   image_embeddings: {}", tuple(image_embeddings.shape))
         if dt_batch.instruction_indices is not None:
             log.info("[debug_shapes]   instruction_indices: {}", tuple(dt_batch.instruction_indices.shape))
+        if len(batch) > 16 and batch[16] is not None:
+            log.info("[debug_shapes]   --- Sample index (first 2 in batch) ---")
+            for b_idx, row in enumerate(batch[16][:2]):
+                if isinstance(row, dict):
+                    log.info(
+                        "[debug_shapes]   [{}] query_ep={} query_start={} query_len={} task_id={} "
+                        "prompt_eps={} prompt_starts={} prompt_lens={}",
+                        b_idx,
+                        row.get("query_episode_id"),
+                        row.get("query_start"),
+                        row.get("query_len"),
+                        row.get("task_id"),
+                        row.get("prompt_episode_ids", []),
+                        row.get("prompt_starts", []),
+                        row.get("prompt_lens", []),
+                    )
         log.info("[debug_shapes] === end ===")
 
     def train_step_fn(model, batch):

@@ -6,7 +6,7 @@ Supports TensorBoard and W&B; save resolved config and run metadata.
 import os
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union
 
 import torch
 
@@ -65,16 +65,52 @@ class Logger:
         fps: int = 20,
         format: str = "mp4",
     ) -> None:
-        """Log a list of numpy frames (H,W,3) uint8 as a single video to W&B."""
+        """Log a list of numpy frames (H,W,3) uint8 as a single video to W&B. Uses (T,C,H,W) for wandb."""
         if self._wandb is None or not frames:
             return
         import numpy as np
         import wandb
         arr = np.stack(frames)
+        if arr.dtype != np.uint8:
+            arr = np.clip(arr, 0, 255).astype(np.uint8)
+        # W&B expects (T, C, H, W); we have (T, H, W, C)
+        if arr.ndim == 4 and arr.shape[-1] == 3:
+            arr = np.moveaxis(arr, -1, 1)
         self._wandb.log(
             {tag: wandb.Video(arr, fps=fps, format=format)},
             step=step,
         )
+
+    def log_video_from_path(self, tag: str, path: Union[str, Path], step: int) -> None:
+        """Log a video from a file path (e.g. mp4). W&B uses the file's frame rate; passing fps is ignored and triggers a warning."""
+        if self._wandb is None:
+            return
+        import wandb
+        path = Path(path)
+        if not path.exists():
+            return
+        self._wandb.log(
+            {tag: wandb.Video(str(path), format="mp4")},
+            step=step,
+        )
+
+    def log_image(self, tag: str, image: Any, step: int) -> None:
+        """Log an image to W&B (PIL/ndarray or path). For matplotlib, pass fig or save to buffer."""
+        if self._wandb is None:
+            return
+        import wandb
+        if hasattr(image, "savefig"):
+            import io
+            buf = io.BytesIO()
+            image.savefig(buf, format="png", dpi=100, bbox_inches="tight")
+            buf.seek(0)
+            from PIL import Image
+            img = Image.open(buf)
+            self._wandb.log({tag: wandb.Image(img)}, step=step)
+        elif isinstance(image, (str, Path)) and Path(image).exists():
+            self._wandb.log({tag: wandb.Image(str(image))}, step=step)
+        else:
+            self._wandb.log({tag: wandb.Image(image)}, step=step)
 
     def flush(self) -> None:
         if self._writer is not None:

@@ -281,7 +281,7 @@ def run_rollouts_and_save_viz(
     act_dim = getattr(model, "act_dim", env.action_space.shape[0])
     K = eval_context_k
     total_len = total_prompt_len or 512
-    max_traj_len = max_prompt_trajectory_length or 64
+    max_traj_len = max_prompt_trajectory_length  # None = use full trajectory per demo
 
     if eval_context_mode == "zero_shot_adaptation":
         n_trials = eval_num_trials
@@ -294,7 +294,7 @@ def run_rollouts_and_save_viz(
                 trajs_for_prompt = trajs_for_prompt[-K:]
                 returns_for_prompt = returns_for_prompt[-K:]
             prompt = None
-            if trajs_for_prompt and total_len and max_traj_len:
+            if trajs_for_prompt and total_len:
                 prompt = build_prompt_tuple(
                     trajs_for_prompt,
                     state_mean_t,
@@ -366,11 +366,19 @@ def run_rollouts_and_save_viz(
                     all_frames_for_wandb.append(_add_trial_text(f, f"Trial {ep + 1}  t={t}"))
 
     env.close()
-    # Save combined video (all trials with labels) to disk so it works with or without wandb
+    # Save combined video (all trials with labels) and each trial separately; then log to wandb
     if collect_frames and all_frames_for_wandb:
+        all_trials_path = video_folder / "all_trials.mp4"
         _write_frames_video(video_folder, "all_trials.mp4", all_frames_for_wandb, fps=20)
-    if logger and all_frames_for_wandb:
-        logger.log_video("eval/rollout_video", all_frames_for_wandb, step=step, fps=20)
+        if logger is not None and getattr(logger, "_wandb", None) is not None:
+            # Log main video from array so W&B respects fps (path-based logging ignores fps and warns)
+            logger.log_video("eval/rollout_video", all_frames_for_wandb, step=step, fps=20)
+            for i in range(len(all_returns)):
+                trial_path = video_folder / f"trial_{i}.mp4"
+                if trial_path.exists():
+                    logger.log_video_from_path(
+                        f"eval/rollout_video_trial_{i}", trial_path, step=step
+                    )
 
     # Save visualizations
     viz_dir = run_dir / "viz" / "samples" / f"step_{step:06d}"
@@ -400,20 +408,47 @@ def run_rollouts_and_save_viz(
         fig.tight_layout()
         fig.savefig(viz_dir / f"rollout_{i}.png", dpi=100)
         plt.close(fig)
-    fig2, ax = plt.subplots(figsize=(4, 3))
-    ax.bar(range(len(all_returns)), all_returns, color="steelblue")
-    ax.axhline(
-        np.mean(all_returns),
-        color="red",
-        linestyle="--",
-        label=f"mean={np.mean(all_returns):.1f}",
-    )
-    ax.set_xlabel("rollout")
-    ax.set_ylabel("return")
-    ax.legend()
-    ax.set_title(f"Eval step {step}")
-    fig2.savefig(viz_dir / "returns.png", dpi=100)
-    plt.close(fig2)
+    from matplotlib.ticker import MaxNLocator
+    _font = {"family": "serif", "serif": ["Palatino", "Palatino Linotype", "DejaVu Serif"]}
+    with plt.rc_context({"font.family": "serif", "font.serif": _font["serif"]}):
+        fig2, ax = plt.subplots(figsize=(4, 3))
+        ax.bar(range(len(all_returns)), all_returns, color="steelblue")
+        ax.axhline(
+            np.mean(all_returns),
+            color="red",
+            linestyle="--",
+            label=f"mean={np.mean(all_returns):.1f}",
+        )
+        ax.set_xlabel("rollout")
+        ax.set_ylabel("return")
+        ax.set_ylim(0, 1)
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+        ax.legend()
+        ax.set_title(f"Eval step {step}")
+        fig2.savefig(viz_dir / "returns.png", dpi=100)
+        plt.close(fig2)
+
+    # Cumulative return over trials with trial boundaries
+    if len(all_returns) > 0:
+        cum_returns = np.cumsum(all_returns)
+        with plt.rc_context({"font.family": "serif", "font.serif": _font["serif"]}):
+            fig3, ax3 = plt.subplots(figsize=(6, 3.5))
+            x = np.arange(len(all_returns), dtype=int)
+            ax3.plot(x, cum_returns, color="steelblue", linewidth=2, marker="o", markersize=4)
+            for i in range(1, len(all_returns)):
+                ax3.axvline(x=i - 0.5, color="gray", linestyle="--", linewidth=0.8, alpha=0.7)
+            ax3.set_xlabel("trial")
+            ax3.set_ylabel("cumulative return")
+            ax3.set_ylim(0, 1)
+            ax3.xaxis.set_major_locator(MaxNLocator(integer=True))
+            ax3.set_title(f"Eval step {step}: cumulative return")
+            ax3.grid(True, alpha=0.3)
+        fig3.tight_layout()
+        cum_path = viz_dir / "eval_cumulative_return.png"
+        fig3.savefig(cum_path, dpi=100)
+        plt.close(fig3)
+        if logger is not None and getattr(logger, "_wandb", None) is not None:
+            logger.log_image("eval/cumulative_return", str(cum_path), step=step)
 
     return {
         "eval/return_mean": float(np.mean(all_returns)),

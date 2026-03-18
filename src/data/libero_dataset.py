@@ -353,6 +353,17 @@ def make_libero_index_loader(
             result = result + (imgs,)
         else:
             result = result + (None,)
+        # Attach index row for debug (sample index fields: query_episode_id, query_start, prompt_episode_ids, etc.)
+        index_summary = {
+            "query_episode_id": q_ep,
+            "query_start": q_start,
+            "query_len": q_len,
+            "task_id": task_id,
+            "prompt_episode_ids": list(prompt_episode_ids) if prompt_episode_ids else [],
+            "prompt_starts": list(prompt_starts) if prompt_starts else [],
+            "prompt_lens": list(prompt_lens) if prompt_lens else [],
+        }
+        result = result + (index_summary,)
         return result
 
     return loader_fn

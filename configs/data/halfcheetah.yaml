@@ -8,7 +8,7 @@ num_train_tasks: 1
 max_episode_steps: 1000
 num_context_trajectories: 3
 max_total_prompt_length: 60   # increase to 256 (and set context_style=full_trajectory) for full-context demos
-max_prompt_trajectory_length: null  # when context_style=full_trajectory, cap each demo to this many steps
+max_prompt_trajectory_length: null  # null = full trajectory; set to N to cap each demo to last N steps
 context_style: subsampled
 lazy_dataset: true
 max_training_examples: 500000
