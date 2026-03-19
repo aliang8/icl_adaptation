@@ -39,7 +39,7 @@ class RewardModel:
         raise NotImplementedError
 
     def compute_rewards_batch(
-        self, *, frames_list: Sequence[np.ndarray], tasks: Sequence[str], batch_size: int
+        self, *, frames_list: Sequence[np.ndarray], tasks: Sequence[str]
     ) -> List[np.ndarray]:  # list of [T_i]
         return [self.compute_rewards_one(frames=f, task=t) for (f, t) in zip(frames_list, tasks)]
 
@@ -88,7 +88,7 @@ class RoboDopamine8BRewardModel(RewardModel):
 
 
 class Robometer4BRewardModel(RewardModel):
-    """Wrapper over robometer reward model; supports batched inference across trajectories."""
+    """Robometer-4B: per-frame rewards. Splits trajectory into segments of batch_size frames per model forward."""
 
     name = "robometer_4b"
 
@@ -97,6 +97,7 @@ class Robometer4BRewardModel(RewardModel):
         *,
         model_path: str = "robometer/Robometer-4B",
         device: Optional[str] = None,
+        batch_size: int = 32,
     ):
         from robometer.data.dataset_types import ProgressSample, Trajectory
         from robometer.evals.eval_server import compute_batch_outputs
@@ -122,54 +123,45 @@ class Robometer4BRewardModel(RewardModel):
         self.tokenizer = tokenizer
         self.processor = processor
         self.exp_config = exp_config
-
         self.batch_collator = setup_batch_collator(processor, tokenizer, exp_config, is_eval=True)
 
-        loss_config = getattr(exp_config, "loss", None)
-        self.is_discrete = (
-            getattr(loss_config, "progress_loss_type", "l2").lower() == "discrete"
-            if loss_config
-            else False
-        )
-        self.num_bins = getattr(loss_config, "progress_discrete_bins", None) or getattr(
-            getattr(exp_config, "model", None), "progress_discrete_bins", 10
-        )
+        loss_config = exp_config.loss
+        self.is_discrete = loss_config.progress_loss_type.lower() == "discrete"
+        self.num_bins = loss_config.progress_discrete_bins
 
-    def compute_rewards_batch(
-        self,
-        *,
-        frames_list: Sequence[np.ndarray],
-        tasks: Sequence[str],
-        batch_size: int,
-    ) -> List[np.ndarray]:
-        assert len(frames_list) == len(tasks), "frames_list and tasks must align"
-        n = len(frames_list)
-        out: List[np.ndarray] = []
-        for i in range(0, n, batch_size):
-            sub_frames = frames_list[i : i + batch_size]
-            sub_tasks = tasks[i : i + batch_size]
-            samples = []
-            for j, (frames, task) in enumerate(zip(sub_frames, sub_tasks)):
-                frames_u8 = np.asarray(frames)
-                if frames_u8.dtype != np.uint8:
-                    frames_u8 = np.clip(frames_u8, 0, 255).astype(np.uint8)
-                T = int(frames_u8.shape[0])
-                traj = self._Trajectory(
-                    frames=frames_u8,
-                    frames_shape=tuple(frames_u8.shape),
+        self.batch_size = batch_size
+
+    def compute_rewards_one(self, *, frames: np.ndarray, task: str) -> np.ndarray:
+        """Per-frame rewards. Splits into segments of batch_size frames; runs each segment through the model separately."""
+        frames_u8 = np.asarray(frames, dtype=np.uint8)
+        if frames_u8.dtype != np.uint8:
+            frames_u8 = np.clip(frames_u8, 0, 255).astype(np.uint8)
+        T = frames_u8.shape[0]
+        if T == 0:
+            return np.zeros(0, dtype=np.float32)
+
+        segments = [
+            frames_u8[s:s + self.batch_size]
+            for s in range(0, T, self.batch_size)
+        ]
+        rewards_list: List[np.ndarray] = []
+        for i, seg in enumerate(segments):
+            sample = self._ProgressSample(
+                trajectory=self._Trajectory(
+                    frames=seg,
+                    frames_shape=tuple(seg.shape),
                     task=task,
-                    id=str(i + j),
-                    metadata={"subsequence_length": T},
+                    id=str(i),
+                    metadata={"subsequence_length": seg.shape[0]},
                     video_embeddings=None,
-                )
-                samples.append(self._ProgressSample(trajectory=traj, sample_type="progress"))
-
-            batch = self.batch_collator(samples)
+                ),
+                sample_type="progress",
+            )
+            batch = self.batch_collator([sample])
             progress_inputs = batch["progress_inputs"]
             for key, value in progress_inputs.items():
                 if hasattr(value, "to"):
                     progress_inputs[key] = value.to(self.device)
-
             results = self._compute_batch_outputs(
                 self.reward_model,
                 self.tokenizer,
@@ -178,47 +170,35 @@ class Robometer4BRewardModel(RewardModel):
                 is_discrete_mode=self.is_discrete,
                 num_bins=self.num_bins,
             )
-
-            progress_pred = results.get("progress_pred", [])
-            if not progress_pred or len(progress_pred) == 0:
-                for frames in sub_frames:
-                    out.append(np.zeros((int(frames.shape[0]),), dtype=np.float32))
-                continue
-
-            if isinstance(progress_pred, (list, tuple)):
-                pred_list = list(progress_pred)
-            else:
-                pred_list = [progress_pred]
-
-            for j, frames in enumerate(sub_frames):
-                if j < len(pred_list):
-                    pred = pred_list[j]
-                    arr = np.asarray(pred, dtype=np.float32).reshape(-1)
-                    out.append(pad_or_trunc_1d(arr, int(frames.shape[0])))
-                else:
-                    out.append(np.zeros((int(frames.shape[0]),), dtype=np.float32))
-
-        return out
+            pred_list = results.get("progress_pred", []) or []
+            if not isinstance(pred_list, (list, tuple)):
+                pred_list = [pred_list]
+            arr = np.asarray(pred_list[0], dtype=np.float32).reshape(-1) if pred_list else np.zeros(0, dtype=np.float32)
+            rewards_list.append(pad_or_trunc_1d(arr, seg.shape[0]))
+        out = np.concatenate(rewards_list, axis=0)
+        return pad_or_trunc_1d(out, T)
 
 
 def build_reward_model(
     *,
     model_name: str,
     device: Optional[str] = None,
+    batch_size: int = 32,
     robometer_model_path: str = "robometer/Robometer-4B",
     robodopamine_model_path: str = "tanhuajie2001/Robo-Dopamine-GRM-2.0-8B-Preview",
-    robodopamine_frame_interval: int = 1,
-    robodopamine_batch_size: int = 4,
+    dopamine_frame_interval: int = 1,
 ) -> RewardModel:
+    """Build a reward model. batch_size: frames per segment (Robometer) / prompts per batch (RoboDopamine)."""
     if model_name in ("robodopamine_8b", "robodopamine", "dopamine_8b"):
         return RoboDopamine8BRewardModel(
             model_path=robodopamine_model_path,
-            frame_interval=robodopamine_frame_interval,
-            batch_size=robodopamine_batch_size,
+            frame_interval=dopamine_frame_interval,
+            batch_size=batch_size,
         )
     if model_name in ("robometer_4b", "robometer", "robometer_4b_dense", "robometer_4b_progress"):
         return Robometer4BRewardModel(
             model_path=robometer_model_path,
             device=device,
+            batch_size=batch_size,
         )
     raise ValueError(f"Unknown reward model: {model_name}")

@@ -110,6 +110,25 @@ Dataset layout:
 - **HalfCheetah (Minari)**: `datasets/HalfCheetah-v2/<data_quality>/trajectories.pkl` (created by `scripts/download_d4rl_halfcheetah.py` via Minari). Use `data_quality: medium_expert` (or `medium`, `expert`) in config and `--override data=[base,halfcheetah]`.
 - **ICRT-MT (language + multi-view images)**: `datasets/ICRT-MT/` from `uv run python scripts/download_icrt_dataset.py --output-dir datasets` ([HuggingFace](https://huggingface.co/datasets/Ravenh97/ICRT-MT)). After `uv sync --extra icrt`, visualize with `uv run python scripts/visualize_icrt_data.py`. Use `data=[base,icrt_mt] model=vla_dt` for language-conditioned, vision-based in-context policy (VLA-DT). See [docs/ICRT_MT_TRAINING.md](docs/ICRT_MT_TRAINING.md) (training only, no eval) and SETUP.md “Optional: ICRT-style”.
 - **LIBERO-Cosmos-Policy**: [nvidia/LIBERO-Cosmos-Policy](https://huggingface.co/datasets/nvidia/LIBERO-Cosmos-Policy) — download with `uv run python scripts/download_libero_cosmos.py --output-dir datasets`, train with `data=[base,libero_cosmos]`, run in-distribution eval with `scripts/run_libero_eval.py`. See [docs/LIBERO_COSMOS_TRAINING.md](docs/LIBERO_COSMOS_TRAINING.md).
+- **RoboArena DataDump**: [RoboArena/DataDump_08-05-2025](https://huggingface.co/datasets/RoboArena/DataDump_08-05-2025) or [DataDump_02-03-2026](https://huggingface.co/datasets/RoboArena/DataDump_02-03-2026) — download the raw dump, then convert evaluation_sessions (metadata + policy videos/npz) to task-grouped episodes and a manifest.
+
+  **Download raw data** (requires git and [Git LFS](https://git-lfs.github.com/) for videos):
+
+  ```bash
+  git lfs install
+  cd datasets
+  git clone https://huggingface.co/datasets/RoboArena/DataDump_08-05-2025
+  git clone https://huggingface.co/datasets/RoboArena/DataDump_02-03-2026
+  ```
+
+  **Convert to episodes + manifest**:
+
+  ```bash
+  uv run python scripts/convert_roboarena_to_dataset.py --input-dir datasets/DataDump_08-05-2025
+  uv run python scripts/convert_roboarena_to_dataset.py --input-dir datasets/DataDump_02-03-2026 --output-dir datasets --symlink
+  ```
+
+  Output: `episodes/<task_slug>/<idx>/` (primary.mp4, wrist.mp4, lowdim.npz) and `manifest.parquet`. Use `--skip-existing` (default) to skip already-converted episodes; `--no-skip-existing` to overwrite.
 - **AntDir / multi-task**: `datasets/<env_name>/<data_quality>/dataset_task_<id>.pkl` and `dataset_task_prompt<id>.pkl` (see Meta-DT data collection).  
 If no data is found, the trainer falls back to minimal dummy data for a dry run.
 

@@ -51,8 +51,12 @@ def _load_returns_and_meta(root: Path, reward_key: str, max_episodes: int | None
 
     for _, row in df.iterrows():
         ep_id = int(row["episode_id"])
-        ep_dir = episodes_dir / f"{ep_id:06d}"
-        lowdim_path = ep_dir / "lowdim.npz"
+        if row.get("lowdim_path"):
+            lowdim_path = root / row["lowdim_path"]
+            ep_dir = lowdim_path.parent
+        else:
+            ep_dir = episodes_dir / f"{ep_id:06d}"
+            lowdim_path = ep_dir / "lowdim.npz"
         if not lowdim_path.is_file():
             continue
         data = load_npz_arrays(lowdim_path)

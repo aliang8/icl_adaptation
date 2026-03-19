@@ -103,9 +103,9 @@ def main():
         sys.exit(1)
 
     df = pd.read_parquet(manifest_path)
-    episode_ids = df["episode_id"].tolist()
     if args.max_episodes is not None:
-        episode_ids = episode_ids[: args.max_episodes]
+        df = df.head(args.max_episodes)
+    episode_rows = df.to_dict(orient="records")
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     h, w = args.resize[0], args.resize[1]
@@ -168,11 +168,16 @@ def main():
         ]
         return np.concatenate(views, axis=-1)
 
-    for ep_id in tqdm(episode_ids, desc="Precomputing embeddings", unit="ep"):
-        ep_dir = episodes_dir / f"{ep_id:06d}"
+    for row in tqdm(episode_rows, desc="Precomputing embeddings", unit="ep"):
+        ep_id = int(row["episode_id"])
+        if row.get("lowdim_path"):
+            lowdim_path = root / row["lowdim_path"]
+            ep_dir = lowdim_path.parent
+        else:
+            ep_dir = episodes_dir / f"{ep_id:06d}"
+            lowdim_path = ep_dir / "lowdim.npz"
         primary_path = ep_dir / "primary.mp4"
         wrist_path = ep_dir / "wrist.mp4"
-        lowdim_path = ep_dir / "lowdim.npz"
         out_path = ep_dir / "embeddings.npz"
         if out_path.is_file() and not args.force:
             continue

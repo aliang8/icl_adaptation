@@ -2,12 +2,13 @@
 """
 Convert LIBERO-Cosmos-Policy HDF5 → episode folders + Parquet manifest (dataset only).
 
-Output layout:
-  - episodes/{episode_id:06d}/: primary.mp4, wrist.mp4, lowdim.npz (proprio, actions, dones, rewards)
-  - manifest.parquet: episode_id, task_description, success, n_steps, paths
+Output layout (aligned with RoboArena conversion):
+  - episodes/<task_slug>/<idx:06d>/: primary.mp4, wrist.mp4, lowdim.npz (proprio, actions, dones, rewards)
+  - manifest.parquet: episode_id, task_description, success, partial_success, n_steps, primary_path, wrist_path, lowdim_path, task_id
 
-No sample index here. After converting, run scripts/build_libero_sample_index.py to build
-sample_index.parquet for in-context training.
+task_description comes from HDF5 attrs["task_description"] (language instruction). partial_success is 1.0/0.0 (LIBERO has no fine-grained partial).
+
+After converting, run scripts/build_libero_sample_index.py to build sample_index.parquet for in-context training.
 
 Usage:
   python scripts/convert_libero_hdf5_to_dataset.py --input-dir datasets/LIBERO-Cosmos-Policy
@@ -17,6 +18,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -24,6 +26,14 @@ _script_dir = Path(__file__).resolve().parent
 _project_root = _script_dir.parent
 if _project_root not in sys.path:
     sys.path.insert(0, str(_project_root))
+
+
+def _task_to_slug(task: str) -> str:
+    """Normalize task string to a directory-safe slug (same as convert_roboarena_to_dataset)."""
+    s = (task or "unknown").strip().lower()
+    s = re.sub(r"[^\w\s-]", "", s)
+    s = re.sub(r"[-\s]+", "_", s)
+    return s or "unknown"
 
 
 def main():
@@ -98,10 +108,10 @@ def main():
         print(f"No .hdf5 files in {all_episodes_dir}", flush=True)
         sys.exit(1)
 
-    # First pass: read episode metadata for manifest
+    # First pass: read episode metadata and build task-grouped episode list
     print("Reading episode metadata...", flush=True)
-    meta = []
-    for ep_id, path in enumerate(tqdm(hdf5_files, desc="Metadata", unit="file")):
+    rows = []
+    for path in tqdm(hdf5_files, desc="Metadata", unit="file"):
         with h5py.File(path, "r") as f:
             T = f["proprio"].shape[0]
             task_desc = None
@@ -111,37 +121,59 @@ def main():
             succ = bool(f.attrs.get("success", False))
             has_primary = "primary_images_jpeg" in f
             has_wrist = "wrist_images_jpeg" in f
-        meta.append(
-            {
-                "episode_id": ep_id,
-                "task_description": task_desc or "",
-                "success": succ,
-                "n_steps": T,
-                "has_primary": has_primary,
-                "has_wrist": has_wrist,
-            }
-        )
+        rows.append({
+            "path": path,
+            "task_description": task_desc or "",
+            "success": succ,
+            "partial_success": 1.0 if succ else 0.0,
+            "n_steps": T,
+            "has_primary": has_primary,
+            "has_wrist": has_wrist,
+        })
 
-    # Second pass: write episode folders (MP4 + NPZ) and collect manifest rows; skip if already exist
+    rows.sort(key=lambda r: (_task_to_slug(r["task_description"]), str(r["path"])))
+    task_count = {}
+    episode_list = []
+    for r in rows:
+        slug = _task_to_slug(r["task_description"])
+        if slug == "unknown":
+            import ipdb
+            ipdb.set_trace()
+            raise ValueError(
+                "task slug is 'unknown'; task_description may be missing or empty in HDF5 attrs. "
+                "Inspect r['path'], r['task_description'] in ipdb."
+            )
+        idx = task_count.get(slug, 0)
+        task_count[slug] = idx + 1
+        episode_list.append((slug, idx, r))
+
+    manifest_columns = ["episode_id", "task_description", "success", "partial_success", "n_steps", "primary_path", "wrist_path", "lowdim_path"]
     manifest_rows = []
-    for ep_id, path in enumerate(tqdm(hdf5_files[:200], desc="Converting episodes", unit="file")):
-        ep_dir = episodes_dir / f"{ep_id:06d}"
+    global_episode_id = 0
+
+    def _read_n_steps(p):
+        d = np.load(p, allow_pickle=False)
+        return int(np.asarray(d["proprio"]).shape[0])
+
+    for task_slug, idx, r in tqdm(episode_list, desc="Converting episodes", unit="file"):
+        ep_dir = episodes_dir / task_slug / f"{idx:06d}"
         lowdim_path = ep_dir / "lowdim.npz"
         skip = lowdim_path.is_file()
 
-        rel_primary = f"episodes/{ep_id:06d}/primary.mp4"
-        rel_wrist = f"episodes/{ep_id:06d}/wrist.mp4"
-        rel_lowdim = f"episodes/{ep_id:06d}/lowdim.npz"
+        rel = f"episodes/{task_slug}/{idx:06d}"
+        rel_primary = f"{rel}/primary.mp4"
+        rel_wrist = f"{rel}/wrist.mp4"
+        rel_lowdim = f"{rel}/lowdim.npz"
 
         if skip:
-            # Use existing paths if files exist
             if not (ep_dir / "primary.mp4").is_file():
                 rel_primary = None
             if not (ep_dir / "wrist.mp4").is_file():
                 rel_wrist = None
+            n_steps = _read_n_steps(lowdim_path)
         else:
             ep_dir.mkdir(parents=True, exist_ok=True)
-            with h5py.File(path, "r") as f:
+            with h5py.File(r["path"], "r") as f:
                 proprio = np.asarray(f["proprio"], dtype=np.float32)
                 actions = np.asarray(f["actions"], dtype=np.float32)
                 T = proprio.shape[0]
@@ -155,10 +187,9 @@ def main():
                     dones = np.zeros(T, dtype=np.float32)
                     if T > 0:
                         dones[-1] = 1.0
-                success = bool(f.attrs.get("success", False))
                 rewards = np.zeros(T, dtype=np.float32)
-                if success and np.any(dones > 0):
-                    rewards[np.argmax(dones > 0)] = 1.0
+                if T > 0:
+                    rewards[-1] = r["partial_success"]
 
                 np.savez_compressed(
                     lowdim_path,
@@ -195,27 +226,29 @@ def main():
                         writer.close()
                 else:
                     rel_wrist = None
+            n_steps = T
 
-        m = meta[ep_id]
-        manifest_rows.append(
-            {
-                "episode_id": ep_id,
-                "task_description": m["task_description"],
-                "success": m["success"],
-                "n_steps": m["n_steps"],
-                "primary_path": rel_primary,
-                "wrist_path": rel_wrist,
-                "lowdim_path": rel_lowdim,
-            }
-        )
+        manifest_rows.append({
+            "episode_id": global_episode_id,
+            "task_description": r["task_description"],
+            "success": r["success"],
+            "partial_success": r["partial_success"],
+            "n_steps": n_steps,
+            "primary_path": rel_primary,
+            "wrist_path": rel_wrist,
+            "lowdim_path": rel_lowdim,
+        })
+        global_episode_id += 1
 
-    manifest_df = pd.DataFrame(manifest_rows)
-
+    manifest_df = pd.DataFrame(manifest_rows) if manifest_rows else pd.DataFrame(columns=manifest_columns)
+    unique_tasks = sorted(manifest_df["task_description"].unique().tolist(), key=str)
+    task_to_id = {t: i for i, t in enumerate(unique_tasks)}
+    manifest_df["task_id"] = manifest_df["task_description"].map(task_to_id)
     manifest_path = output_root / "manifest.parquet"
     manifest_df.to_parquet(manifest_path, index=False)
 
-    print(f"Saved manifest to {manifest_path} ({len(manifest_df)} episodes)", flush=True)
-    print(f"Episodes under {episodes_dir}", flush=True)
+    print(f"Saved manifest to {manifest_path} ({len(manifest_df)} episodes, {len(unique_tasks)} tasks)", flush=True)
+    print(f"Episodes under {episodes_dir} (by task: {list(task_count.keys())[:10]}{'...' if len(task_count) > 10 else ''})", flush=True)
     print(
         "Next: python scripts/build_libero_sample_index.py --data-dir " + str(output_root.parent),
         flush=True,
