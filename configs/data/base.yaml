@@ -17,10 +17,10 @@ context_dim: 16
 context_hidden_dim: 128
 num_context_trajectories: 1
 context_sort_ascending: true
-context_sampling: random
+context_sampling: stratified
 max_total_prompt_length: null
 max_prompt_trajectory_length: null  # null = use full trajectory; int = cap each context demo to last N steps
-context_style: subsampled
+context_style: full_trajectory
 lazy_dataset: true
 max_training_examples: 500000
 task_instructions: null

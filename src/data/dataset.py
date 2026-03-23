@@ -122,6 +122,7 @@ class ICLTrajectoryDatasetBase(Dataset, ABC):
         self._lazy = lazy_dataset
         self._max_examples = max_training_examples if lazy_dataset else None
         self._seed = seed
+        self._prompt_return_log_count = 0
 
         log.debug("Computing state mean/std over {} trajectories...", len(trajectories))
         states = np.concatenate([t["observations"] for t in trajectories], axis=0)
@@ -183,6 +184,27 @@ class ICLTrajectoryDatasetBase(Dataset, ABC):
         mask_seg = np.concatenate([np.zeros(pad_len), np.ones(tlen)], axis=0)
         return state_seg, context_seg, action_seg, reward_seg, done_seg, rtg_seg, ts_seg, mask_seg
 
+    def _log_prompt_context_returns_sample(
+        self,
+        chosen: List[Dict[str, np.ndarray]],
+        traj_idx: int,
+        si: int,
+    ) -> None:
+        """First 4 samples only: env return per context traj in prompt order (avoids log spam)."""
+        if self._prompt_return_log_count >= 4:
+            return
+        self._prompt_return_log_count += 1
+        ordered = [float(np.asarray(t["rewards"], dtype=np.float64).sum()) for t in chosen]
+        log.info(
+            "[prompt_context_returns] {}/4 | query traj_idx={} si={} | context_sort_ascending={} | "
+            "env_returns_prompt_order={}",
+            self._prompt_return_log_count,
+            traj_idx,
+            si,
+            self.context_sort_ascending,
+            [round(x, 3) for x in ordered],
+        )
+
     def _get_one_sample(
         self,
         traj_idx: int,
@@ -211,6 +233,7 @@ class ICLTrajectoryDatasetBase(Dataset, ABC):
             if prompt_list and self.num_context_trajectories >= 1
             else [traj]
         )
+        self._log_prompt_context_returns_sample(chosen, traj_idx, si)
         ps, pa, pr, prtg, pts, pm = self._build_prompt(
             chosen, self.state_mean, self.state_std, self.total_prompt_len
         )
@@ -295,6 +318,7 @@ class ICLTrajectoryDatasetBase(Dataset, ABC):
                     )
                 else:
                     chosen = [traj]
+                self._log_prompt_context_returns_sample(chosen, num, si)
                 ps, pa, pr, prtg, pts, pm = self._build_prompt(
                     chosen, state_mean, state_std, total_plen
                 )

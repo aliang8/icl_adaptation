@@ -18,6 +18,7 @@ dependencies = [
     "transformers>=4.20.0",
     "ipdb",
     "imageio[ffmpeg]>=2.9.0",
+    "opencv-python-headless>=4.5.0",
     "datasets>=4.5.0",
     "einops"
 ]

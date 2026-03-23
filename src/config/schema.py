@@ -13,14 +13,14 @@ class ModelConfig:
     context_dim: int = 16
     hidden_size: int = 128
     max_length: Optional[int] = 20
-    max_ep_len: int = 200
+    max_ep_len: int = 6000
     n_layer: int = 3
     n_head: int = 1
     n_inner: Optional[int] = None  # 4 * hidden_size if None
     activation_function: str = "relu"
     resid_pdrop: float = 0.1
     attn_pdrop: float = 0.1
-    n_positions: int = 1024
+    n_positions: int = 65536
     action_tanh: bool = True
     # VLA-DT (vision-language-action): set true in model=vla_dt
     use_vision: bool = False
@@ -195,8 +195,6 @@ class ExperimentConfig:
     best_metric_mode: str = "max"  # max or min
     # export
     export_final: bool = True
-    # Debug: print shapes of batch and model inputs on first train step (for OOM / shape debugging)
-    debug_shapes: bool = False
 
 
 @dataclass

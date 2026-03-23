@@ -8,6 +8,8 @@ eval_context_k: null
 eval_reward_source: env
 eval_reward_model: null
 save_eval_video: true  # set true to save eval rollout videos to viz/samples/step_XXX/videos/
+# LIBERO only: stitch primary|wrist in eval video. Gymnasium envs (HalfCheetah, etc.) use a single camera; train.py ignores this flag for non-LIBERO.
+eval_render_both_views: true
 run_action_compare_eval: false  # set true to save pred vs GT action plots to viz/action_compare/step_XXX/
 num_action_compare_demos: 3
 warm_train_steps: 70000
@@ -18,4 +20,3 @@ save_periodic_every_steps: 25000
 best_metric_name: eval/return_mean
 best_metric_mode: max
 export_final: true
-debug_shapes: false  # set true to print batch/model input shapes on first train step

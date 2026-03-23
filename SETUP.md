@@ -63,6 +63,8 @@ You can install both if you plan to use HalfCheetah and ICRT-style data. **Robom
 
 ### Path A: HalfCheetah (Minari)
 
+For a **copy-paste command sheet** (install → download → train, and what *not* to run for rewards), see **[docs/D4RL_TRAINING.md](docs/D4RL_TRAINING.md)**.
+
 1. Install Minari (see Step 3).
 2. Download datasets into `datasets/`:
 

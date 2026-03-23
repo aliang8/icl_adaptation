@@ -313,12 +313,10 @@ def build_optimizer_scheduler(model, cfg):
     return optimizer, scheduler
 
 
-def make_train_step_fn(
-    task_instructions, debug_shapes: bool = False, use_precomputed_embeddings: bool = False
-):
+def make_train_step_fn(task_instructions, use_precomputed_embeddings: bool = False):
     """Build a train step that passes instruction_indices and optional image_embeddings to VLA-DT."""
     task_list = list(task_instructions) if task_instructions else []
-    _debug_shapes_printed = [False]
+    _train_batch_logged = [False]
     _vision_encoder_logged = [False]
 
     _BATCH_NAMES = [
@@ -340,28 +338,28 @@ def make_train_step_fn(
     ]
 
     def _print_shapes(model, batch, dt_batch, image_embeddings):
-        log.info("[debug_shapes] === Batch / model input shapes (first step) ===")
+        log.info("[train_batch] === shapes (first train step) ===")
         log.info(
-            "[debug_shapes] Batch layout: [0-7] query segment (states,contexts,actions,rewards,dones,rtg,timesteps,masks); "
-            "[8-13] in-context prompt (prompt_s,a,r,rtg,ts,m); [14] instructions; [15] images or precomputed embeddings; "
-            "[16] sample index rows (index-backed dataset only: query_episode_id, query_start, prompt_episode_ids, etc.)."
+            "[train_batch] layout: [0-7] query (states,contexts,actions,rewards,dones,rtg,timesteps,masks); "
+            "[8-13] prompt (prompt_s,a,r,rtg,ts,m); [14] instructions; [15] images/embeddings; "
+            "[16] sample index (LIBERO index-backed: query_episode_id, ...)."
         )
         for i, name in enumerate(_BATCH_NAMES):
             if i >= len(batch):
                 break
             x = batch[i]
             if isinstance(x, torch.Tensor):
-                log.info("[debug_shapes]   {}: {} {}", name, x.dtype, tuple(x.shape))
+                log.info("[train_batch]   {}: {} {}", name, x.dtype, tuple(x.shape))
             elif isinstance(x, (list, tuple)) and x and isinstance(x[0], torch.Tensor):
                 log.info(
-                    "[debug_shapes]   {}: list of {} tensors {}",
+                    "[train_batch]   {}: list of {} tensors {}",
                     name,
                     len(x),
                     [tuple(t.shape) for t in x],
                 )
             else:
                 log.info(
-                    "[debug_shapes]   {}: type={} len={}",
+                    "[train_batch]   {}: type={} len={}",
                     name,
                     type(x).__name__,
                     len(x) if hasattr(x, "__len__") else "?",
@@ -371,32 +369,32 @@ def make_train_step_fn(
             if isinstance(imgs, (list, tuple)):
                 for v, t in enumerate(imgs):
                     if isinstance(t, torch.Tensor):
-                        log.info("[debug_shapes]   images view[{}]: {}", v, tuple(t.shape))
+                        log.info("[train_batch]   images view[{}]: {}", v, tuple(t.shape))
             elif isinstance(imgs, torch.Tensor):
-                log.info("[debug_shapes]   image_embeddings (precomputed): {}", tuple(imgs.shape))
+                log.info("[train_batch]   image_embeddings (precomputed): {}", tuple(imgs.shape))
             else:
-                log.info("[debug_shapes]   images/embeddings: {}", type(imgs).__name__)
-        log.info("[debug_shapes]   --- DTBatch ---")
-        log.info("[debug_shapes]   states: {}", tuple(dt_batch.states.shape))
-        log.info("[debug_shapes]   actions: {}", tuple(dt_batch.actions.shape))
+                log.info("[train_batch]   images/embeddings: {}", type(imgs).__name__)
+        log.info("[train_batch]   --- DTBatch (prompt trimmed for RTG align in step) ---")
+        log.info("[train_batch]   states: {}", tuple(dt_batch.states.shape))
+        log.info("[train_batch]   actions: {}", tuple(dt_batch.actions.shape))
         if dt_batch.prompt and dt_batch.prompt[0] is not None:
             log.info(
-                "[debug_shapes]   prompt (s,a,r,rtg,ts,m): {}",
+                "[train_batch]   prompt (s,a,r,rtg,ts,m): {}",
                 [tuple(p.shape) for p in dt_batch.prompt],
             )
         if image_embeddings is not None:
-            log.info("[debug_shapes]   image_embeddings: {}", tuple(image_embeddings.shape))
+            log.info("[train_batch]   image_embeddings: {}", tuple(image_embeddings.shape))
         if dt_batch.instruction_indices is not None:
             log.info(
-                "[debug_shapes]   instruction_indices: {}",
+                "[train_batch]   instruction_indices: {}",
                 tuple(dt_batch.instruction_indices.shape),
             )
         if len(batch) > 16 and batch[16] is not None:
-            log.info("[debug_shapes]   --- Sample index (first 2 in batch) ---")
+            log.info("[train_batch]   --- sample index (first 2 rows) ---")
             for b_idx, row in enumerate(batch[16][:2]):
                 if isinstance(row, dict):
                     log.info(
-                        "[debug_shapes]   [{}] query_ep={} query_start={} query_len={} task_id={} "
+                        "[train_batch]   [{}] query_ep={} query_start={} query_len={} task_id={} "
                         "prompt_eps={} prompt_starts={} prompt_lens={}",
                         b_idx,
                         row.get("query_episode_id"),
@@ -407,7 +405,24 @@ def make_train_step_fn(
                         row.get("prompt_starts", []),
                         row.get("prompt_lens", []),
                     )
-        log.info("[debug_shapes] === end ===")
+        if len(batch) > 13:
+            pr, pm = batch[10], batch[13]
+            if isinstance(pr, torch.Tensor) and isinstance(pm, torch.Tensor):
+                log.info("[train_batch] --- prompt_r masked sum (first 2 batch rows, pre-trim tensors) ---")
+                B = min(2, pr.shape[0])
+                for b in range(B):
+                    pr_b = pr[b].float()
+                    pm_b = pm[b].float()
+                    if pr_b.dim() > 1:
+                        masked = (pr_b.squeeze(-1) * pm_b).sum().item()
+                    else:
+                        masked = (pr_b * pm_b).sum().item()
+                    log.info("[train_batch]   row {}: sum(prompt_r * prompt_m) = {:.4f}", b, masked)
+                log.info(
+                    "[train_batch] per-context env returns (prompt order): see [prompt_context_returns] "
+                    "(first 4 dataset samples / workers)"
+                )
+        log.info("[train_batch] === end ===")
 
     def train_step_fn(model, batch):
         """One step: forward, MSE loss on actions. Batch: 15 elements (14 tensors + instructions); optional 16th = images."""
@@ -478,9 +493,9 @@ def make_train_step_fn(
             image_embeddings=image_embeddings,
             instruction_indices=instruction_indices,
         )
-        if debug_shapes and not _debug_shapes_printed[0]:
+        if not _train_batch_logged[0]:
             _print_shapes(model, batch, dt_batch, image_embeddings)
-            _debug_shapes_printed[0] = True
+            _train_batch_logged[0] = True
         out = model(dt_batch)
         loss = out.loss if out.loss is not None else torch.tensor(0.0, device=states.device)
         with torch.no_grad():
@@ -845,50 +860,63 @@ def main():
                 sampling=data_cfg.context_sampling,
             )
         task_desc = (dataset.task_instructions or [None])[0] if dataset.task_instructions else None
-        metrics = run_rollouts_and_save_viz(
-            model=model,
-            env_name=env_name,
-            state_mean=state_mean,
-            state_std=state_std,
-            device=device,
-            run_dir=run_dir,
-            step=step,
-            num_rollouts=num_rollouts,
-            max_episode_steps=data_cfg.max_episode_steps,
-            scale=data_cfg.return_scale,
-            save_video=cfg.experiment.save_eval_video,
-            eval_context_mode=eval_mode,
-            prompt_trajectories=prompt_trajectories,
-            eval_num_trials=cfg.experiment.eval_num_trials,
-            eval_context_k=eval_k,
-            eval_reward_source=cfg.experiment.eval_reward_source,
-            eval_reward_model=cfg.experiment.eval_reward_model,
-            total_prompt_len=dataset.total_prompt_len,
-            max_prompt_trajectory_length=dataset.max_prompt_trajectory_length,
-            task_description=task_desc,
-            logger=logger,
-            eval_render_both_views=cfg.experiment.eval_render_both_views,
+        # Dual-camera stitch is LIBERO-only; Gymnasium (HalfCheetah, etc.) has a single render view.
+        eval_render_both_views = bool(cfg.experiment.eval_render_both_views) and (
+            env_name in LIBERO_SUITES
         )
-        if (
-            cfg.experiment.run_action_compare_eval
-            and hasattr(dataset, "trajectories")
-            and dataset.trajectories
-        ):
-            action_metrics = run_action_compare_eval(
-                model=model,
-                trajectories=dataset.trajectories,
-                state_mean=state_mean,
-                state_std=state_std,
-                device=device,
-                run_dir=run_dir,
-                step=step,
-                num_demos=cfg.experiment.num_action_compare_demos,
-                max_episode_steps=data_cfg.max_episode_steps,
-                scale=data_cfg.return_scale,
-                use_gt_action=True,
-                warm_train_steps=cfg.experiment.warm_train_steps,
-            )
-            metrics = {**metrics, **action_metrics}
+        # inference_mode: no autograd graph. Without this, rollout chains ~max_episode_steps forwards
+        # via actions_t = cat(..., action) and retains the full graph -> CUDA OOM.
+        was_training = model.training
+        model.eval()
+        try:
+            with torch.inference_mode():
+                metrics = run_rollouts_and_save_viz(
+                    model=model,
+                    env_name=env_name,
+                    state_mean=state_mean,
+                    state_std=state_std,
+                    device=device,
+                    run_dir=run_dir,
+                    step=step,
+                    num_rollouts=num_rollouts,
+                    max_episode_steps=data_cfg.max_episode_steps,
+                    scale=data_cfg.return_scale,
+                    save_video=cfg.experiment.save_eval_video,
+                    eval_context_mode=eval_mode,
+                    prompt_trajectories=prompt_trajectories,
+                    eval_num_trials=cfg.experiment.eval_num_trials,
+                    eval_context_k=eval_k,
+                    eval_reward_source=cfg.experiment.eval_reward_source,
+                    eval_reward_model=cfg.experiment.eval_reward_model,
+                    total_prompt_len=dataset.total_prompt_len,
+                    max_prompt_trajectory_length=dataset.max_prompt_trajectory_length,
+                    task_description=task_desc,
+                    logger=logger,
+                    eval_render_both_views=eval_render_both_views,
+                )
+                if (
+                    cfg.experiment.run_action_compare_eval
+                    and hasattr(dataset, "trajectories")
+                    and dataset.trajectories
+                ):
+                    action_metrics = run_action_compare_eval(
+                        model=model,
+                        trajectories=dataset.trajectories,
+                        state_mean=state_mean,
+                        state_std=state_std,
+                        device=device,
+                        run_dir=run_dir,
+                        step=step,
+                        num_demos=cfg.experiment.num_action_compare_demos,
+                        max_episode_steps=data_cfg.max_episode_steps,
+                        scale=data_cfg.return_scale,
+                        use_gt_action=True,
+                        warm_train_steps=cfg.experiment.warm_train_steps,
+                    )
+                    metrics = {**metrics, **action_metrics}
+        finally:
+            if was_training:
+                model.train()
         append_metrics_history(run_dir, step, metrics)
         return metrics
 
@@ -896,7 +924,6 @@ def main():
     export_dir = str(run_dir / "artifacts" / "inference")
     train_step_fn = make_train_step_fn(
         dataset.task_instructions or [],
-        debug_shapes=cfg.experiment.debug_shapes,
         use_precomputed_embeddings=getattr(cfg.data, "use_precomputed_embeddings", False),
     )
     final_step, best_metric = trainer.run_training(

@@ -16,7 +16,7 @@ $PY scripts/download_d4rl_halfcheetah.py \
   --output-dir "${PROJECT_ROOT}/datasets" \
   --qualities medium expert medium_expert
 
-# Train with HalfCheetah config + W&B
+# Train with default model=transformer + HalfCheetah data
 echo "=== Training Meta-DT on HalfCheetah (W&B enabled) ==="
 $PY -m src.train \
   --config-dir "${PROJECT_ROOT}/configs" \

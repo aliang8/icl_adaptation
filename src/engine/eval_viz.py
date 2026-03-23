@@ -10,9 +10,80 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+# Dataset / config may use D4RL-era ids (e.g. HalfCheetah-v2). Core Gymnasium only registers
+# modern MuJoCo envs (v4+); v2/v3 in gymnasium-robotics still need deprecated mujoco_py.
+# Map to v5 for eval when observation/action shapes match (HalfCheetah: 17 / 6).
+_GYMNASIUM_EVAL_ENV_ALIASES = {
+    "HalfCheetah-v2": "HalfCheetah-v5",
+    "halfcheetah-v2": "HalfCheetah-v5",
+}
+_EVAL_ENV_ALIAS_LOGGED: set[str] = set()
 
-def _try_make_env(env_name: str, render_both_views: bool = True):
-    """Create env: LIBERO suite (libero_10, ...) via make_libero_env, else Gymnasium/gym. Returns None if env or deps missing."""
+
+def _log_eval_transformer_seq(
+    model: Any,
+    prompt: Optional[Tuple[Any, ...]],
+    *,
+    env_name: str,
+    max_episode_steps: int,
+    tag: str,
+) -> None:
+    """
+    Print how long the transformer sequence is on each eval get_action call.
+
+    OOM during eval is usually from attention over (prompt + padded query): with condition_rtg,
+    each env/query timestep becomes 3 tokens, so positions ≈ 3 * (prompt_timesteps + model.max_length).
+    That is fixed for the whole rollout (not growing with env t) but huge if max_total_prompt_length is large.
+    """
+    condition_rtg = getattr(model, "_condition_rtg", True)
+    tokens_per_step = 3 if condition_rtg else 2
+    max_len = getattr(model, "max_length", None)
+    if max_len is None:
+        max_len = 0
+    t_prompt = 0
+    if prompt is not None and prompt[0] is not None:
+        t_prompt = int(prompt[0].shape[1])
+    total_tokens = tokens_per_step * (t_prompt + int(max_len))
+    npos = None
+    tr = getattr(model, "transformer", None)
+    if tr is not None:
+        cfg = getattr(tr, "config", None)
+        if cfg is not None:
+            npos = getattr(cfg, "n_positions", None)
+    print(
+        f"Eval transformer seq [{tag}] env={env_name!r}: "
+        f"prompt_timesteps={t_prompt}, query_padded_to_max_length={max_len}, "
+        f"tokens_per_dt_step={tokens_per_step} => "
+        f"~{total_tokens} positions per get_action call; "
+        f"rollout max_episode_steps={max_episode_steps}.",
+        flush=True,
+    )
+    if npos is not None:
+        print(f"  backbone n_positions={npos}", flush=True)
+    if total_tokens > 8192:
+        print(
+            "  WARNING: very long eval context — consider lowering data.max_total_prompt_length "
+            "(or a dedicated eval prompt cap), smaller model, or eval on CPU.",
+            flush=True,
+        )
+
+
+def _render_rgb_frame(env: Any) -> Optional[np.ndarray]:
+    """RGB frame from Gymnasium env (create with render_mode='rgb_array')."""
+    frame = env.render()
+    if frame is None or not isinstance(frame, np.ndarray):
+        return None
+    return np.asarray(frame)
+
+
+def _try_make_env(
+    env_name: str,
+    render_both_views: bool = True,
+    render_mode: Optional[str] = None,
+):
+    """Create env: LIBERO suite (libero_10, ...) via make_libero_env, else Gymnasium/gym. Returns None if env or deps missing.
+    render_both_views is only used for LIBERO (primary + wrist); Gymnasium envs have a single camera.
+    """
     from src.envs.libero_env import LIBERO_SUITES, make_libero_env
 
     if env_name in LIBERO_SUITES:
@@ -26,7 +97,32 @@ def _try_make_env(env_name: str, render_both_views: bool = True):
 
     import gymnasium as gym
 
-    return gym.make(env_name)
+    gym_id = _GYMNASIUM_EVAL_ENV_ALIASES.get(env_name, env_name)
+    if gym_id != env_name and env_name not in _EVAL_ENV_ALIAS_LOGGED:
+        _EVAL_ENV_ALIAS_LOGGED.add(env_name)
+        print(
+            f"Eval env alias: {env_name!r} -> {gym_id!r} "
+            f"(core Gymnasium MuJoCo; same obs/act dims as D4RL/Minari HalfCheetah)"
+        )
+
+    try:
+        if render_mode is not None:
+            return gym.make(gym_id, render_mode=render_mode)
+        return gym.make(gym_id)
+    except Exception as e:
+        msg = str(e).lower()
+        # If alias failed or user passed another -v2 id, give a clear hint.
+        if (
+            "gymnasium-robotics" in msg
+            or "mujoco v2" in msg
+            or "mujoco v3" in msg
+        ):
+            raise RuntimeError(
+                f"Could not create Gymnasium env {gym_id!r} (from config {env_name!r}). "
+                f"For HalfCheetah, use MuJoCo-backed Gymnasium (HalfCheetah-v5) and "
+                f"`uv sync --extra d4rl` so `mujoco` is installed. Original error: {e}"
+            ) from e
+        raise
 
 
 class _GymnasiumToGymStepAdapter:
@@ -183,6 +279,7 @@ def _run_one_rollout(
     ep: int,
     prompt: Optional[Tuple[Any, ...]],
     collect_frames: bool = False,
+    env_name: str = "",
 ) -> Tuple[float, int, np.ndarray, np.ndarray, Dict[str, np.ndarray], List[np.ndarray]]:
     """Run one episode; return (return, length, states, actions, trajectory_dict, frames)."""
     import torch
@@ -191,10 +288,10 @@ def _run_one_rollout(
     if isinstance(obs, tuple):
         obs = obs[0]
     frames: List[np.ndarray] = []
-    if collect_frames and hasattr(env, "render"):
-        frame = env.render(mode="rgb_array")
-        if frame is not None and isinstance(frame, np.ndarray):
-            frames.append(np.asarray(frame))
+    if collect_frames:
+        frame = _render_rgb_frame(env)
+        if frame is not None:
+            frames.append(frame)
     use_vision = getattr(model, "vision_encoder", None) is not None
     get_images = getattr(env, "get_current_images", None)
     image_list: List[Tuple[Any, Any]] = []
@@ -212,7 +309,15 @@ def _run_one_rollout(
     ep_actions: List[np.ndarray] = []
     ep_rewards: List[float] = []
     ep_return = 0.0
+    ml_q = getattr(model, "max_length", None)
     for t in range(max_episode_steps):
+        if t % 25 == 0 or t < 3:
+            n_live = int(states.shape[0])
+            print(
+                f"[eval rollout] env={env_name!r} ep={ep} env_timestep={t}/{max_episode_steps} "
+                f"live_query_length={n_live} states (query padded to max_length={ml_q} inside get_action)",
+                flush=True,
+            )
         image_embeddings = None
         if use_vision and image_list:
             image_embeddings = _encode_rollout_images(image_list, model, device)
@@ -231,7 +336,10 @@ def _run_one_rollout(
         )
         if action.dim() == 1:
             action = action.unsqueeze(0)
-        action_np = action.detach().cpu().numpy().flatten()
+        # Detach before feeding back into next get_action so we never chain autograd graphs
+        # across env steps (OOM if eval runs without torch.inference_mode).
+        action = action.detach()
+        action_np = action.cpu().numpy().flatten()
         step_out = env.step(action_np)
         if len(step_out) == 5:
             next_obs, reward, done, truncated, _ = step_out
@@ -241,10 +349,10 @@ def _run_one_rollout(
         if use_vision and get_images is not None:
             prim, wrist = get_images()
             image_list.append((prim, wrist))
-        if collect_frames and hasattr(env, "render"):
-            frame = env.render(mode="rgb_array")
-            if frame is not None and isinstance(frame, np.ndarray):
-                frames.append(np.asarray(frame))
+        if collect_frames:
+            frame = _render_rgb_frame(env)
+            if frame is not None:
+                frames.append(frame)
         if isinstance(next_obs, tuple):
             next_obs = next_obs[0]
         r = float(reward)
@@ -306,10 +414,21 @@ def run_rollouts_and_save_viz(
     Run one eval rollout (N trials). Each trial can be saved as trial_0.mp4, trial_1.mp4, ...
     For wandb: log one continuous video with "Trial 1", "Trial 2", ... overlaid.
     """
-    env = _try_make_env(env_name, render_both_views=eval_render_both_views)
-    if env is None:
-        from src.envs.libero_env import LIBERO_SUITES
+    from src.envs.libero_env import LIBERO_SUITES
 
+    use_wandb_video = logger is not None and getattr(logger, "_wandb", None) is not None
+    collect_frames = save_video or use_wandb_video
+    # Gymnasium needs render_mode="rgb_array" at construction for env.render() to return pixels.
+    gym_render_mode: Optional[str] = None
+    if collect_frames and env_name not in LIBERO_SUITES:
+        gym_render_mode = "rgb_array"
+
+    env = _try_make_env(
+        env_name,
+        render_both_views=eval_render_both_views,
+        render_mode=gym_render_mode,
+    )
+    if env is None:
         if env_name in LIBERO_SUITES:
             print(
                 f"Eval rollouts skipped: LIBERO not installed for '{env_name}'. "
@@ -321,8 +440,6 @@ def run_rollouts_and_save_viz(
 
     viz_dir = run_dir / "viz" / "samples" / f"step_{step:06d}"
     viz_dir.mkdir(parents=True, exist_ok=True)
-    use_wandb_video = logger is not None and getattr(logger, "_wandb", None) is not None
-    collect_frames = save_video or use_wandb_video
     video_folder = viz_dir / "videos"
     if collect_frames:
         video_folder.mkdir(parents=True, exist_ok=True)
@@ -401,6 +518,13 @@ def run_rollouts_and_save_viz(
                     sort_ascending=True,
                     trajectory_returns=returns_for_prompt or None,
                 )
+            _log_eval_transformer_seq(
+                model,
+                prompt,
+                env_name=env_name,
+                max_episode_steps=max_episode_steps,
+                tag=f"zero_shot trial {trial} / step {step}",
+            )
             ep_return, length, S, A, traj_dict, frames = _run_one_rollout(
                 model,
                 env,
@@ -413,6 +537,7 @@ def run_rollouts_and_save_viz(
                 trial,
                 prompt,
                 collect_frames=collect_frames,
+                env_name=env_name,
             )
             ret = _return_for_traj(traj_dict, ep_return)
             context_list.append((traj_dict, ret))
@@ -439,6 +564,13 @@ def run_rollouts_and_save_viz(
             device,
             sort_ascending=True,
         )
+        _log_eval_transformer_seq(
+            model,
+            prompt,
+            env_name=env_name,
+            max_episode_steps=max_episode_steps,
+            tag=f"prompt mode step {step}",
+        )
         for ep in range(num_rollouts):
             ep_return, length, S, A, _, frames = _run_one_rollout(
                 model,
@@ -452,6 +584,7 @@ def run_rollouts_and_save_viz(
                 ep,
                 prompt,
                 collect_frames=collect_frames,
+                env_name=env_name,
             )
             all_returns.append(ep_return)
             all_lengths.append(length)
@@ -462,6 +595,14 @@ def run_rollouts_and_save_viz(
                 for t, f in enumerate(frames):
                     all_frames_for_wandb.append(_add_trial_text(f, f"Trial {ep + 1}  t={t}"))
     else:
+        if num_rollouts > 0:
+            _log_eval_transformer_seq(
+                model,
+                None,
+                env_name=env_name,
+                max_episode_steps=max_episode_steps,
+                tag=f"no prompt step {step}",
+            )
         for ep in range(num_rollouts):
             ep_return, length, S, A, _, frames = _run_one_rollout(
                 model,
@@ -475,6 +616,7 @@ def run_rollouts_and_save_viz(
                 ep,
                 None,
                 collect_frames=collect_frames,
+                env_name=env_name,
             )
             all_returns.append(ep_return)
             all_lengths.append(length)
