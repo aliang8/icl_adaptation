@@ -153,6 +153,7 @@ class ICLTrajectoryDatasetBase(Dataset, ABC):
         self._max_examples = max_training_examples if lazy_dataset else None
         self._seed = seed
         self._prompt_return_log_count = 0
+        self._task_ids: List[int] = []
 
         log.debug("Computing state mean/std over {} trajectories...", len(trajectories))
         states = np.concatenate([t["observations"] for t in trajectories], axis=0)
@@ -478,11 +479,7 @@ class ICLTrajectoryDatasetBase(Dataset, ABC):
         if self._lazy:
             return self._get_item_lazy(index)
         instruction = ""
-        if (
-            self.task_instructions is not None
-            and hasattr(self, "_task_ids")
-            and index < len(self._task_ids)
-        ):
+        if self.task_instructions is not None and index < len(self._task_ids):
             tid = self._task_ids[index]
             if tid < len(self.task_instructions):
                 instruction = self.task_instructions[tid] or ""

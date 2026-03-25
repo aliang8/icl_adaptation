@@ -111,7 +111,7 @@ def _print_dataset_stats(
     if proprio_keys is None:
         proprio_keys = []
 
-    trajectories = dataset.trajectories if hasattr(dataset, "trajectories") else None
+    trajectories = dataset.trajectories
     n_trajectories = len(trajectories) if trajectories else 0
     n_segments = len(dataset)
     traj_lengths = (
@@ -143,9 +143,9 @@ def _print_dataset_stats(
                 for t in tasks[:max_examples]
             ]
             table.add_row("Example tasks", "\n".join(examples) if examples else "—")
-    return_min = dataset.return_min if hasattr(dataset, "return_min") else None
-    return_max = dataset.return_max if hasattr(dataset, "return_max") else None
-    return_avg = dataset.return_avg if hasattr(dataset, "return_avg") else None
+    return_min = dataset.return_min
+    return_max = dataset.return_max
+    return_avg = dataset.return_avg
     for label, val in [
         ("Return (min)", return_min),
         ("Return (max)", return_max),
@@ -374,11 +374,15 @@ def make_train_step_fn(task_instructions, use_precomputed_embeddings: bool = Fal
                     [tuple(t.shape) for t in x],
                 )
             else:
+                try:
+                    lx = len(x)
+                except TypeError:
+                    lx = "?"
                 log.info(
                     "[train_batch]   {}: type={} len={}",
                     name,
                     type(x).__name__,
-                    len(x) if hasattr(x, "__len__") else "?",
+                    lx,
                 )
         if len(batch) > 15 and batch[15] is not None:
             imgs = batch[15]
@@ -491,7 +495,9 @@ def make_train_step_fn(task_instructions, use_precomputed_embeddings: bool = Fal
                     if not _vision_encoder_logged[0]:
                         log.info("Vision encoder input: {} views, shapes {}", len(imgs), shapes_str)
                 else:
-                    shapes_str = imgs.shape if hasattr(imgs, "shape") else type(imgs)
+                    shapes_str = (
+                        tuple(imgs.shape) if isinstance(imgs, torch.Tensor) else type(imgs).__name__
+                    )
                     if not _vision_encoder_logged[0]:
                         log.info("Vision encoder input: {}", shapes_str)
                 image_embeddings = model.vision_encoder(batch[15])
@@ -823,7 +829,6 @@ def main():
     log.info("Dataset size: {} segments, state_mean/std computed", len(dataset))
     if (
         data_cfg.use_vision
-        and hasattr(dataset, "trajectories")
         and dataset.trajectories
         and not any(isinstance(t, dict) and t.get("images") for t in dataset.trajectories)
     ):
@@ -852,7 +857,7 @@ def main():
     if bool(cfg.experiment.save_training_sample_videos):
         from src.engine.training_debug_viz import save_training_sample_videos
 
-        trs = getattr(dataset, "trajectories", None)
+        trs = dataset.trajectories
         has_images = bool(
             data_cfg.use_vision
             or (
@@ -941,7 +946,7 @@ def main():
         else:
             eval_k = cfg.experiment.eval_context_k or data_cfg.num_context_trajectories
         prompt_trajectories = None
-        if eval_mode == "prompt" and hasattr(dataset, "trajectories") and dataset.trajectories:
+        if eval_mode == "prompt" and dataset.trajectories:
             prompt_trajectories = sample_context_trajectories(
                 dataset.trajectories,
                 n=eval_k,
@@ -989,11 +994,7 @@ def main():
                     reward_normalization_stats_path=data_cfg.reward_normalization_stats_path,
                     wandb_defer_step_commit=use_wandb,
                 )
-                if (
-                    cfg.experiment.run_action_compare_eval
-                    and hasattr(dataset, "trajectories")
-                    and dataset.trajectories
-                ):
+                if cfg.experiment.run_action_compare_eval and dataset.trajectories:
                     action_metrics = run_action_compare_eval(
                         model=model,
                         trajectories=dataset.trajectories,

@@ -40,10 +40,10 @@ def run_action_compare_eval(
 
     state_mean_t = state_mean
     state_std_t = state_std
-    if hasattr(state_mean_t, "numpy"):
-        state_mean_t = state_mean_t.numpy()
-    if hasattr(state_std_t, "numpy"):
-        state_std_t = state_std_t.numpy()
+    if isinstance(state_mean_t, torch.Tensor):
+        state_mean_t = state_mean_t.detach().cpu().numpy()
+    if isinstance(state_std_t, torch.Tensor):
+        state_std_t = state_std_t.detach().cpu().numpy()
     state_mean_t = np.asarray(state_mean_t, dtype=np.float32)
     state_std_t = np.asarray(state_std_t, dtype=np.float32)
     if state_mean_t.ndim == 0:

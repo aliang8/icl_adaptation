@@ -182,11 +182,8 @@ def make_libero_env(
 
         def get_current_images(self) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
             """Return (primary, wrist) as (H, W, 3) uint8 for current timestep. Matches dataset order: agentview=primary, robot0_eye_in_hand=wrist."""
-            inner = getattr(self._env, "env", self._env)
-            get_obs = getattr(inner, "_get_observations", None)
-            if get_obs is None:
-                return None, None
-            obs = get_obs()
+            inner = self._env.env
+            obs = inner._get_observations()
             if not isinstance(obs, dict):
                 return None, None
 

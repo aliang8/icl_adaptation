@@ -58,10 +58,7 @@ def save_training_sample_videos(
     """
     if num_clips <= 0:
         return
-    if not hasattr(dataset, "_get_one_sample"):
-        log.info("Training sample videos: dataset has no _get_one_sample; skipping.")
-        return
-    trajs = getattr(dataset, "trajectories", None)
+    trajs = dataset.trajectories
     if not trajs:
         log.info("Training sample videos: no trajectories on dataset; skipping.")
         return

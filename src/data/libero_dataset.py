@@ -431,6 +431,7 @@ def build_libero_in_context_dataset(
             self.max_episode_steps = cfg.max_episode_steps
             self.num_context_trajectories = cfg.num_context_trajectories
             self.prompt_length = cfg.prompt_length
+            self.context_subsample_strategy = cfg.context_subsample_strategy
             self.return_min = 0.0
             self.return_max = 1.0
             self.return_avg = 0.5

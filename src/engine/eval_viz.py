@@ -10,6 +10,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 from src.data.reward_normalization import load_stats, normalize_reward_scalar
+from src.models.meta_dt import MetaDecisionTransformer
 
 # Dataset / config may use D4RL-era ids (e.g. HalfCheetah-v2). Core Gymnasium only registers
 # modern MuJoCo envs (v4+); v2/v3 in gymnasium-robotics still need deprecated mujoco_py.
@@ -36,21 +37,17 @@ def _log_eval_transformer_seq(
     each env/query timestep becomes 3 tokens, so positions ≈ 3 * (prompt_timesteps + model.max_length).
     That is fixed for the whole rollout (not growing with env t) but huge if max_total_prompt_length is large.
     """
-    condition_rtg = getattr(model, "_condition_rtg", True)
+    if not isinstance(model, MetaDecisionTransformer):
+        raise TypeError(f"eval expects MetaDecisionTransformer, got {type(model)}")
+    condition_rtg = model._condition_rtg
     tokens_per_step = 3 if condition_rtg else 2
-    max_len = getattr(model, "max_length", None)
-    if max_len is None:
-        max_len = 0
+    max_len = model.max_length if model.max_length is not None else 0
     t_prompt = 0
     if prompt is not None and prompt[0] is not None:
         t_prompt = int(prompt[0].shape[1])
     total_tokens = tokens_per_step * (t_prompt + int(max_len))
-    npos = None
-    tr = getattr(model, "transformer", None)
-    if tr is not None:
-        cfg = getattr(tr, "config", None)
-        if cfg is not None:
-            npos = getattr(cfg, "n_positions", None)
+    tr = model.transformer
+    npos = tr.config.n_positions
     print(
         f"Eval transformer seq [{tag}] env={env_name!r}: "
         f"prompt_timesteps={t_prompt}, query_padded_to_max_length={max_len}, "
@@ -59,8 +56,7 @@ def _log_eval_transformer_seq(
         f"rollout max_episode_steps={max_episode_steps}.",
         flush=True,
     )
-    if npos is not None:
-        print(f"  backbone n_positions={npos}", flush=True)
+    print(f"  backbone n_positions={npos}", flush=True)
     if total_tokens > 8192:
         print(
             "  WARNING: very long eval context — consider lowering data.max_total_prompt_length "
@@ -129,7 +125,8 @@ class _GymnasiumToGymStepAdapter:
         self._env = env
 
     def __getattr__(self, name: str):
-        return getattr(self._env, name)
+        env = object.__getattribute__(self, "_env")
+        return object.__getattribute__(env, name)
 
     def step(self, action: Any):
         out = self._env.step(action)
@@ -146,12 +143,10 @@ def _wrap_record_video(env: Any, video_folder: Path) -> Tuple[Any, bool]:
     """Wrap env with RecordVideo (Gymnasium). Returns (wrapped_env, success)."""
     import gymnasium as gym
 
-    if hasattr(gym, "wrappers") and hasattr(gym.wrappers, "RecordVideo"):
-        return (
-            gym.wrappers.RecordVideo(env, str(video_folder), episode_trigger=lambda ep: True),
-            True,
-        )
-    return env, False
+    return (
+        gym.wrappers.RecordVideo(env, str(video_folder), episode_trigger=lambda ep: True),
+        True,
+    )
 
 
 def _write_trial_video(
@@ -210,14 +205,16 @@ def _annotated_rollout_frames(
     trial_tag: str,
 ) -> List[np.ndarray]:
     """Overlay trial id, timestep, and RTG scalar seen by the model at that frame (before get_action)."""
-    cond_rtg = getattr(model, "_condition_rtg", True)
+    if not isinstance(model, MetaDecisionTransformer):
+        raise TypeError(f"eval expects MetaDecisionTransformer, got {type(model)}")
+    cond_rtg = model._condition_rtg
     out: List[np.ndarray] = []
     for t, f in enumerate(frames):
         lines = [f"{trial_tag}  t={t}"]
         if cond_rtg and t < len(rtg_per_frame):
-            lines.append(f"RTG (model input, /return_scale)={rtg_per_frame[t]:.4f}")
+            lines.append(f"RTG: {rtg_per_frame[t]:.4f}")
         elif not cond_rtg:
-            lines.append("RTG conditioning: off")
+            lines.append("RTG: off")
         out.append(_annotate_eval_frame(f, lines))
     return out
 
@@ -261,7 +258,9 @@ def _encode_rollout_images(
     """Build (1, T, D) image embeddings from list of (primary, wrist) frames. Returns None if no encoder or no images."""
     import torch
 
-    vision_encoder = getattr(model, "vision_encoder", None)
+    if not isinstance(model, MetaDecisionTransformer):
+        raise TypeError(f"eval expects MetaDecisionTransformer, got {type(model)}")
+    vision_encoder = model.vision_encoder
     if vision_encoder is None or not image_list:
         return None
     primary_frames = []
@@ -313,6 +312,8 @@ def _run_one_rollout(
     before each get_action (model input in /scale units; rewards in prompt use same scale)."""
     import torch
 
+    if not isinstance(model, MetaDecisionTransformer):
+        raise TypeError(f"eval expects MetaDecisionTransformer, got {type(model)}")
     rtg_for_frames: List[float] = []
     obs, _ = env.reset(seed=step + ep)
     if isinstance(obs, tuple):
@@ -325,11 +326,10 @@ def _run_one_rollout(
         if frame is not None:
             frames.append(frame)
             rtg_for_frames.append(float(returns_to_go[0, -1].detach().cpu()))
-    use_vision = getattr(model, "vision_encoder", None) is not None
-    get_images = getattr(env, "get_current_images", None)
+    use_vision = model.vision_encoder is not None
     image_list: List[Tuple[Any, Any]] = []
-    if use_vision and get_images is not None:
-        prim, wrist = get_images()
+    if use_vision:
+        prim, wrist = env.get_current_images()
         image_list.append((prim, wrist))
     context_dim = model.context_dim
     states = torch.from_numpy(obs).float().reshape(1, -1).to(device)
@@ -341,7 +341,7 @@ def _run_one_rollout(
     ep_actions: List[np.ndarray] = []
     ep_rewards: List[float] = []
     ep_return = 0.0
-    ml_q = getattr(model, "max_length", None)
+    ml_q = model.max_length
     for t in range(max_episode_steps):
         rtg_snap = float(returns_to_go[0, -1].detach().cpu())
         prompt_now = prompt
@@ -405,8 +405,8 @@ def _run_one_rollout(
         else:
             next_obs, reward, done, _ = step_out[:4]
             truncated = False
-        if use_vision and get_images is not None:
-            prim, wrist = get_images()
+        if use_vision:
+            prim, wrist = env.get_current_images()
             image_list.append((prim, wrist))
         if collect_frames:
             frame = _render_rgb_frame(env)
@@ -486,6 +486,11 @@ def run_rollouts_and_save_viz(
     """
     from src.envs.libero_env import LIBERO_SUITES
 
+    if not isinstance(model, MetaDecisionTransformer):
+        raise TypeError(
+            f"run_rollouts_and_save_viz expects MetaDecisionTransformer, got {type(model)}"
+        )
+
     use_wandb_video = logger is not None and logger._wandb is not None
     # Several media logs share one W&B step; never commit=True on each video or the step advances N times.
     wb_commit_video = False
@@ -519,12 +524,11 @@ def run_rollouts_and_save_viz(
         print(f"Eval rollout: saving per-trial videos to {video_folder.resolve()}")
     elif save_video:
         video_folder.mkdir(parents=True, exist_ok=True)
-        env, video_ok = _wrap_record_video(env, video_folder)
-        if video_ok:
-            print(f"Eval rollout videos will be saved to: {video_folder.resolve()}")
-        else:
-            print("Warning: save_eval_video=true but no RecordVideo/Monitor wrapper available.")
+        env, _ = _wrap_record_video(env, video_folder)
+        print(f"Eval rollout videos will be saved to: {video_folder.resolve()}")
     all_frames_for_wandb: List[np.ndarray] = []
+
+    import torch
 
     state_mean_t = state_mean
     state_std_t = state_std
@@ -532,10 +536,10 @@ def run_rollouts_and_save_viz(
         state_mean_t = np.zeros(env.observation_space.shape[0])
     if state_std_t is None:
         state_std_t = np.ones(env.observation_space.shape[0])
-    if hasattr(state_mean_t, "numpy"):
-        state_mean_t = state_mean_t.numpy()
-    if hasattr(state_std_t, "numpy"):
-        state_std_t = state_std_t.numpy()
+    if isinstance(state_mean_t, torch.Tensor):
+        state_mean_t = state_mean_t.detach().cpu().numpy()
+    if isinstance(state_std_t, torch.Tensor):
+        state_std_t = state_std_t.detach().cpu().numpy()
     state_mean_t = np.asarray(state_mean_t, dtype=np.float32)
     state_std_t = np.asarray(state_std_t, dtype=np.float32)
 
@@ -570,8 +574,6 @@ def run_rollouts_and_save_viz(
             stats=reward_stats,
         )
 
-    import torch
-
     from src.engine.eval_context import build_prompt_tuple
     from src.engine.reward_models import get_return_from_env, get_return_from_reward_model
 
@@ -591,8 +593,8 @@ def run_rollouts_and_save_viz(
     all_states_list: List[np.ndarray] = []
     all_actions_list: List[np.ndarray] = []
 
-    state_dim = getattr(model, "state_dim", env.observation_space.shape[0])
-    act_dim = getattr(model, "act_dim", env.action_space.shape[0])
+    state_dim = model.state_dim
+    act_dim = model.act_dim
     K = eval_context_k
     total_len = total_prompt_len or 512
     max_traj_len = max_prompt_trajectory_length  # None = use full trajectory per demo
@@ -600,9 +602,10 @@ def run_rollouts_and_save_viz(
     if eval_context_mode == "zero_shot_adaptation":
         n_trials = eval_num_trials
         context_list: List[Tuple[Dict[str, np.ndarray], float]] = []
-        current_trial_k = int(K) if K is not None else int(getattr(model, "max_length", 20))
-        ml_model = getattr(model, "max_length", None)
-        cond_rtg = getattr(model, "_condition_rtg", True)
+        ml_fallback = model.max_length if model.max_length is not None else 20
+        current_trial_k = int(K) if K is not None else int(ml_fallback)
+        ml_model = model.max_length
+        cond_rtg = model._condition_rtg
         tps = 3 if cond_rtg else 2
         print(
             f"[zero_shot eval] Policy: [all completed prior trials] + "
