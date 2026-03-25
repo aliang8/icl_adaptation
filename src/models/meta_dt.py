@@ -132,6 +132,7 @@ class MetaDecisionTransformer(nn.Module):
         pred_actions_full = self.predict_action(hidden[:, action_index])
         pred_actions = pred_actions_full[:, -T:, :]
 
+        # Action MSE uses attention_mask / prompt_attention_mask: 0 = padded (no loss), 1 = valid.
         if self.query_loss_only:
             loss = self.compute_loss(pred_actions, batch.actions, mask)
         else:
@@ -286,12 +287,23 @@ class MetaDecisionTransformer(nn.Module):
         return x
 
     def compute_loss(self, pred_actions: Tensor, actions: Tensor, mask: Tensor) -> Optional[Tensor]:
-        """MSE on actions at valid (masked) positions."""
+        """MSE on actions; only timesteps with mask > 0 (valid data) contribute to the mean.
+
+        Padded query prefix and padded prompt slots use mask 0 in the dataset/collate, so they
+        are excluded here. Padded values must not appear in the reduced loss.
+        """
         if pred_actions is None or actions is None:
             return None
+        if pred_actions.shape[:2] != actions.shape[:2] or pred_actions.shape[:2] != mask.shape[:2]:
+            raise ValueError(
+                "compute_loss: pred_actions, actions, and mask must align on [batch, time]; "
+                f"got pred {tuple(pred_actions.shape)}, actions {tuple(actions.shape)}, "
+                f"mask {tuple(mask.shape)}"
+            )
         act_dim = pred_actions.shape[-1]
-        pred_flat = pred_actions.reshape(-1, act_dim)[mask.reshape(-1) > 0]
-        target_flat = actions.reshape(-1, act_dim)[mask.reshape(-1) > 0]
+        valid = (mask > 0).reshape(-1)
+        pred_flat = pred_actions.reshape(-1, act_dim)[valid]
+        target_flat = actions.reshape(-1, act_dim)[valid]
         if pred_flat.numel() == 0:
             return None
         return torch.nn.functional.mse_loss(pred_flat, target_flat)

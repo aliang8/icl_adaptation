@@ -14,33 +14,52 @@ import torch
 from src.data.trajectories import discount_cumsum, sort_trajectories_by_return
 
 
+def _subsample_indices(length: int, cap: Optional[int], strategy: str) -> np.ndarray:
+    """Select ordered indices from [0, length) according to strategy."""
+    if length <= 0:
+        return np.zeros(0, dtype=np.int64)
+    if strategy == "none":
+        return np.arange(length, dtype=np.int64)
+    if cap is None or cap <= 0 or length <= cap:
+        return np.arange(length, dtype=np.int64)
+    if strategy == "last":
+        return np.arange(length - cap, length, dtype=np.int64)
+    if strategy == "uniform":
+        return np.linspace(0, length - 1, num=cap, dtype=np.int64)
+    if strategy == "random":
+        idx = np.sort(np.random.choice(length, size=cap, replace=False))
+        return idx.astype(np.int64)
+    raise ValueError(
+        f"Unsupported context_subsample_strategy='{strategy}'. "
+        "Use one of: none, last, uniform, random."
+    )
+
+
 def _prompt_segment_from_traj(
     traj: Dict[str, np.ndarray],
     state_mean: np.ndarray,
     state_std: np.ndarray,
     scale: float,
     max_prompt_trajectory_length: Optional[int],
+    context_subsample_strategy: str,
     state_dim: int,
     act_dim: int,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """One trajectory as prompt segment (last max_prompt_trajectory_length steps). Timesteps independent per trajectory: start..start+T."""
+    """One trajectory as prompt segment with optional per-trajectory subsampling."""
     T = traj["rewards"].shape[0]
     if T == 0:
         raise ValueError("Empty trajectory")
-    cap = max_prompt_trajectory_length
-    if cap is not None and T > cap:
-        start = T - cap
-        T = cap
-    else:
-        start = 0
     obs = np.asarray(traj["observations"], dtype=np.float32)
     act = np.asarray(traj["actions"], dtype=np.float32)
     rew = np.asarray(traj["rewards"], dtype=np.float32)
-    ps = (obs[start : start + T] - state_mean) / state_std
-    pa = act[start : start + T]
-    pr = rew[start : start + T].reshape(-1, 1)
-    prtg = discount_cumsum(rew[start:], gamma=1.0)[:T].reshape(-1, 1) / scale
-    pts = np.arange(start, start + T, dtype=np.float32)
+    idx = _subsample_indices(T, max_prompt_trajectory_length, context_subsample_strategy)
+    full_rtg = discount_cumsum(rew, gamma=1.0).reshape(-1, 1)
+    ps = (obs[idx] - state_mean) / state_std
+    pa = act[idx]
+    pr = rew[idx].reshape(-1, 1)
+    prtg = full_rtg[idx] / scale
+    pts = idx.astype(np.float32)
+    T = idx.shape[0]
     pm = np.ones(T, dtype=np.float32)
     return ps, pa, pr, prtg, pts, pm
 
@@ -57,6 +76,11 @@ def _pad_or_trim_prompt(
     act_dim: int,
     take_last: bool,
 ) -> Tuple[np.ndarray, ...]:
+    """
+    If shorter than total_plen: **left-pad** so valid prompt timesteps are **right-aligned**
+    (abutting the query segment), matching training collate. If longer: trim from start (take_last)
+    or from end (not take_last).
+    """
     if ps.shape[0] >= total_plen:
         if take_last:
             ps, pa, pr, prtg, pts, pm = (
@@ -99,12 +123,16 @@ def build_prompt_tuple(
     device: torch.device,
     sort_ascending: bool = True,
     trajectory_returns: Optional[List[float]] = None,
+    context_subsample_strategy: str = "none",
 ) -> Optional[Tuple[torch.Tensor, ...]]:
     """
     Build the 6-tuple (prompt_states, prompt_actions, prompt_rewards, prompt_rtg, prompt_timesteps, prompt_mask)
     from K trajectories, sorted by return (ascending = worst first, like training context).
     If trajectory_returns is provided (same length as trajectories), sort by those instead of sum(rewards).
     Returns None if trajectories is empty.
+
+    Uses take_last=True when trimming/padding: short prompts are **left-padded** so real tokens sit at the
+    end next to the query (same as training _pad_or_trim_prompt with take_last=True).
     """
     if not trajectories:
         return None
@@ -123,6 +151,7 @@ def build_prompt_tuple(
             state_std,
             scale,
             max_prompt_trajectory_length,
+            context_subsample_strategy,
             state_dim,
             act_dim,
         )

@@ -23,7 +23,7 @@ use_language: false
 num_views: 2
 image_embed_dim: 256
 # ICRT-style: only compute action loss on query segment (default true)
-query_loss_only: true
+query_loss_only: false
 # Heads / inputs (match schema + build_model common dict)
 predict_returns: false
 predict_state: false

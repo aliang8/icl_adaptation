@@ -167,6 +167,7 @@ def _print_dataset_stats(
     max_pt = dataset.max_prompt_trajectory_length
     if max_pt is not None:
         table.add_row("Max prompt trajectory length", str(max_pt))
+        table.add_row("Context subsample strategy", str(dataset.context_subsample_strategy))
     table.add_row("Total prompt length", str(dataset.total_prompt_len))
     table.add_row("Use vision", "yes" if use_vision else "no")
     table.add_row("Image keys (config)", ", ".join(image_keys) if image_keys else "—")
@@ -752,10 +753,12 @@ def main():
             scale=data_cfg.return_scale,
             total_epi_per_task=max(1, len(trajectories) // max(1, data_cfg.num_train_tasks)),
             num_context_trajectories=data_cfg.num_context_trajectories,
+            randomize_num_context_trajectories=data_cfg.randomize_num_context_trajectories,
             context_sort_ascending=data_cfg.context_sort_ascending,
             context_sampling=data_cfg.context_sampling,
             max_total_prompt_length=data_cfg.max_total_prompt_length,
             max_prompt_trajectory_length=data_cfg.max_prompt_trajectory_length,
+            context_subsample_strategy=data_cfg.context_subsample_strategy,
             context_style=data_cfg.context_style,
             lazy_dataset=data_cfg.lazy_dataset,
             max_training_examples=data_cfg.max_training_examples,
@@ -904,6 +907,7 @@ def main():
                     eval_reward_model=cfg.experiment.eval_reward_model,
                     total_prompt_len=dataset.total_prompt_len,
                     max_prompt_trajectory_length=dataset.max_prompt_trajectory_length,
+                    context_subsample_strategy=dataset.context_subsample_strategy,
                     task_description=task_desc,
                     logger=logger,
                     eval_render_both_views=eval_render_both_views,

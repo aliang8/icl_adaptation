@@ -22,6 +22,27 @@ from src.data.trajectories import discount_cumsum, sample_context_trajectories
 PromptArrays = Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]
 
 
+def _subsample_indices(length: int, cap: Optional[int], strategy: str) -> np.ndarray:
+    """Select ordered indices from [0, length) according to strategy."""
+    if length <= 0:
+        return np.zeros(0, dtype=np.int64)
+    if strategy == "none":
+        return np.arange(length, dtype=np.int64)
+    if cap is None or cap <= 0 or length <= cap:
+        return np.arange(length, dtype=np.int64)
+    if strategy == "last":
+        return np.arange(length - cap, length, dtype=np.int64)
+    if strategy == "uniform":
+        return np.linspace(0, length - 1, num=cap, dtype=np.int64)
+    if strategy == "random":
+        idx = np.sort(np.random.choice(length, size=cap, replace=False))
+        return idx.astype(np.int64)
+    raise ValueError(
+        f"Unsupported context_subsample_strategy='{strategy}'. "
+        "Use one of: none, last, uniform, random."
+    )
+
+
 def _pad_or_trim_prompt(
     ps: np.ndarray,
     pa: np.ndarray,
@@ -85,6 +106,7 @@ class ICLTrajectoryDatasetBase(Dataset, ABC):
         scale: float = 500.0,
         total_epi_per_task: int = 100,
         num_context_trajectories: int = 1,
+        randomize_num_context_trajectories: bool = False,
         context_sort_ascending: bool = True,
         context_sampling: str = "random",
         trajectory_contexts: Optional[Dict[int, np.ndarray]] = None,
@@ -95,6 +117,7 @@ class ICLTrajectoryDatasetBase(Dataset, ABC):
         query_history_length: Optional[int] = None,
         use_vision: bool = False,
         image_keys: Optional[List[str]] = None,
+        context_subsample_strategy: str = "none",
         **kwargs: Any,
     ):
         self.trajectories = trajectories
@@ -113,12 +136,19 @@ class ICLTrajectoryDatasetBase(Dataset, ABC):
         self.scale = scale
         self.total_epi_per_task = total_epi_per_task
         self.num_context_trajectories = num_context_trajectories
+        self.randomize_num_context_trajectories = randomize_num_context_trajectories
+        if randomize_num_context_trajectories:
+            log.info(
+                "Training with random prior count m ~ Uniform{{0..{}}} context trajectories per sample",
+                num_context_trajectories,
+            )
         self.context_sort_ascending = context_sort_ascending
         self.context_sampling = context_sampling
         self.trajectory_contexts = trajectory_contexts or {}
         self.task_instructions = task_instructions
         self.prompt_length = None
         self.max_prompt_trajectory_length = None
+        self.context_subsample_strategy = context_subsample_strategy
         self._lazy = lazy_dataset
         self._max_examples = max_training_examples if lazy_dataset else None
         self._seed = seed
@@ -132,6 +162,31 @@ class ICLTrajectoryDatasetBase(Dataset, ABC):
         self.return_min = float(returns.min())
         self.return_max = float(returns.max())
         self.return_avg = float(returns.mean())
+
+    def _sample_num_context_trajectories(self) -> int:
+        """Max prior count N = num_context_trajectories; m in {0..N} when randomize, else always N."""
+        n = self.num_context_trajectories
+        if n <= 0:
+            return 0
+        if not self.randomize_num_context_trajectories:
+            return n
+        return random.randint(0, n)
+
+    def _choose_context_trajectories(
+        self, prompt_list: List[Dict[str, np.ndarray]], query_traj: Dict[str, np.ndarray]
+    ) -> List[Dict[str, np.ndarray]]:
+        """Prior demos for the prompt; [] if m=0 or no pool; [query_traj] only when pool is empty (legacy)."""
+        if not prompt_list:
+            return [query_traj]
+        m = self._sample_num_context_trajectories()
+        if m <= 0:
+            return []
+        return sample_context_trajectories(
+            prompt_list,
+            m,
+            ascending=self.context_sort_ascending,
+            sampling=self.context_sampling,
+        )
 
     @abstractmethod
     def _build_prompt(
@@ -223,16 +278,7 @@ class ICLTrajectoryDatasetBase(Dataset, ABC):
             traj_contexts = np.zeros(
                 (len(traj["observations"]), self.context_dim), dtype=np.float32
             )
-        chosen = (
-            sample_context_trajectories(
-                prompt_list,
-                self.num_context_trajectories,
-                ascending=self.context_sort_ascending,
-                sampling=self.context_sampling,
-            )
-            if prompt_list and self.num_context_trajectories >= 1
-            else [traj]
-        )
+        chosen = self._choose_context_trajectories(prompt_list, traj)
         self._log_prompt_context_returns_sample(chosen, traj_idx, si)
         ps, pa, pr, prtg, pts, pm = self._build_prompt(
             chosen, self.state_mean, self.state_std, self.total_prompt_len
@@ -309,15 +355,7 @@ class ICLTrajectoryDatasetBase(Dataset, ABC):
                 )
 
             for si in range(traj["rewards"].shape[0] - 1):
-                if prompt_list and self.num_context_trajectories >= 1:
-                    chosen = sample_context_trajectories(
-                        prompt_list,
-                        self.num_context_trajectories,
-                        ascending=self.context_sort_ascending,
-                        sampling=self.context_sampling,
-                    )
-                else:
-                    chosen = [traj]
+                chosen = self._choose_context_trajectories(prompt_list, traj)
                 self._log_prompt_context_returns_sample(chosen, num, si)
                 ps, pa, pr, prtg, pts, pm = self._build_prompt(
                     chosen, state_mean, state_std, total_plen
@@ -570,6 +608,16 @@ class SubsampledICLTrajectoryDataset(ICLTrajectoryDatasetBase):
         state_std: np.ndarray,
         total_plen: int,
     ) -> PromptArrays:
+        if not chosen:
+            z = np.zeros((0, self.state_dim), dtype=np.float32)
+            az = np.ones((0, self.act_dim), dtype=np.float32) * (-10.0)
+            rz = np.zeros((0, 1), dtype=np.float32)
+            rtz = np.zeros((0, 1), dtype=np.float32)
+            tz = np.zeros(0, dtype=np.float32)
+            mz = np.zeros(0, dtype=np.float32)
+            return _pad_or_trim_prompt(
+                z, az, rz, rtz, tz, mz, total_plen, self.state_dim, self.act_dim, take_last=False
+            )
         segs_ps, segs_pa, segs_pr, segs_prtg, segs_pts, segs_pm = [], [], [], [], [], []
         for traj in chosen:
             s, a, r, rtg_, ts, m = self._segment_from_traj(traj, state_mean, state_std)
@@ -660,21 +708,21 @@ class FullTrajectoryICLTrajectoryDataset(ICLTrajectoryDatasetBase):
         state_mean: np.ndarray,
         state_std: np.ndarray,
     ) -> PromptArrays:
-        """Full trajectory arrays; capped to last max_prompt_trajectory_length steps when set. Timesteps independent per trajectory: start..start+T."""
+        """Full trajectory arrays with optional per-trajectory subsampling cap."""
         T = traj["rewards"].shape[0]
         if T == 0:
             raise ValueError("Empty trajectory in _prompt_from_full_trajectory")
-        cap = self.max_prompt_trajectory_length
-        if cap is not None and T > cap:
-            start = T - cap
-            T = cap
-        else:
-            start = 0
-        ps = (traj["observations"][start : start + T] - state_mean) / state_std
-        pa = traj["actions"][start : start + T]
-        pr = traj["rewards"][start : start + T].reshape(-1, 1)
-        prtg = discount_cumsum(traj["rewards"][start:], gamma=1.0)[:T].reshape(-1, 1) / self.scale
-        pts = np.arange(start, start + T, dtype=np.float32)
+        idx = _subsample_indices(T, self.max_prompt_trajectory_length, self.context_subsample_strategy)
+        obs = np.asarray(traj["observations"], dtype=np.float32)
+        act = np.asarray(traj["actions"], dtype=np.float32)
+        rew = np.asarray(traj["rewards"], dtype=np.float32)
+        full_rtg = discount_cumsum(rew, gamma=1.0).reshape(-1, 1)
+        ps = (obs[idx] - state_mean) / state_std
+        pa = act[idx]
+        pr = rew[idx].reshape(-1, 1)
+        prtg = full_rtg[idx] / self.scale
+        pts = idx.astype(np.float32)
+        T = idx.shape[0]
         pm = np.ones(T, dtype=np.float32)
         return ps, pa, pr, prtg, pts, pm
 
@@ -685,6 +733,16 @@ class FullTrajectoryICLTrajectoryDataset(ICLTrajectoryDatasetBase):
         state_std: np.ndarray,
         total_plen: int,
     ) -> PromptArrays:
+        if not chosen:
+            z = np.zeros((0, self.state_dim), dtype=np.float32)
+            az = np.ones((0, self.act_dim), dtype=np.float32) * (-10.0)
+            rz = np.zeros((0, 1), dtype=np.float32)
+            rtz = np.zeros((0, 1), dtype=np.float32)
+            tz = np.zeros(0, dtype=np.float32)
+            mz = np.zeros(0, dtype=np.float32)
+            return _pad_or_trim_prompt(
+                z, az, rz, rtz, tz, mz, total_plen, self.state_dim, self.act_dim, take_last=True
+            )
         segs_ps, segs_pa, segs_pr, segs_prtg, segs_pts, segs_pm = [], [], [], [], [], []
         for traj in chosen:
             s, a, r, rtg_, ts, m = self._prompt_from_full_trajectory(traj, state_mean, state_std)

@@ -82,11 +82,15 @@ class DataConfig:
     context_dim: int = 16
     context_hidden_dim: int = 128
     num_context_trajectories: int = 1
+    # If true, each sample uses m ~ Uniform{0..N} prior demos (N=num_context_trajectories); query window unchanged.
+    randomize_num_context_trajectories: bool = True
     context_sort_ascending: bool = True
     context_sampling: str = "random"
     max_total_prompt_length: Optional[int] = None
     # full_trajectory: None = use full trajectory per demo; int = cap each context demo to last N steps
     max_prompt_trajectory_length: Optional[int] = None
+    # How to subsample each context trajectory: "none" (full trajectory) | "last" | "uniform" | "random"
+    context_subsample_strategy: str = "none"
     # "subsampled" = prompt_length steps per context traj; "full_trajectory" = full traj per demo (capped per traj, then total)
     context_style: str = "subsampled"
     lazy_dataset: bool = True

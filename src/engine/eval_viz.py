@@ -184,17 +184,41 @@ def _write_frames_video(
     writer.close()
 
 
-def _add_trial_text(frame: np.ndarray, label: str, y_offset: int = 18) -> np.ndarray:
-    """Draw label on frame (copy). Requires cv2. y_offset is vertical position from top."""
+def _annotate_eval_frame(frame: np.ndarray, lines: List[str]) -> np.ndarray:
+    """Draw multiple lines (white stroke + black fill) on frame copy. Requires cv2."""
     import cv2
 
     out = np.asarray(frame).copy()
     h, w = out.shape[:2]
     font = cv2.FONT_HERSHEY_SIMPLEX
-    scale = max(0.5, min(w, h) / 400.0)
-    thick = max(1, int(scale * 2))
-    cv2.putText(out, label, (10, y_offset), font, scale, (255, 255, 255), thick, cv2.LINE_AA)
-    cv2.putText(out, label, (10, y_offset), font, scale, (0, 0, 0), max(1, thick - 1), cv2.LINE_AA)
+    sc = max(0.45, min(w, h) / 480.0)
+    thick = max(1, int(sc * 2))
+    y = int(18 * sc + 12)
+    for line in lines:
+        if not line:
+            continue
+        cv2.putText(out, line, (10, y), font, sc, (255, 255, 255), thick, cv2.LINE_AA)
+        cv2.putText(out, line, (10, y), font, sc, (0, 0, 0), max(1, thick - 1), cv2.LINE_AA)
+        y += int(24 * sc + 10)
+    return out
+
+
+def _annotated_rollout_frames(
+    model: Any,
+    frames: List[np.ndarray],
+    rtg_per_frame: List[float],
+    trial_tag: str,
+) -> List[np.ndarray]:
+    """Overlay trial id, timestep, and RTG scalar seen by the model at that frame (before get_action)."""
+    cond_rtg = getattr(model, "_condition_rtg", True)
+    out: List[np.ndarray] = []
+    for t, f in enumerate(frames):
+        lines = [f"{trial_tag}  t={t}"]
+        if cond_rtg and t < len(rtg_per_frame):
+            lines.append(f"RTG (model input, /return_scale)={rtg_per_frame[t]:.4f}")
+        elif not cond_rtg:
+            lines.append("RTG conditioning: off")
+        out.append(_annotate_eval_frame(f, lines))
     return out
 
 
@@ -284,10 +308,12 @@ def _run_one_rollout(
             Tuple[Optional[Tuple[Any, ...]], Dict[str, Any]],
         ]
     ] = None,
-) -> Tuple[float, int, np.ndarray, np.ndarray, Dict[str, np.ndarray], List[np.ndarray]]:
-    """Run one episode; return (return, length, states, actions, trajectory_dict, frames)."""
+) -> Tuple[float, int, np.ndarray, np.ndarray, Dict[str, np.ndarray], List[np.ndarray], List[float]]:
+    """Run one episode. Returns frames and rtg_for_frames (same length): RTG scalar at query tail
+    before each get_action (model input in /scale units; rewards in prompt use same scale)."""
     import torch
 
+    rtg_for_frames: List[float] = []
     obs, _ = env.reset(seed=step + ep)
     if isinstance(obs, tuple):
         obs = obs[0]
@@ -296,6 +322,7 @@ def _run_one_rollout(
         frame = _render_rgb_frame(env)
         if frame is not None:
             frames.append(frame)
+            rtg_for_frames.append(float(returns_to_go[0, -1].detach().cpu()))
     use_vision = getattr(model, "vision_encoder", None) is not None
     get_images = getattr(env, "get_current_images", None)
     image_list: List[Tuple[Any, Any]] = []
@@ -315,6 +342,7 @@ def _run_one_rollout(
     ep_return = 0.0
     ml_q = getattr(model, "max_length", None)
     for t in range(max_episode_steps):
+        rtg_snap = float(returns_to_go[0, -1].detach().cpu())
         prompt_now = prompt
         prompt_meta: Dict[str, Any] = {"mode": "static", "prev_trials": 0, "current_trial_steps": 0}
         if prompt_builder is not None:
@@ -383,6 +411,7 @@ def _run_one_rollout(
             frame = _render_rgb_frame(env)
             if frame is not None:
                 frames.append(frame)
+                rtg_for_frames.append(rtg_snap)
         if isinstance(next_obs, tuple):
             next_obs = next_obs[0]
         r_env = float(reward)
@@ -414,6 +443,7 @@ def _run_one_rollout(
         np.array(ep_actions),
         traj_dict,
         frames,
+        rtg_for_frames,
     )
 
 
@@ -437,6 +467,7 @@ def run_rollouts_and_save_viz(
     eval_reward_model: Optional[str] = None,
     total_prompt_len: Optional[int] = None,
     max_prompt_trajectory_length: Optional[int] = None,
+    context_subsample_strategy: str = "none",
     task_description: Optional[str] = None,
     logger: Optional[Any] = None,
     eval_render_both_views: bool = True,
@@ -576,7 +607,9 @@ def run_rollouts_and_save_viz(
             f"[zero_shot eval] Policy: [all completed prior trials] + "
             f"[last {current_trial_k} env steps of current trial]. "
             f"total_prompt_cap={total_len} max_prompt_traj_len={max_traj_len} "
-            f"query_pad_max_length={ml_model} tokens_per_dt_step={tps}",
+            f"context_subsample_strategy={context_subsample_strategy} "
+            f"query_pad_max_length={ml_model} tokens_per_dt_step={tps}. "
+            f"Prompt tensor: left-pad, valid prompt timesteps right-aligned with query (matches train).",
             flush=True,
         )
         for trial in range(n_trials):
@@ -646,6 +679,7 @@ def run_rollouts_and_save_viz(
                     device,
                     sort_ascending=True,
                     trajectory_returns=rets or None,
+                    context_subsample_strategy=context_subsample_strategy,
                 )
                 pt = int(prompt_dyn[0].shape[1])
                 meta["prompt_timesteps_in_model"] = pt
@@ -668,7 +702,7 @@ def run_rollouts_and_save_viz(
                 max_episode_steps=max_episode_steps,
                 tag=f"zero_shot trial {trial} / step {step} (prompt length varies during rollout)",
             )
-            ep_return, length, S, A, traj_dict, frames = _run_one_rollout(
+            ep_return, length, S, A, traj_dict, frames, rtg_ff = _run_one_rollout(
                 model,
                 env,
                 state_mean_t,
@@ -696,9 +730,9 @@ def run_rollouts_and_save_viz(
             all_states_list.append(S)
             all_actions_list.append(A)
             if collect_frames and frames:
-                _write_trial_video(video_folder, trial, frames)
-                for t, f in enumerate(frames):
-                    all_frames_for_wandb.append(_add_trial_text(f, f"Trial {trial + 1}  t={t}"))
+                ann = _annotated_rollout_frames(model, frames, rtg_ff, f"Trial {trial + 1}")
+                _write_trial_video(video_folder, trial, ann)
+                all_frames_for_wandb.extend(ann)
     elif eval_context_mode == "prompt" and prompt_trajectories:
         prompt = build_prompt_tuple(
             prompt_trajectories,
@@ -711,6 +745,7 @@ def run_rollouts_and_save_viz(
             scale,
             device,
             sort_ascending=True,
+            context_subsample_strategy=context_subsample_strategy,
         )
         _log_eval_transformer_seq(
             model,
@@ -720,7 +755,7 @@ def run_rollouts_and_save_viz(
             tag=f"prompt mode step {step}",
         )
         for ep in range(num_rollouts):
-            ep_return, length, S, A, _, frames = _run_one_rollout(
+            ep_return, length, S, A, _, frames, rtg_ff = _run_one_rollout(
                 model,
                 env,
                 state_mean_t,
@@ -740,9 +775,9 @@ def run_rollouts_and_save_viz(
             all_states_list.append(S)
             all_actions_list.append(A)
             if collect_frames and frames:
-                _write_trial_video(video_folder, ep, frames)
-                for t, f in enumerate(frames):
-                    all_frames_for_wandb.append(_add_trial_text(f, f"Trial {ep + 1}  t={t}"))
+                ann = _annotated_rollout_frames(model, frames, rtg_ff, f"Trial {ep + 1}")
+                _write_trial_video(video_folder, ep, ann)
+                all_frames_for_wandb.extend(ann)
     else:
         if num_rollouts > 0:
             _log_eval_transformer_seq(
@@ -753,7 +788,7 @@ def run_rollouts_and_save_viz(
                 tag=f"no prompt step {step}",
             )
         for ep in range(num_rollouts):
-            ep_return, length, S, A, _, frames = _run_one_rollout(
+            ep_return, length, S, A, _, frames, rtg_ff = _run_one_rollout(
                 model,
                 env,
                 state_mean_t,
@@ -773,9 +808,9 @@ def run_rollouts_and_save_viz(
             all_states_list.append(S)
             all_actions_list.append(A)
             if collect_frames and frames:
-                _write_trial_video(video_folder, ep, frames)
-                for t, f in enumerate(frames):
-                    all_frames_for_wandb.append(_add_trial_text(f, f"Trial {ep + 1}  t={t}"))
+                ann = _annotated_rollout_frames(model, frames, rtg_ff, f"Trial {ep + 1}")
+                _write_trial_video(video_folder, ep, ann)
+                all_frames_for_wandb.extend(ann)
 
     env.close()
     # Save combined video (all trials with labels) and each trial separately; then log to wandb
