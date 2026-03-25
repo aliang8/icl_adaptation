@@ -193,6 +193,8 @@ ENV_DIMS = {
     "ICRT-MT": (8, 8),  # proprio (e.g. 3+1 or 6+1), action same
     "WalkerRandParams-v0": (17, 6),
     "HopperRandParams-v0": (11, 3),
+    # Placeholder; train overwrites from first trajectory after V-D4RL load
+    "VD4RL": (768, 6),
 }
 for _suite in LIBERO_SUITES:
     ENV_DIMS[_suite] = (9, 7)  # LIBERO proprio 9, action 7
@@ -242,6 +244,23 @@ def validate_dataset_paths(env_name: str, paths, data_cfg) -> None:
         log.info("ICRT-MT dataset config found: {}", config_path)
     elif env_name in LIBERO_SUITES:
         log.info("LIBERO: dataset at data_dir/LIBERO-Cosmos-Policy/data/ (episode_index)")
+    elif env_name == "VD4RL":
+        p = (
+            paths.data_root
+            / data_cfg.vd4rl_suite
+            / data_cfg.vd4rl_task
+            / data_cfg.vd4rl_split
+            / data_cfg.vd4rl_pixel_size
+        )
+        if not p.is_dir():
+            raise FileNotFoundError(
+                f"V-D4RL npz directory not found: {p}\n"
+                "Download datasets from the Google Drive linked in "
+                "https://github.com/conglu1997/v-d4rl and point paths.data_root at the parent "
+                f"of `{data_cfg.vd4rl_suite}/` (expected layout: "
+                f".../{data_cfg.vd4rl_task}/{data_cfg.vd4rl_split}/{data_cfg.vd4rl_pixel_size}/*.npz)."
+            )
+        log.info("V-D4RL data directory found: {}", p)
 
 
 def build_model(cfg, state_dim: int, action_dim: int, num_instructions: Optional[int] = None):
@@ -709,6 +728,35 @@ def main():
             action_dim,
         )
 
+    if env_name == "VD4RL":
+        from src.data.vd4rl_loader import load_vd4rl_npz_trajectories
+
+        vd4rl_dir = (
+            paths.data_root
+            / data_cfg.vd4rl_suite
+            / data_cfg.vd4rl_task
+            / data_cfg.vd4rl_split
+            / data_cfg.vd4rl_pixel_size
+        )
+        trajectories, prompt_per_task = load_vd4rl_npz_trajectories(
+            str(vd4rl_dir),
+            max_episodes=data_cfg.vd4rl_max_episodes,
+            obs_downsample=int(data_cfg.vd4rl_obs_downsample),
+            store_images=bool(data_cfg.use_vision),
+            shuffle=bool(data_cfg.vd4rl_shuffle_npz_order),
+            seed=int(data_cfg.seed),
+        )
+        if trajectories:
+            state_dim = int(trajectories[0]["observations"].shape[1])
+            action_dim = int(trajectories[0]["actions"].shape[1])
+            log.info(
+                "VD4RL: inferred state_dim={}, action_dim={} (set model dims to match)",
+                state_dim,
+                action_dim,
+            )
+        else:
+            log.error("VD4RL: no trajectories loaded from {}", vd4rl_dir)
+
     in_context_result = None
     if env_name in LIBERO_SUITES:
         import src.data.libero_dataset
@@ -800,6 +848,30 @@ def main():
         proprio_keys=data_cfg.proprio_keys or [],
         use_vision=data_cfg.use_vision,
     )
+
+    if bool(cfg.experiment.save_training_sample_videos):
+        from src.engine.training_debug_viz import save_training_sample_videos
+
+        trs = getattr(dataset, "trajectories", None)
+        has_images = bool(
+            data_cfg.use_vision
+            or (
+                trs
+                and any(isinstance(t, dict) and t.get("images") for t in trs[: min(32, len(trs))])
+            )
+        )
+        if has_images:
+            save_training_sample_videos(
+                Path(run_dir),
+                dataset,
+                return_scale=float(data_cfg.return_scale),
+                num_clips=int(cfg.experiment.num_training_sample_videos),
+                fps=int(cfg.experiment.training_sample_video_fps),
+            )
+        else:
+            log.info(
+                "experiment.save_training_sample_videos=true but no trajectory images; skipping debug MP4s."
+            )
 
     num_instructions = len(dataset.task_instructions) if dataset.task_instructions else None
     model = build_model(cfg, state_dim, action_dim, num_instructions=num_instructions).to(device)

@@ -118,6 +118,14 @@ class DataConfig:
     reward_norm_constant: float = 1.0
     reward_norm_epsilon: float = 1e-8
     reward_normalization_stats_path: Optional[str] = None
+    # V-D4RL (https://github.com/conglu1997/v-d4rl): npz under data_root / suite / task / split / pixel_size
+    vd4rl_suite: str = "main"
+    vd4rl_task: str = "walker_walk"
+    vd4rl_split: str = "random"
+    vd4rl_pixel_size: str = "64px"
+    vd4rl_max_episodes: Optional[int] = None
+    vd4rl_obs_downsample: int = 16
+    vd4rl_shuffle_npz_order: bool = False
 
 
 @dataclass
@@ -206,6 +214,10 @@ class ExperimentConfig:
     best_metric_mode: str = "max"  # max or min
     # export
     export_final: bool = True
+    # Vision / image datasets: save MP4s of query windows + RTG/mask at train start (run_dir/viz/training_sample_debug/)
+    save_training_sample_videos: bool = True
+    num_training_sample_videos: int = 3
+    training_sample_video_fps: int = 8
 
 
 @dataclass

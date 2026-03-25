@@ -318,6 +318,8 @@ def _run_one_rollout(
     if isinstance(obs, tuple):
         obs = obs[0]
     frames: List[np.ndarray] = []
+    # Initialize RTG early so debug video collection at t=0 can record it.
+    returns_to_go = torch.tensor([[scale]], device=device)
     if collect_frames:
         frame = _render_rgb_frame(env)
         if frame is not None:
@@ -334,7 +336,6 @@ def _run_one_rollout(
     contexts = torch.zeros(1, context_dim, device=device)
     actions_t = torch.zeros(0, model.act_dim, device=device)
     rewards_t = torch.zeros(0, device=device)
-    returns_to_go = torch.tensor([[scale]], device=device)
     timesteps = torch.zeros(1, 1, dtype=torch.long, device=device)
     ep_states = [obs.copy()]
     ep_actions: List[np.ndarray] = []

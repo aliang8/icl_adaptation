@@ -1,0 +1,15 @@
+# Vision-only DT for V-D4RL (single camera, no language).
+# state_dim must match data.vd4rl_obs_downsample ** 2 * 3 (default 16 -> 768).
+# act_dim: 6 for walker_walk / cheetah_run; set 17 for humanoid_walk if you use that task.
+defaults:
+  - vla_dt
+
+state_dim: 768
+act_dim: 6
+use_language: false
+use_language_input: false
+num_views: 1
+max_length: 20
+max_ep_len: 2048
+n_positions: 8192
+vision_proprio_attention_fusion: true

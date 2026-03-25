@@ -20,3 +20,7 @@ save_periodic_every_steps: 25000
 best_metric_name: eval/return_mean
 best_metric_mode: max
 export_final: true
+# Image datasets: MP4s under run_dir/viz/training_sample_debug/ at train start
+save_training_sample_videos: true
+num_training_sample_videos: 3
+training_sample_video_fps: 8
