@@ -9,7 +9,11 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
-from src.data.reward_normalization import load_stats, normalize_reward_scalar
+from src.data.reward_normalization import (
+    initial_rtg_token,
+    load_stats,
+    normalize_reward_scalar,
+)
 from src.models.meta_dt import MetaDecisionTransformer
 
 # Dataset / config may use D4RL-era ids (e.g. HalfCheetah-v2). Core Gymnasium only registers
@@ -77,11 +81,30 @@ def _try_make_env(
     env_name: str,
     render_both_views: bool = True,
     render_mode: Optional[str] = None,
+    *,
+    vd4rl_eval_pixel_hw: Optional[int] = None,
+    vd4rl_eval_obs_downsample: Optional[int] = None,
+    vd4rl_eval_seed: int = 0,
 ):
     """Create env: LIBERO suite (libero_10, ...) via make_libero_env, else Gymnasium/gym. Returns None if env or deps missing.
     render_both_views is only used for LIBERO (primary + wrist); Gymnasium envs have a single camera.
     """
     from src.envs.libero_env import LIBERO_SUITES, make_libero_env
+
+    if env_name.startswith("VD4RL/dmc/"):
+        from src.envs.vd4rl_eval_env import make_vd4rl_dm_control_pixel_env
+
+        if vd4rl_eval_pixel_hw is None or vd4rl_eval_obs_downsample is None:
+            raise ValueError(
+                f"Env {env_name!r} requires data.vd4rl_pixel_size and data.vd4rl_obs_downsample "
+                "(passed as vd4rl_eval_pixel_hw / vd4rl_eval_obs_downsample from train)."
+            )
+        return make_vd4rl_dm_control_pixel_env(
+            env_name,
+            pixel_hw=int(vd4rl_eval_pixel_hw),
+            obs_downsample=int(vd4rl_eval_obs_downsample),
+            seed=int(vd4rl_eval_seed),
+        )
 
     if env_name in LIBERO_SUITES:
         return make_libero_env(
@@ -212,7 +235,8 @@ def _annotated_rollout_frames(
     for t, f in enumerate(frames):
         lines = [f"{trial_tag}  t={t}"]
         if cond_rtg and t < len(rtg_per_frame):
-            lines.append(f"RTG: {rtg_per_frame[t]:.4f}")
+            # Same units as training: future_return / return_scale (O(1)), not raw env return.
+            lines.append(f"RTG (norm): {rtg_per_frame[t]:.4f}")
         elif not cond_rtg:
             lines.append("RTG: off")
         out.append(_annotate_eval_frame(f, lines))
@@ -293,7 +317,7 @@ def _run_one_rollout(
     state_mean_t: np.ndarray,
     state_std_t: np.ndarray,
     device: Any,
-    scale: float,
+    return_scale: float,
     max_episode_steps: int,
     step: int,
     ep: int,
@@ -307,9 +331,18 @@ def _run_one_rollout(
             Tuple[Optional[Tuple[Any, ...]], Dict[str, Any]],
         ]
     ] = None,
+    target_future_normalized_return_sum: Optional[float] = None,
 ) -> Tuple[float, int, np.ndarray, np.ndarray, Dict[str, np.ndarray], List[np.ndarray], List[float]]:
-    """Run one episode. Returns frames and rtg_for_frames (same length): RTG scalar at query tail
-    before each get_action (model input in /scale units; rewards in prompt use same scale)."""
+    """Run one episode. Returns frames and rtg_for_frames (same length): **normalized** RTG at
+    query tail before each get_action — same as the tensor passed to the model
+    (``discount_cumsum(normalized_rewards)/return_scale`` space, ~O(1)). Video overlay uses this
+    value; do not multiply by ``return_scale`` or reward-norm constants (that produced misleading
+    multi-million overlays when ``reward_normalization=constant``).
+
+    Initial RTG is ``initial_rtg_token(return_scale, target_future_normalized_return_sum=...)`` so
+    it stays consistent with how training builds RTG from normalized rewards (default target sum
+    ``return_scale`` → token ``1.0``). Per-step env rewards are mapped with ``normalize_reward_for_rtg``.
+    """
     import torch
 
     if not isinstance(model, MetaDecisionTransformer):
@@ -319,8 +352,11 @@ def _run_one_rollout(
     if isinstance(obs, tuple):
         obs = obs[0]
     frames: List[np.ndarray] = []
-    # Initialize RTG early so debug video collection at t=0 can record it.
-    returns_to_go = torch.tensor([[scale]], device=device)
+    rtg0 = initial_rtg_token(
+        return_scale,
+        target_future_normalized_return_sum=target_future_normalized_return_sum,
+    )
+    returns_to_go = torch.tensor([[rtg0]], device=device, dtype=torch.float32)
     if collect_frames:
         frame = _render_rgb_frame(env)
         if frame is not None:
@@ -427,7 +463,7 @@ def _run_one_rollout(
             [states, torch.from_numpy(next_obs).float().reshape(1, -1).to(device)], dim=0
         )
         returns_to_go = torch.cat(
-            [returns_to_go, (returns_to_go[0, -1] - r_model / scale).reshape(1, 1)], dim=1
+            [returns_to_go, (returns_to_go[0, -1] - r_model / return_scale).reshape(1, 1)], dim=1
         )
         timesteps = torch.cat([timesteps, torch.tensor([[t + 1]], device=device)], dim=1)
         if done or truncated:
@@ -458,7 +494,7 @@ def run_rollouts_and_save_viz(
     step: int,
     num_rollouts: int = 3,
     max_episode_steps: int = 200,
-    scale: float = 5000.0,
+    return_scale: float = 5000.0,
     save_video: bool = False,
     eval_context_mode: str = "prompt",
     prompt_trajectories: Optional[List[Dict[str, np.ndarray]]] = None,
@@ -477,12 +513,22 @@ def run_rollouts_and_save_viz(
     reward_norm_epsilon: float = 1e-8,
     reward_normalization_stats_path: Optional[str] = None,
     wandb_defer_step_commit: bool = False,
+    vd4rl_eval_pixel_hw: Optional[int] = None,
+    vd4rl_eval_obs_downsample: Optional[int] = None,
+    vd4rl_eval_seed: int = 0,
+    eval_rtg_target_future_sum_normalized: Optional[float] = None,
 ) -> Dict[str, float]:
     """
     Run one eval rollout (N trials). Each trial can be saved as trial_0.mp4, trial_1.mp4, ...
     For wandb: log one continuous video with "Trial 1", "Trial 2", ... overlaid.
     When wandb_defer_step_commit=True (training eval), media uses commit=False so the trainer
     can log scalars at the same step with commit=True without W&B dropping out-of-order steps.
+
+    ``return_scale`` and reward-normalization kwargs must match training ``data.return_scale`` and
+    the same settings used when building trajectories (e.g. D4RL ``apply_reward_normalization``).
+    RTG tokens are updated with ``r_normalized / return_scale`` like ``dataset.py``.
+    ``eval_rtg_target_future_sum_normalized`` (default ``None`` → use ``return_scale``) sets the
+    initial RTG token via ``initial_rtg_token`` (default ``1.0``).
     """
     from src.envs.libero_env import LIBERO_SUITES
 
@@ -505,6 +551,9 @@ def run_rollouts_and_save_viz(
         env_name,
         render_both_views=eval_render_both_views,
         render_mode=gym_render_mode,
+        vd4rl_eval_pixel_hw=vd4rl_eval_pixel_hw,
+        vd4rl_eval_obs_downsample=vd4rl_eval_obs_downsample,
+        vd4rl_eval_seed=vd4rl_eval_seed,
     )
     if env is None:
         if env_name in LIBERO_SUITES:
@@ -573,6 +622,26 @@ def run_rollouts_and_save_viz(
             epsilon=reward_norm_epsilon,
             stats=reward_stats,
         )
+
+    stats_note = f"path={stats_path}" if stats_path else "none"
+    rtg0 = initial_rtg_token(
+        return_scale,
+        target_future_normalized_return_sum=eval_rtg_target_future_sum_normalized,
+    )
+    tgt_g = (
+        eval_rtg_target_future_sum_normalized
+        if eval_rtg_target_future_sum_normalized is not None
+        else return_scale
+    )
+    print(
+        f"Eval RTG: return_scale={return_scale} (divisor); "
+        f"target_future_norm_return_sum={tgt_g} -> initial_rtg_token={rtg0:.6g}; "
+        f"reward_normalization={mode!r} reward_norm_constant={reward_norm_constant} "
+        f"epsilon={reward_norm_epsilon} stats={stats_note}; "
+        f"per-step r uses normalize_reward_scalar (same as training trajectories). "
+        f"Video overlay RTG is normalized (~O(1)), not ×return_scale or ×reward_norm_constant.",
+        flush=True,
+    )
 
     from src.engine.eval_context import build_prompt_tuple
     from src.engine.reward_models import get_return_from_env, get_return_from_reward_model
@@ -679,7 +748,7 @@ def run_rollouts_and_save_viz(
                     max_traj_len,
                     state_dim,
                     act_dim,
-                    scale,
+                    return_scale,
                     device,
                     sort_ascending=True,
                     trajectory_returns=rets or None,
@@ -712,7 +781,7 @@ def run_rollouts_and_save_viz(
                 state_mean_t,
                 state_std_t,
                 device,
-                scale,
+                return_scale,
                 max_episode_steps,
                 step,
                 trial,
@@ -721,6 +790,7 @@ def run_rollouts_and_save_viz(
                 env_name=env_name,
                 normalize_reward_for_rtg=_normalize_reward_for_model,
                 prompt_builder=_build_prompt_with_current,
+                target_future_normalized_return_sum=eval_rtg_target_future_sum_normalized,
             )
             ret = _return_for_traj(traj_dict, ep_return)
             context_list.append((traj_dict, ret))
@@ -746,7 +816,7 @@ def run_rollouts_and_save_viz(
             max_traj_len,
             state_dim,
             act_dim,
-            scale,
+            return_scale,
             device,
             sort_ascending=True,
             context_subsample_strategy=context_subsample_strategy,
@@ -765,7 +835,7 @@ def run_rollouts_and_save_viz(
                 state_mean_t,
                 state_std_t,
                 device,
-                scale,
+                return_scale,
                 max_episode_steps,
                 step,
                 ep,
@@ -773,6 +843,7 @@ def run_rollouts_and_save_viz(
                 collect_frames=collect_frames,
                 env_name=env_name,
                 normalize_reward_for_rtg=_normalize_reward_for_model,
+                target_future_normalized_return_sum=eval_rtg_target_future_sum_normalized,
             )
             all_returns.append(ep_return)
             all_lengths.append(length)
@@ -798,7 +869,7 @@ def run_rollouts_and_save_viz(
                 state_mean_t,
                 state_std_t,
                 device,
-                scale,
+                return_scale,
                 max_episode_steps,
                 step,
                 ep,
@@ -806,6 +877,7 @@ def run_rollouts_and_save_viz(
                 collect_frames=collect_frames,
                 env_name=env_name,
                 normalize_reward_for_rtg=_normalize_reward_for_model,
+                target_future_normalized_return_sum=eval_rtg_target_future_sum_normalized,
             )
             all_returns.append(ep_return)
             all_lengths.append(length)

@@ -20,8 +20,11 @@ num_context_trajectories: 1
 randomize_num_context_trajectories: true
 context_sort_ascending: true
 context_sampling: stratified
+# max_total_prompt_length: null -> max_episode_steps * (num_context_trajectories + 1) at runtime
 max_total_prompt_length: null
-max_prompt_trajectory_length: null  # null = use full trajectory; int = cap each context demo to last N steps
+# max_prompt_trajectory_length: null = full each context demo (subject to context_subsample_strategy)
+max_prompt_trajectory_length: null
+
 # How to subsample each context trajectory: none (full trajectory) | last | uniform | random
 context_subsample_strategy: none
 context_style: full_trajectory

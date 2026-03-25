@@ -1,3 +1,6 @@
+defaults:
+  - base
+  
 # D4RL HalfCheetah: mixed expertise
 # Data from scripts/download_d4rl_halfcheetah.py -> datasets/HalfCheetah-v2/<quality>/
 env_name: HalfCheetah-v2
@@ -7,10 +10,6 @@ num_tasks: 1
 num_train_tasks: 1
 max_episode_steps: 1000
 num_context_trajectories: 3
-# full_trajectory: concat num_context_trajectories demos, then trim prompt to <= max_total_prompt_length steps.
-max_total_prompt_length: 4000
-# Per demo: null = use full episode; int = only last N steps of each context trajectory before concat.
-max_prompt_trajectory_length: null
 context_style: full_trajectory
 lazy_dataset: true
 max_training_examples: 500000

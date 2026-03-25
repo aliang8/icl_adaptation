@@ -86,8 +86,9 @@ class DataConfig:
     randomize_num_context_trajectories: bool = True
     context_sort_ascending: bool = True
     context_sampling: str = "random"
+    # Omit/null -> resolved_max_total_prompt_length (max_episode_steps * (num_context_trajectories + 1))
     max_total_prompt_length: Optional[int] = None
-    # full_trajectory: None = use full trajectory per demo; int = cap each context demo to last N steps
+    # Per context demo: null = use full trajectory (within strategy); int = last N steps of each demo before concat
     max_prompt_trajectory_length: Optional[int] = None
     # How to subsample each context trajectory: "none" (full trajectory) | "last" | "uniform" | "random"
     context_subsample_strategy: str = "none"
@@ -118,14 +119,33 @@ class DataConfig:
     reward_norm_constant: float = 1.0
     reward_norm_epsilon: float = 1e-8
     reward_normalization_stats_path: Optional[str] = None
-    # V-D4RL (https://github.com/conglu1997/v-d4rl): npz under data_root / suite / task / split / pixel_size
+    # V-D4RL (https://github.com/conglu1997/v-d4rl): leaf dir data_root/suite/task/split/pixel_size with *.npz (64px) or *.hdf5 (84px)
     vd4rl_suite: str = "main"
     vd4rl_task: str = "walker_walk"
     vd4rl_split: str = "random"
+    # If set (non-empty), load and merge trajectories from each split dir; ignores vd4rl_split for loading.
+    vd4rl_splits: Optional[List[str]] = None
     vd4rl_pixel_size: str = "64px"
     vd4rl_max_episodes: Optional[int] = None
     vd4rl_obs_downsample: int = 16
     vd4rl_shuffle_npz_order: bool = False
+    # Rollout env id when different from env_name (e.g. env_name=VD4RL for data, eval on dm_control).
+    # Use VD4RL/dmc/walker_walk (see src/envs/vd4rl_eval_env.py). Null = default VD4RL/dmc/{vd4rl_task}.
+    eval_env_name: Optional[str] = None
+
+
+def resolved_max_total_prompt_length(data_cfg: DataConfig) -> int:
+    """
+    Total prompt timesteps after concatenating context demos (then pad/trim to this length).
+
+    If ``data.max_total_prompt_length`` is set, returns that value. Otherwise returns
+    ``max_episode_steps * (num_context_trajectories + 1)``.
+    """
+    if data_cfg.max_total_prompt_length is not None:
+        return int(data_cfg.max_total_prompt_length)
+    eps = int(data_cfg.max_episode_steps)
+    n = int(data_cfg.num_context_trajectories)
+    return eps * (n + 1)
 
 
 @dataclass

@@ -115,6 +115,27 @@ def apply_minmax(
     return out, stats
 
 
+def initial_rtg_token(
+    return_scale: float,
+    *,
+    target_future_normalized_return_sum: Optional[float] = None,
+) -> float:
+    """
+    Starting RTG for online rollouts, same space as training targets:
+    ``discount_cumsum(trajectory[\"rewards\"]) / return_scale`` with **already-normalized**
+    per-step rewards.
+
+    Conditioning on total future **normalized** return ``G`` uses token ``G / return_scale``.
+    Default ``G = return_scale`` gives ``1.0`` (standard DT-style eval). ``return_scale`` itself
+    is not passed through ``normalize_reward_scalar`` — only per-step env rewards are.
+    """
+    s = float(return_scale)
+    if s == 0.0:
+        raise ValueError("return_scale must be non-zero")
+    g = s if target_future_normalized_return_sum is None else float(target_future_normalized_return_sum)
+    return g / s
+
+
 def normalize_reward_scalar(
     reward: float,
     mode: str,

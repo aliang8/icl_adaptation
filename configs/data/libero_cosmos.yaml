@@ -1,3 +1,6 @@
+defaults:
+  - base
+  
 # LIBERO-Cosmos-Policy: nvidia/LIBERO-Cosmos-Policy on HuggingFace
 # 1) Download HDF5: huggingface-cli download nvidia/LIBERO-Cosmos-Policy --repo-type dataset --local-dir <data_dir>/LIBERO-Cosmos-Policy
 # 2) Convert: python scripts/convert_libero_hdf5_to_dataset.py --input-dir <data_dir>/LIBERO-Cosmos-Policy
@@ -32,5 +35,5 @@ image_size: [256, 256]
 min_trajectory_length: 10
 max_trajectory_length: 400
 
-max_total_prompt_length: null     # null = no cap (use full concatenated prompt); set to N to trim to last N steps
-max_prompt_trajectory_length: null  # null = use full trajectory; set to N to cap each context demo to last N steps
+# null -> resolved default max_episode_steps * (num_context_trajectories + 1); set int to trim/pad prompt to N steps
+max_total_prompt_length: null

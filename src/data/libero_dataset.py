@@ -22,6 +22,8 @@ import sys
 from loguru import logger as log
 from tqdm import tqdm
 
+from src.config.schema import resolved_max_total_prompt_length
+
 
 def _has_new_format(root: Path) -> bool:
     """True if manifest.parquet and episodes/ exist (MP4+NPZ layout)."""
@@ -394,6 +396,13 @@ def build_libero_in_context_dataset(
     task_instructions = get_libero_task_instructions_from_manifest(str(data_dir)) or []
     index = SampleIndex(index_df, length_bin_columns=["query_len", "prompt_len"])
     use_precomputed_embeddings = data_cfg.use_precomputed_embeddings
+    total_plen = resolved_max_total_prompt_length(data_cfg)
+    if data_cfg.max_total_prompt_length is None:
+        log.info(
+            "LIBERO: data.max_total_prompt_length unset -> using {} "
+            "(max_episode_steps * (num_context_trajectories + 1))",
+            total_plen,
+        )
     loader_fn = make_libero_index_loader(
         root,
         task_instructions,
@@ -402,15 +411,13 @@ def build_libero_in_context_dataset(
         data_cfg.context_dim,
         device,
         data_cfg.return_scale,
-        data_cfg.max_total_prompt_length,
+        total_plen,
         data_cfg.max_prompt_trajectory_length,
         use_vision=data_cfg.use_vision and not use_precomputed_embeddings,
         image_keys=data_cfg.image_keys or [],
         use_precomputed_embeddings=use_precomputed_embeddings,
     )
     idx_dataset = IndexBackedDataset(index, loader_fn)
-    total_prompt_len = data_cfg.max_total_prompt_length
-    max_pt = data_cfg.max_prompt_trajectory_length
 
     class _Wrapper:
         """Wrapper so index-backed dataset matches the interface expected by train.py (_print_dataset_stats, etc.)."""
@@ -443,7 +450,7 @@ def build_libero_in_context_dataset(
             return self._d[i]
 
     dataset = _Wrapper(
-        idx_dataset, task_instructions, total_prompt_len, max_pt, state_dim, action_dim, data_cfg
+        idx_dataset, task_instructions, total_plen, data_cfg.max_prompt_trajectory_length, state_dim, action_dim, data_cfg
     )
     batch_sampler = GroupedBatchSampler(
         index, data_cfg.batch_size, shuffle=True, seed=data_cfg.seed
@@ -464,8 +471,8 @@ def build_libero_in_context_dataset(
         state_mean=dataset.state_mean,
         state_std=dataset.state_std,
         task_instructions=task_instructions,
-        total_prompt_len=total_prompt_len,
-        max_prompt_trajectory_length=max_pt,
+        total_prompt_len=total_plen,
+        max_prompt_trajectory_length=data_cfg.max_prompt_trajectory_length,
     )
 
 

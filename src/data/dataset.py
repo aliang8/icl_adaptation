@@ -163,7 +163,7 @@ class ICLTrajectoryDatasetBase(Dataset, ABC):
         self.return_min = float(returns.min())
         self.return_max = float(returns.max())
         self.return_avg = float(returns.mean())
-
+    
     def _sample_num_context_trajectories(self) -> int:
         """Max prior count N = num_context_trajectories; m in {0..N} when randomize, else always N."""
         n = self.num_context_trajectories

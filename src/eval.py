@@ -6,6 +6,7 @@ Use for eval-only runs and for validating exported models.
 import os
 import argparse
 from pathlib import Path
+from typing import Any, Dict, Optional
 
 import numpy as np
 import torch
@@ -17,6 +18,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.models import MetaDecisionTransformer, RNNContextEncoder
 from src.data.trajectories import sort_trajectories_by_return, discount_cumsum
+from src.data.reward_normalization import (
+    initial_rtg_token,
+    load_stats,
+    normalize_reward_scalar,
+)
 
 
 def load_model_for_eval(
@@ -108,13 +114,57 @@ def run_eval_episodes(
     warm_train_steps: int = 0,
     current_step: int = 0,
     prompt=None,
+    reward_normalization: str = "none",
+    reward_norm_constant: float = 1.0,
+    reward_norm_epsilon: float = 1e-8,
+    reward_normalization_stats_path: Optional[str] = None,
+    eval_rtg_target_future_sum_normalized: Optional[float] = None,
 ):
-    """Run evaluation episodes and return mean return and mean length."""
+    """Run evaluation episodes and return mean return and mean length.
+
+    ``scale`` is ``data.return_scale``. Per-step env rewards and initial RTG follow the same rules
+    as training rollouts in ``eval_viz._run_one_rollout`` (normalized rewards + ``initial_rtg_token``).
+    """
     model.eval()
     if context_encoder is not None:
         context_encoder.eval()
     state_mean_t = torch.from_numpy(state_mean).to(device) if state_mean is not None else 0.0
     state_std_t = torch.from_numpy(state_std).to(device) if state_std is not None else 1.0
+    mode = (reward_normalization or "none").strip().lower()
+    reward_stats: Optional[Dict[str, Any]] = None
+    stats_path = reward_normalization_stats_path
+    if isinstance(stats_path, str) and stats_path.strip().lower() in ("", "none", "null", "~"):
+        stats_path = None
+    if mode in ("standardize", "dataset_std", "zscore", "minmax", "dataset_minmax"):
+        if stats_path:
+            sp = Path(stats_path)
+            if sp.is_file():
+                reward_stats = load_stats(sp)
+            else:
+                raise FileNotFoundError(
+                    f"reward_normalization_stats_path not found: {sp}. "
+                    "Provide stats JSON for eval to match training."
+                )
+        else:
+            raise ValueError(
+                "reward_normalization requires reward_normalization_stats_path for "
+                "standardize/minmax in run_eval_episodes (to match training)."
+            )
+
+    def _norm_r(r: float) -> float:
+        return normalize_reward_scalar(
+            r,
+            mode,
+            reward_norm_constant=reward_norm_constant,
+            epsilon=reward_norm_epsilon,
+            stats=reward_stats,
+        )
+
+    rs = float(scale)
+    rtg0 = initial_rtg_token(
+        rs,
+        target_future_normalized_return_sum=eval_rtg_target_future_sum_normalized,
+    )
     returns = []
     lengths = []
     for _ in range(num_episodes):
@@ -126,7 +176,7 @@ def run_eval_episodes(
         contexts = torch.zeros(1, context_dim, device=device)
         actions = torch.zeros(0, model.act_dim, device=device)
         rewards = torch.zeros(0, device=device)
-        returns_to_go = torch.tensor([[scale]], device=device)
+        returns_to_go = torch.tensor([[rtg0]], device=device, dtype=torch.float32)
         timesteps = torch.zeros(1, 1, dtype=torch.long, device=device)
         ep_return = 0.0
         for t in range(max_episode_steps):
@@ -143,9 +193,11 @@ def run_eval_episodes(
             )
             action_np = action.detach().cpu().numpy()
             next_state, reward, done, _ = env.step(action_np)
-            ep_return += reward
+            r_env = float(reward)
+            r_model = _norm_r(r_env)
+            ep_return += r_env
             actions = torch.cat([actions, action.unsqueeze(0)], dim=0)
-            rewards = torch.cat([rewards, torch.tensor([reward], device=device)])
+            rewards = torch.cat([rewards, torch.tensor([r_model], device=device)])
             states = torch.cat(
                 [states, torch.from_numpy(next_state).float().reshape(1, -1).to(device)], dim=0
             )
@@ -153,7 +205,7 @@ def run_eval_episodes(
                 # Update context from recent (s,a,r) segment
                 pass  # Stub: compute context from last context_horizon steps
             returns_to_go = torch.cat(
-                [returns_to_go, (returns_to_go[0, -1] - reward / scale).reshape(1, 1)], dim=1
+                [returns_to_go, (returns_to_go[0, -1] - r_model / rs).reshape(1, 1)], dim=1
             )
             timesteps = torch.cat([timesteps, torch.tensor([[t + 1]], device=device)], dim=1)
             if done:

@@ -31,6 +31,7 @@ from src.engine.eval_action_compare import run_action_compare_eval
 from src.engine.trainer import Trainer
 from src.models import MetaDecisionTransformer, RNNContextEncoder, VLADecisionTransformer
 from src.models.types import DTBatch
+from src.config.schema import resolved_max_total_prompt_length
 from src.data import ICLTrajectoryDataset, collate_icl_batch
 from src.data.trajectories import (
     convert_data_to_trajectories,
@@ -232,6 +233,19 @@ def resolve_paths(cfg):
     return SimpleNamespace(repo_root=repo_root, data_root=data_root, output_root=output_root)
 
 
+def _vd4rl_split_list(data_cfg) -> list:
+    """Use vd4rl_splits when set; otherwise single vd4rl_split."""
+    splits = getattr(data_cfg, "vd4rl_splits", None)
+    if splits is not None:
+        raw = OmegaConf.to_container(splits, resolve=True)
+        if isinstance(raw, list) and len(raw) > 0:
+            return [str(x) for x in raw]
+    single = OmegaConf.select(data_cfg, "vd4rl_split", default=None)
+    if single is None:
+        single = "random"
+    return [str(single)]
+
+
 def validate_dataset_paths(env_name: str, paths, data_cfg) -> None:
     """Fail fast at startup if required dataset paths are missing."""
     if env_name == "ICRT-MT":
@@ -245,22 +259,37 @@ def validate_dataset_paths(env_name: str, paths, data_cfg) -> None:
     elif env_name in LIBERO_SUITES:
         log.info("LIBERO: dataset at data_dir/LIBERO-Cosmos-Policy/data/ (episode_index)")
     elif env_name == "VD4RL":
-        p = (
-            paths.data_root
-            / data_cfg.vd4rl_suite
-            / data_cfg.vd4rl_task
-            / data_cfg.vd4rl_split
-            / data_cfg.vd4rl_pixel_size
-        )
-        if not p.is_dir():
-            raise FileNotFoundError(
-                f"V-D4RL npz directory not found: {p}\n"
-                "Download datasets from the Google Drive linked in "
-                "https://github.com/conglu1997/v-d4rl and point paths.data_root at the parent "
-                f"of `{data_cfg.vd4rl_suite}/` (expected layout: "
-                f".../{data_cfg.vd4rl_task}/{data_cfg.vd4rl_split}/{data_cfg.vd4rl_pixel_size}/*.npz)."
+        for split in _vd4rl_split_list(data_cfg):
+            p = (
+                paths.data_root
+                / data_cfg.vd4rl_suite
+                / data_cfg.vd4rl_task
+                / split
+                / data_cfg.vd4rl_pixel_size
             )
-        log.info("V-D4RL data directory found: {}", p)
+            if not p.is_dir():
+                raise FileNotFoundError(
+                    f"V-D4RL data directory not found: {p}\n"
+                    "Download datasets from the Google Drive linked in "
+                    "https://github.com/conglu1997/v-d4rl and set paths.data_root to the folder that "
+                    f"contains `{data_cfg.vd4rl_suite}/` (expected leaf dir: "
+                    f".../{data_cfg.vd4rl_task}/<split>/{data_cfg.vd4rl_pixel_size}/ "
+                    "with `*.npz` for 64px or `*.hdf5` for 84px DrQ shards)."
+                )
+            has_npz = any(p.glob("*.npz"))
+            has_h5 = any(p.glob("*.hdf5"))
+            if not has_npz and not has_h5:
+                raise FileNotFoundError(
+                    f"V-D4RL directory exists but has no *.npz or *.hdf5 files: {p}\n"
+                    "64px (DreamerV2) uses .npz; 84px (DrQ-v2) uses .hdf5 (e.g. shard_*_reward_*.hdf5). "
+                    "Install h5py for hdf5: uv pip install h5py"
+                )
+            log.info(
+                "V-D4RL data directory found: {} split={} ({})",
+                p,
+                split,
+                "npz" if has_npz else "hdf5",
+            )
 
 
 def build_model(cfg, state_dim: int, action_dim: int, num_instructions: Optional[int] = None):
@@ -737,31 +766,106 @@ def main():
     if env_name == "VD4RL":
         from src.data.vd4rl_loader import load_vd4rl_npz_trajectories
 
-        vd4rl_dir = (
-            paths.data_root
-            / data_cfg.vd4rl_suite
-            / data_cfg.vd4rl_task
-            / data_cfg.vd4rl_split
-            / data_cfg.vd4rl_pixel_size
+        # Pixel frames for debug MP4s / viz even when training on flattened state (use_vision=false).
+        vd4rl_store_images = bool(data_cfg.use_vision) or bool(
+            cfg.experiment.save_training_sample_videos
         )
-        trajectories, prompt_per_task = load_vd4rl_npz_trajectories(
-            str(vd4rl_dir),
-            max_episodes=data_cfg.vd4rl_max_episodes,
-            obs_downsample=int(data_cfg.vd4rl_obs_downsample),
-            store_images=bool(data_cfg.use_vision),
-            shuffle=bool(data_cfg.vd4rl_shuffle_npz_order),
-            seed=int(data_cfg.seed),
-        )
+        split_list = _vd4rl_split_list(data_cfg)
+        cap = data_cfg.vd4rl_max_episodes
+        if len(split_list) == 1:
+            vd4rl_dir = (
+                paths.data_root
+                / data_cfg.vd4rl_suite
+                / data_cfg.vd4rl_task
+                / split_list[0]
+                / data_cfg.vd4rl_pixel_size
+            )
+            trajectories, prompt_per_task = load_vd4rl_npz_trajectories(
+                str(vd4rl_dir),
+                max_episodes=cap,
+                obs_downsample=int(data_cfg.vd4rl_obs_downsample),
+                store_images=vd4rl_store_images,
+                shuffle=bool(data_cfg.vd4rl_shuffle_npz_order),
+                seed=int(data_cfg.seed),
+            )
+        else:
+            merged: list = []
+            for split in split_list:
+                vd4rl_dir = (
+                    paths.data_root
+                    / data_cfg.vd4rl_suite
+                    / data_cfg.vd4rl_task
+                    / split
+                    / data_cfg.vd4rl_pixel_size
+                )
+                trajs, _ = load_vd4rl_npz_trajectories(
+                    str(vd4rl_dir),
+                    max_episodes=None,
+                    obs_downsample=int(data_cfg.vd4rl_obs_downsample),
+                    store_images=vd4rl_store_images,
+                    shuffle=bool(data_cfg.vd4rl_shuffle_npz_order),
+                    seed=int(data_cfg.seed),
+                )
+                merged.extend(trajs)
+                log.info(
+                    "VD4RL: loaded {} trajectories from split={} ({})",
+                    len(trajs),
+                    split,
+                    vd4rl_dir,
+                )
+            if cap is not None and len(merged) > int(cap):
+                merged = merged[: int(cap)]
+            trajectories = merged
+            prompt_per_task = [sort_trajectories_by_return(merged, ascending=False)]
         if trajectories:
+            from src.data.reward_normalization import apply_reward_normalization, load_stats
+
+            rn_mode = (data_cfg.reward_normalization or "none").strip().lower()
+            if rn_mode not in ("none", "", "off", "false"):
+                stats_pre = None
+                sp_str = data_cfg.reward_normalization_stats_path
+                if isinstance(sp_str, str) and sp_str.strip().lower() in ("", "null", "none", "~"):
+                    sp_str = None
+                if sp_str:
+                    sp = Path(sp_str)
+                    if sp.is_file():
+                        stats_pre = load_stats(sp)
+                        log.info("VD4RL: loaded reward norm stats from {}", sp)
+                    else:
+                        log.warning(
+                            "reward_normalization_stats_path={} not found; computing stats from VD4RL data",
+                            sp,
+                        )
+                trajectories, st = apply_reward_normalization(
+                    trajectories,
+                    data_cfg.reward_normalization,
+                    reward_norm_constant=float(data_cfg.reward_norm_constant),
+                    epsilon=float(data_cfg.reward_norm_epsilon),
+                    stats=stats_pre,
+                    in_place=True,
+                )
+                log.info(
+                    "VD4RL: applied data.reward_normalization={} stats_keys={}",
+                    data_cfg.reward_normalization,
+                    list(st.keys()),
+                )
             state_dim = int(trajectories[0]["observations"].shape[1])
             action_dim = int(trajectories[0]["actions"].shape[1])
             log.info(
-                "VD4RL: inferred state_dim={}, action_dim={} (set model dims to match)",
+                "VD4RL: {} trajectories from {} split(s); state_dim={}, action_dim={}",
+                len(trajectories),
+                len(split_list),
                 state_dim,
                 action_dim,
             )
         else:
-            log.error("VD4RL: no trajectories loaded from {}", vd4rl_dir)
+            log.error(
+                "VD4RL: no trajectories loaded from splits {} under {}/{}/{}",
+                split_list,
+                paths.data_root,
+                data_cfg.vd4rl_suite,
+                data_cfg.vd4rl_task,
+            )
 
     in_context_result = None
     if env_name in LIBERO_SUITES:
@@ -793,6 +897,13 @@ def main():
         return
 
     if in_context_result is None:
+        total_plen = resolved_max_total_prompt_length(data_cfg)
+        if data_cfg.max_total_prompt_length is None:
+            log.info(
+                "data.max_total_prompt_length unset -> using {} "
+                "(max_episode_steps * (num_context_trajectories + 1))",
+                total_plen,
+            )
         dataset = ICLTrajectoryDataset(
             trajectories=trajectories,
             horizon=data_cfg.horizon,
@@ -810,7 +921,7 @@ def main():
             randomize_num_context_trajectories=data_cfg.randomize_num_context_trajectories,
             context_sort_ascending=data_cfg.context_sort_ascending,
             context_sampling=data_cfg.context_sampling,
-            max_total_prompt_length=data_cfg.max_total_prompt_length,
+            max_total_prompt_length=total_plen,
             max_prompt_trajectory_length=data_cfg.max_prompt_trajectory_length,
             context_subsample_strategy=data_cfg.context_subsample_strategy,
             context_style=data_cfg.context_style,
@@ -954,6 +1065,19 @@ def main():
                 sampling=data_cfg.context_sampling,
             )
         task_desc = (dataset.task_instructions or [None])[0] if dataset.task_instructions else None
+        eval_rollout_env = env_name
+        if env_name == "VD4RL":
+            override_eval = getattr(data_cfg, "eval_env_name", None)
+            if override_eval is not None and str(override_eval).strip():
+                eval_rollout_env = str(override_eval)
+            else:
+                eval_rollout_env = f"VD4RL/dmc/{data_cfg.vd4rl_task}"
+        vd4rl_px = None
+        vd4rl_ds = None
+        if str(eval_rollout_env).startswith("VD4RL/dmc/"):
+            px_str = str(data_cfg.vd4rl_pixel_size).replace("px", "").strip()
+            vd4rl_px = int(px_str) if px_str else 64
+            vd4rl_ds = int(data_cfg.vd4rl_obs_downsample)
         # Dual-camera stitch is LIBERO-only; Gymnasium (HalfCheetah, etc.) has a single render view.
         eval_render_both_views = bool(cfg.experiment.eval_render_both_views) and (
             env_name in LIBERO_SUITES
@@ -966,7 +1090,7 @@ def main():
             with torch.inference_mode():
                 metrics = run_rollouts_and_save_viz(
                     model=model,
-                    env_name=env_name,
+                    env_name=eval_rollout_env,
                     state_mean=state_mean,
                     state_std=state_std,
                     device=device,
@@ -974,7 +1098,7 @@ def main():
                     step=step,
                     num_rollouts=num_rollouts,
                     max_episode_steps=data_cfg.max_episode_steps,
-                    scale=data_cfg.return_scale,
+                    return_scale=float(data_cfg.return_scale),
                     save_video=cfg.experiment.save_eval_video,
                     eval_context_mode=eval_mode,
                     prompt_trajectories=prompt_trajectories,
@@ -993,6 +1117,9 @@ def main():
                     reward_norm_epsilon=float(data_cfg.reward_norm_epsilon),
                     reward_normalization_stats_path=data_cfg.reward_normalization_stats_path,
                     wandb_defer_step_commit=use_wandb,
+                    vd4rl_eval_pixel_hw=vd4rl_px,
+                    vd4rl_eval_obs_downsample=vd4rl_ds,
+                    vd4rl_eval_seed=int(data_cfg.seed),
                 )
                 if cfg.experiment.run_action_compare_eval and dataset.trajectories:
                     action_metrics = run_action_compare_eval(

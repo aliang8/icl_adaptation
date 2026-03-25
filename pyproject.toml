@@ -27,7 +27,8 @@ dependencies = [
 [project.optional-dependencies]
 # Minari: offline RL datasets. The `mujoco` package is required for Gymnasium MuJoCo envs
 # (e.g. HalfCheetah-v5 eval); minari[all] alone does not always install it.
-d4rl = ["minari[all]", "mujoco>=3.0.0"]
+# dm_control: V-D4RL eval (dm_control Walker-walk / Cheetah-run, same suite as upstream v-d4rl).
+d4rl = ["minari[all]", "mujoco>=3.0.0", "dm_control"]
 # ICRT-style: robot manipulation with language + multi-view images (HuggingFace + HDF5 + viz).
 icrt = ["huggingface_hub>=0.20.0", "h5py>=3.8.0", "datasets>=2.0.0"]
 # LIBERO: deps for sim env. Pin robosuite 1.4.x for LIBERO compatibility. Clone LIBERO inside this repo, then: uv sync --extra libero

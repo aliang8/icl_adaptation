@@ -2,7 +2,8 @@
 # https://github.com/conglu1997/v-d4rl
 #
 # Expected layout under paths.data_root (e.g. ./datasets):
-#   main/walker_walk/random/64px/*.npz
+#   main/walker_walk/<split>/64px/*.npz
+# Multiple splits: set vd4rl_splits (list); trajectories are merged. If vd4rl_splits is empty/missing, vd4rl_split is used (default random).
 #
 # Run (model=vd4rl_dt enables vision path; state/action dims are inferred from the first npz):
 #   python -m src.train data=[base,vd4rl_walker_random] model=vd4rl_dt paths.data_root=/path/to/vd4rl_parent
@@ -12,20 +13,23 @@ defaults:
   - base
 
 env_name: VD4RL
+# Rollout env: dm_control Walker-walk with pixels -> same vector obs as vd4rl_loader (not Gymnasium Walker2d).
+eval_env_name: null
 # Single benchmark: one context pool (all episodes), avoid slicing by num_train_tasks
 num_tasks: 1
 num_train_tasks: 1
 num_context_trajectories: 4
 randomize_num_context_trajectories: true
 context_style: full_trajectory
-max_total_prompt_length: 256
-max_prompt_trajectory_length: null
+max_total_prompt_length: 3000
 lazy_dataset: true
 use_vision: true
 # Match flattened downsampled pixels: vd4rl_obs_downsample^2 * 3
 vd4rl_suite: main
 vd4rl_task: walker_walk
-vd4rl_split: random
+vd4rl_splits:
+  - random
+  - medium_replay
 vd4rl_pixel_size: 64px
 vd4rl_obs_downsample: 16
 vd4rl_max_episodes: null
