@@ -41,19 +41,27 @@ class Logger:
             cfg_dict = OmegaConf.to_container(config, resolve=True) if config is not None else {}
             self._wandb = wandb.init(project=project, entity=entity, name=run_name, config=cfg_dict)
 
-    def log_metrics(self, metrics: Dict[str, float], step: int) -> None:
+    def log_metrics(
+        self, metrics: Dict[str, float], step: int, *, wandb_commit: bool = True
+    ) -> None:
+        wb_payload: Dict[str, Any] = {}
         for k, v in metrics.items():
             if isinstance(v, (int, float)):
                 if self._writer is not None:
                     self._writer.add_scalar(k, v, step)
                 if self._wandb is not None:
-                    self._wandb.log({k: v, "train/global_step": step}, step=step)
+                    wb_payload[k] = v
+        if self._wandb is not None and wb_payload:
+            wb_payload["train/global_step"] = step
+            # commit=False accumulates with other logs at the same step; final commit must follow
+            # (see trainer: eval media first with commit=False, then log_metrics commit=True).
+            self._wandb.log(wb_payload, step=step, commit=wandb_commit)
 
-    def log_scalar(self, tag: str, value: float, step: int) -> None:
+    def log_scalar(self, tag: str, value: float, step: int, *, wandb_commit: bool = True) -> None:
         if self._writer is not None:
             self._writer.add_scalar(tag, value, step)
         if self._wandb is not None:
-            self._wandb.log({tag: value}, step=step)
+            self._wandb.log({tag: value}, step=step, commit=wandb_commit)
 
     def log_video(
         self,
@@ -62,6 +70,8 @@ class Logger:
         step: int,
         fps: int = 20,
         format: str = "mp4",
+        *,
+        wandb_commit: bool = True,
     ) -> None:
         """Log a list of numpy frames (H,W,3) uint8 as a single video to W&B. Uses (T,C,H,W) for wandb."""
         if self._wandb is None or not frames:
@@ -78,9 +88,17 @@ class Logger:
         self._wandb.log(
             {tag: wandb.Video(arr, fps=fps, format=format)},
             step=step,
+            commit=wandb_commit,
         )
 
-    def log_video_from_path(self, tag: str, path: Union[str, Path], step: int) -> None:
+    def log_video_from_path(
+        self,
+        tag: str,
+        path: Union[str, Path],
+        step: int,
+        *,
+        wandb_commit: bool = True,
+    ) -> None:
         """Log a video from a file path (e.g. mp4). W&B uses the file's frame rate; passing fps is ignored and triggers a warning."""
         if self._wandb is None:
             return
@@ -92,9 +110,10 @@ class Logger:
         self._wandb.log(
             {tag: wandb.Video(str(path), format="mp4")},
             step=step,
+            commit=wandb_commit,
         )
 
-    def log_image(self, tag: str, image: Any, step: int) -> None:
+    def log_image(self, tag: str, image: Any, step: int, *, wandb_commit: bool = True) -> None:
         """Log an image to W&B (PIL/ndarray or path). For matplotlib, pass fig or save to buffer."""
         if self._wandb is None:
             return
@@ -109,22 +128,29 @@ class Logger:
             from PIL import Image
 
             img = Image.open(buf)
-            self._wandb.log({tag: wandb.Image(img)}, step=step)
+            self._wandb.log({tag: wandb.Image(img)}, step=step, commit=wandb_commit)
         elif isinstance(image, (str, Path)) and Path(image).exists():
-            self._wandb.log({tag: wandb.Image(str(image))}, step=step)
+            self._wandb.log({tag: wandb.Image(str(image))}, step=step, commit=wandb_commit)
         else:
-            self._wandb.log({tag: wandb.Image(image)}, step=step)
+            self._wandb.log({tag: wandb.Image(image)}, step=step, commit=wandb_commit)
+
+    def log_wandb_dict(self, data: Dict[str, Any], step: int, *, wandb_commit: bool = True) -> None:
+        """Single wandb.log; use wandb_commit=False when more keys follow at the same step."""
+        if self._wandb is None or not data:
+            return
+        self._wandb.log(data, step=step, commit=wandb_commit)
 
     def flush(self) -> None:
+        """Flush TensorBoard buffers only. Does not end the W&B run."""
         if self._writer is not None:
             self._writer.flush()
-        if self._wandb is not None:
-            self._wandb.finish()
 
     def close(self) -> None:
         if self._writer is not None:
+            self._writer.flush()
             self._writer.close()
-        self.flush()
+        if self._wandb is not None:
+            self._wandb.finish()
 
 
 def setup_logging(
@@ -158,6 +184,8 @@ def log_metrics(
     eval_metrics: Optional[Dict[str, float]] = None,
     batch_metrics: Optional[Dict[str, float]] = None,
     checkpoint_path: Optional[str] = None,
+    *,
+    wandb_commit: bool = True,
 ) -> None:
     metrics = {
         "train/action_loss": train_loss,
@@ -173,6 +201,6 @@ def log_metrics(
         metrics.update(eval_metrics)
     if batch_metrics:
         metrics.update(batch_metrics)
-    logger.log_metrics(metrics, step)
+    logger.log_metrics(metrics, step, wandb_commit=wandb_commit)
     if checkpoint_path:
-        logger.log_scalar("checkpoint/path_step", step, step)
+        logger.log_scalar("checkpoint/path_step", float(step), step, wandb_commit=wandb_commit)

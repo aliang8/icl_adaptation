@@ -28,6 +28,7 @@ task_instructions: null
 dataset_config_json: null
 use_vision: false
 use_language: false
+use_precomputed_embeddings: false
 image_keys: null
 image_size: null
 proprio_keys: null
@@ -37,3 +38,9 @@ max_trajectory_length: 450
 # LIBERO
 libero_repo_id: nvidia/LIBERO-Cosmos-Policy
 seed: 0
+# Reward preprocessing for offline trajectories (HalfCheetah pkl). none | constant | standardize | minmax
+reward_normalization: none
+reward_norm_constant: 1000.0
+reward_norm_epsilon: 1.0e-8
+# Optional JSON stats path (standardize/minmax use fixed stats)
+reward_normalization_stats_path: null

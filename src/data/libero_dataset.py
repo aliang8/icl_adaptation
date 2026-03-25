@@ -327,7 +327,7 @@ def make_libero_index_loader(
                 if emb.ndim != 2:
                     print(
                         f"[precomputed_embeddings] Bad embeddings.ndim for episode={q_ep} "
-                        f"query_start={q_start} query_len={q_len}: emb.shape={getattr(emb, 'shape', None)}; "
+                        f"query_start={q_start} query_len={q_len}: emb.shape={emb.shape if hasattr(emb, 'shape') else None}; "
                         "regenerate embeddings.npz.",
                         file=sys.stderr,
                         flush=True,
@@ -393,7 +393,7 @@ def build_libero_in_context_dataset(
         return None
     task_instructions = get_libero_task_instructions_from_manifest(str(data_dir)) or []
     index = SampleIndex(index_df, length_bin_columns=["query_len", "prompt_len"])
-    use_precomputed_embeddings = getattr(data_cfg, "use_precomputed_embeddings", False)
+    use_precomputed_embeddings = data_cfg.use_precomputed_embeddings
     loader_fn = make_libero_index_loader(
         root,
         task_instructions,
@@ -425,11 +425,12 @@ def build_libero_in_context_dataset(
             self.trajectories = []
             self.state_dim = sd
             self.act_dim = ad
-            self.horizon = getattr(cfg, "horizon", 32)
-            self._query_length = getattr(cfg, "query_history_length", 1)
-            self.max_episode_steps = getattr(cfg, "max_episode_steps", 100)
-            self.num_context_trajectories = getattr(cfg, "num_context_trajectories", 3)
-            self.prompt_length = getattr(cfg, "prompt_length", None)
+            self.horizon = cfg.horizon
+            qh = cfg.query_history_length
+            self._query_length = cfg.horizon if qh is None else qh
+            self.max_episode_steps = cfg.max_episode_steps
+            self.num_context_trajectories = cfg.num_context_trajectories
+            self.prompt_length = cfg.prompt_length
             self.return_min = 0.0
             self.return_max = 1.0
             self.return_avg = 0.5

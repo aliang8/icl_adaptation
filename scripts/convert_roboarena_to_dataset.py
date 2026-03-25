@@ -54,6 +54,7 @@ def _load_roboarena_npz(npz_path: Path):
     Returns (proprio (T,14), actions (T,8)) as float32.
     """
     import numpy as np
+
     data = np.load(npz_path, allow_pickle=True)
     if "data" not in data:
         raise ValueError(f"npz has keys {list(data.keys())}, expected 'data'")
@@ -78,6 +79,7 @@ def _load_roboarena_npz(npz_path: Path):
 
 def _read_n_steps(lowdim_path: Path) -> int:
     import numpy as np
+
     d = np.load(lowdim_path, allow_pickle=False)
     return int(np.asarray(d["proprio"]).shape[0])
 
@@ -86,13 +88,26 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Convert RoboArena DataDump to episodes/{task}/{idx}/ + manifest"
     )
-    parser.add_argument("--input-dir", type=str, required=True, help="DataDump root or .../evaluation_sessions")
-    parser.add_argument("--output-dir", type=str, default=None, help="Output root (default: same as input-dir)")
+    parser.add_argument(
+        "--input-dir", type=str, required=True, help="DataDump root or .../evaluation_sessions"
+    )
+    parser.add_argument(
+        "--output-dir", type=str, default=None, help="Output root (default: same as input-dir)"
+    )
     parser.add_argument("--symlink", action="store_true", help="Symlink videos instead of copying")
-    parser.add_argument("--skip-existing", action="store_true", default=True, help="Skip if lowdim.npz exists")
+    parser.add_argument(
+        "--skip-existing", action="store_true", default=True, help="Skip if lowdim.npz exists"
+    )
     parser.add_argument("--no-skip-existing", dest="skip_existing", action="store_false")
-    parser.add_argument("--debug", action="store_true", default=True, help="Print shapes and sample paths (default: on).")
-    parser.add_argument("--no-debug", dest="debug", action="store_false", help="Disable debug prints.")
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        default=True,
+        help="Print shapes and sample paths (default: on).",
+    )
+    parser.add_argument(
+        "--no-debug", dest="debug", action="store_false", help="Disable debug prints."
+    )
     args = parser.parse_args()
 
     try:
@@ -107,11 +122,17 @@ def main() -> None:
     from tqdm import tqdm
 
     input_root = Path(args.input_dir).resolve()
-    sessions_dir = input_root if input_root.name == "evaluation_sessions" else input_root / "evaluation_sessions"
+    sessions_dir = (
+        input_root
+        if input_root.name == "evaluation_sessions"
+        else input_root / "evaluation_sessions"
+    )
     if input_root.name == "evaluation_sessions":
         input_root = input_root.parent
     if not sessions_dir.is_dir():
-        sys.exit(f"Expected evaluation_sessions/ under {input_root}. Pass DataDump root or .../evaluation_sessions")
+        sys.exit(
+            f"Expected evaluation_sessions/ under {input_root}. Pass DataDump root or .../evaluation_sessions"
+        )
 
     output_root = Path(args.output_dir).resolve() if args.output_dir else input_root
     episodes_root = output_root / "episodes"
@@ -164,32 +185,49 @@ def main() -> None:
                 wrist_candidates = list(policy_dir.glob("*_video_wrist.mp4"))
                 wrist_video = wrist_candidates[0] if len(wrist_candidates) == 1 else wrist_video
 
-            policy_letter = (policy_dir.name.split("_")[0] if "_" in policy_dir.name else policy_dir.name[:1]) or "A"
+            policy_letter = (
+                policy_dir.name.split("_")[0] if "_" in policy_dir.name else policy_dir.name[:1]
+            ) or "A"
             policy_info = policies_meta.get(policy_letter) or {}
             success = bool(policy_info.get("binary_success", policy_info.get("success", False)))
             partial_success = float(policy_info.get("partial_success", 0.0))
 
-            rows.append({
-                "session_path": session_path,
-                "policy_name": policy_dir.name,
-                "task": task,
-                "success": success,
-                "partial_success": partial_success,
-                "npz_path": npz_path,
-                "left_path": left_video if left_video.is_file() else None,
-                "wrist_path": wrist_video if wrist_video.is_file() else None,
-            })
+            rows.append(
+                {
+                    "session_path": session_path,
+                    "policy_name": policy_dir.name,
+                    "task": task,
+                    "success": success,
+                    "partial_success": partial_success,
+                    "npz_path": npz_path,
+                    "left_path": left_video if left_video.is_file() else None,
+                    "wrist_path": wrist_video if wrist_video.is_file() else None,
+                }
+            )
 
     if not rows:
         session_dirs = [p for p in sorted(sessions_dir.iterdir()) if p.is_dir()]
         with_meta = sum(1 for p in session_dirs if (p / "metadata.yaml").is_file())
-        with_npz = sum(1 for p in session_dirs for sub in p.iterdir() if sub.is_dir() and list(sub.glob("*.npz")))
-        print(f"Found {len(session_dirs)} session dirs, {with_meta} with metadata.yaml, {with_npz} policy dirs with .npz.", flush=True)
+        with_npz = sum(
+            1
+            for p in session_dirs
+            for sub in p.iterdir()
+            if sub.is_dir() and list(sub.glob("*.npz"))
+        )
+        print(
+            f"Found {len(session_dirs)} session dirs, {with_meta} with metadata.yaml, {with_npz} policy dirs with .npz.",
+            flush=True,
+        )
         if session_dirs:
-            sample = next((s for s in session_dirs if (s / "metadata.yaml").is_file()), session_dirs[0])
+            sample = next(
+                (s for s in session_dirs if (s / "metadata.yaml").is_file()), session_dirs[0]
+            )
             for sub in sample.iterdir():
                 if sub.is_dir():
-                    print(f"  Sample policy dir {sub.name}: {[p.name for p in sub.iterdir()]}", flush=True)
+                    print(
+                        f"  Sample policy dir {sub.name}: {[p.name for p in sub.iterdir()]}",
+                        flush=True,
+                    )
                     break
         sys.exit(1)
 
@@ -198,7 +236,10 @@ def main() -> None:
         print(f"[debug] Found {len(rows)} episodes.", flush=True)
         if rows:
             r0 = rows[0]
-            print(f"[debug] Sample: task={r0['task'][:50]}..., npz={r0['npz_path']}, left={r0.get('left_path')}, wrist={r0.get('wrist_path')}", flush=True)
+            print(
+                f"[debug] Sample: task={r0['task'][:50]}..., npz={r0['npz_path']}, left={r0.get('left_path')}, wrist={r0.get('wrist_path')}",
+                flush=True,
+            )
 
     task_count: dict[str, int] = {}
     episode_list: list[tuple[str, int, dict]] = []
@@ -206,6 +247,7 @@ def main() -> None:
         slug = _task_to_slug(r["task"])
         if slug == "unknown":
             import ipdb
+
             ipdb.set_trace()
             raise ValueError(
                 "task slug is 'unknown'; language_instruction/task may be missing or empty in metadata.yaml. "
@@ -215,7 +257,16 @@ def main() -> None:
         task_count[slug] = idx + 1
         episode_list.append((slug, idx, r))
 
-    manifest_columns = ["episode_id", "task_description", "success", "partial_success", "n_steps", "primary_path", "wrist_path", "lowdim_path"]
+    manifest_columns = [
+        "episode_id",
+        "task_description",
+        "success",
+        "partial_success",
+        "n_steps",
+        "primary_path",
+        "wrist_path",
+        "lowdim_path",
+    ]
     manifest_rows = []
     global_episode_id = 0
 
@@ -225,16 +276,20 @@ def main() -> None:
 
         if args.skip_existing and lowdim_path.is_file():
             rel = f"episodes/{task_slug}/{idx:06d}"
-            manifest_rows.append({
-                "episode_id": global_episode_id,
-                "task_description": r["task"],
-                "success": r["success"],
-                "partial_success": r["partial_success"],
-                "n_steps": _read_n_steps(lowdim_path),
-                "primary_path": f"{rel}/primary.mp4" if (ep_dir / "primary.mp4").is_file() else None,
-                "wrist_path": f"{rel}/wrist.mp4" if (ep_dir / "wrist.mp4").is_file() else None,
-                "lowdim_path": f"{rel}/lowdim.npz",
-            })
+            manifest_rows.append(
+                {
+                    "episode_id": global_episode_id,
+                    "task_description": r["task"],
+                    "success": r["success"],
+                    "partial_success": r["partial_success"],
+                    "n_steps": _read_n_steps(lowdim_path),
+                    "primary_path": f"{rel}/primary.mp4"
+                    if (ep_dir / "primary.mp4").is_file()
+                    else None,
+                    "wrist_path": f"{rel}/wrist.mp4" if (ep_dir / "wrist.mp4").is_file() else None,
+                    "lowdim_path": f"{rel}/lowdim.npz",
+                }
+            )
             global_episode_id += 1
             continue
 
@@ -256,7 +311,10 @@ def main() -> None:
         proprio, actions = _load_roboarena_npz(r["npz_path"])
         T = min(len(proprio), len(actions))
         if args.debug and global_episode_id == 0:
-            print(f"[debug] First episode: proprio.shape={proprio.shape}, actions.shape={actions.shape}, T={T}", flush=True)
+            print(
+                f"[debug] First episode: proprio.shape={proprio.shape}, actions.shape={actions.shape}, T={T}",
+                flush=True,
+            )
         proprio = np.asarray(proprio[:T], dtype=np.float32)
         actions = np.asarray(actions[:T], dtype=np.float32)
         dones = np.zeros(T, dtype=np.float32)
@@ -265,30 +323,42 @@ def main() -> None:
         rewards = np.zeros(T, dtype=np.float32)
         if T > 0:
             rewards[-1] = r["partial_success"]
-        np.savez_compressed(lowdim_path, proprio=proprio, actions=actions, dones=dones, rewards=rewards)
+        np.savez_compressed(
+            lowdim_path, proprio=proprio, actions=actions, dones=dones, rewards=rewards
+        )
 
         rel = f"episodes/{task_slug}/{idx:06d}"
-        manifest_rows.append({
-            "episode_id": global_episode_id,
-            "task_description": r["task"],
-            "success": r["success"],
-            "partial_success": r["partial_success"],
-            "n_steps": T,
-            "primary_path": f"{rel}/primary.mp4" if primary_dst.is_file() else None,
-            "wrist_path": f"{rel}/wrist.mp4" if wrist_dst.is_file() else None,
-            "lowdim_path": f"{rel}/lowdim.npz",
-        })
+        manifest_rows.append(
+            {
+                "episode_id": global_episode_id,
+                "task_description": r["task"],
+                "success": r["success"],
+                "partial_success": r["partial_success"],
+                "n_steps": T,
+                "primary_path": f"{rel}/primary.mp4" if primary_dst.is_file() else None,
+                "wrist_path": f"{rel}/wrist.mp4" if wrist_dst.is_file() else None,
+                "lowdim_path": f"{rel}/lowdim.npz",
+            }
+        )
         global_episode_id += 1
 
-    manifest_df = pd.DataFrame(manifest_rows) if manifest_rows else pd.DataFrame(columns=manifest_columns)
+    manifest_df = (
+        pd.DataFrame(manifest_rows) if manifest_rows else pd.DataFrame(columns=manifest_columns)
+    )
     unique_tasks = sorted(manifest_df["task_description"].unique().tolist(), key=str)
     task_to_id = {t: i for i, t in enumerate(unique_tasks)}
     manifest_df["task_id"] = manifest_df["task_description"].map(task_to_id)
     manifest_path = output_root / "manifest.parquet"
     manifest_df.to_parquet(manifest_path, index=False)
 
-    print(f"Saved manifest to {manifest_path} ({len(manifest_df)} episodes, {len(unique_tasks)} tasks)", flush=True)
-    print(f"Episodes under {episodes_root} (by task: {list(task_count.keys())[:10]}{'...' if len(task_count) > 10 else ''})", flush=True)
+    print(
+        f"Saved manifest to {manifest_path} ({len(manifest_df)} episodes, {len(unique_tasks)} tasks)",
+        flush=True,
+    )
+    print(
+        f"Episodes under {episodes_root} (by task: {list(task_count.keys())[:10]}{'...' if len(task_count) > 10 else ''})",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":

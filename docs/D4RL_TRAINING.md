@@ -35,7 +35,7 @@ cd /path/to/icl_adaptation
 uv venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 uv sync
-uv sync --extra d4rl        # Minari + Gymnasium + MuJoCo (no mujoco_py)
+uv sync --extra d4rl        # Minari + native mujoco (Gymnasium HalfCheetah-v5 eval); no mujoco_py
 ```
 
 `d4rl` here is the **project extra** in `pyproject.toml` (Minari-based), not necessarily the PyPI `d4rl` package.
@@ -81,6 +81,39 @@ ls datasets/HalfCheetah-v2/expert/trajectories.pkl
 
 ---
 
+## 3b. Reward normalization (optional)
+
+Offline step rewards in `trajectories.pkl` can be scaled **before** training so RTG / returns sit in a nicer range for the Decision Transformer.
+
+**Modes**
+
+| Mode | Effect |
+|------|--------|
+| `none` | Use rewards as stored in the pkl. |
+| `constant` | `reward <- reward / data.reward_norm_constant` (e.g. `1000`). Episode ranking by return is unchanged. |
+| `standardize` | Global z-score over **all steps**: `(r - mean) / (std + eps)`. Episode **ordering by return can change** vs raw sums. |
+| `minmax` | Global map to **[0, 1]** using dataset min/max of step rewards. |
+
+Apply normalization at data load time (inside training):
+
+```bash
+uv run python -m src.train --override data=[base,halfcheetah] \
+  data.reward_normalization=constant data.reward_norm_constant=1000
+```
+
+Or:
+
+```bash
+uv run python -m src.train --override data=[base,halfcheetah] \
+  data.reward_normalization=standardize
+```
+
+Tune **`data.return_scale`** with the chosen normalization.
+
+**Fixed stats JSON** (same mean/std on another shard): set `data.reward_normalization_stats_path` to a JSON file (matching mode stats) when using `standardize` or `minmax`.
+
+---
+
 ## 4. Train
 
 **Minimal** (default `model=transformer`):
@@ -106,7 +139,9 @@ uv run python -m src.train \
 uv run python -m src.train \
   --override data=[base,halfcheetah] \
   experiment.max_steps=5000 \
-  data.batch_size=64
+  data.batch_size=4 \
+  paths.data_root=/project2/biyik_1165/aliang80/datasets \
+  experiment.eval_every_steps=100
 ```
 
 **Prompt + query action loss** (optional):
@@ -154,6 +189,7 @@ This runs the download command in §3, then training with W&B and `data=[base,ha
 | Download (default qualities) | `uv run python scripts/download_d4rl_halfcheetah.py --output-dir datasets --qualities medium expert medium_expert` |
 | Train | `uv run python -m src.train --wandb --override data=[base,halfcheetah]` |
 | Resume | `uv run python -m src.train --resume <path/to/checkpoint.pt> --override data=[base,halfcheetah]` |
+| Reward normalization (load-time) | `uv run python -m src.train --override data=[base,halfcheetah] data.reward_normalization=constant data.reward_norm_constant=1000` |
 
 ---
 
@@ -165,6 +201,7 @@ This runs the download command in §3, then training with W&B and `data=[base,ha
 - **Prompt / batch logging** — Training always logs **`[train_batch]`** once (first step): tensor shapes, first two rows’ **masked `prompt_r` sums**, and DTBatch layout. The dataset logs **`[prompt_context_returns]`** for the first **4** samples per process: **full-episode env return** per context trajectory in **prompt order**. With `num_workers>0`, each worker may emit up to 4 `[prompt_context_returns]` lines.
 - **Eval CUDA OOM** — (1) **Sequence length:** each `get_action` runs the transformer on **full prompt + query** padded to `model.max_length`; with `condition_rtg`, length ≈ **`3 × (prompt_timesteps + max_length)`** (~12k tokens for a 4000-step prompt). (2) **Autograd:** eval must run under **`torch.inference_mode()`**; otherwise each step’s `action` was concatenated into `actions_t` and **chained ~1000 forwards into one graph**, blowing VRAM. Training wraps eval in **`model.eval()` + `inference_mode()`**; rollouts also **detach** actions before re-feeding. Further mitigations: lower **`data.max_total_prompt_length`**, shorter **`max_episode_steps`**, disable eval video, or **`torch.cuda.empty_cache()`** for fragmentation. Logs: **`Eval transformer seq`**, **`[eval rollout] env_timestep=...`**.
 - **Minari not found** → `uv sync --extra d4rl`
+- **`ModuleNotFoundError: No module named 'mujoco'` / `DependencyNotInstalled: MuJoCo is not installed`** — Run **`uv sync --extra d4rl`** (includes PyPI **`mujoco`** for `gym.make("HalfCheetah-v5")`). Or: `pip install mujoco` / `pip install "gymnasium[mujoco]"`.
 - **`mujoco_py` / Cython errors** → This path uses **Minari only**; avoid installing legacy D4RL that pulls `mujoco_py`. See **[SETUP.md](../SETUP.md)** troubleshooting.
 - **More environments (Hopper, Walker, Ant)** → Not wired in this repo yet; README mentions them as future/extension. This doc is accurate for **HalfCheetah** only.
 

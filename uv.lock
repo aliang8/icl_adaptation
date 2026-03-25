@@ -2503,6 +2503,8 @@ dependencies = [
     { name = "imageio", version = "2.37.3", source = { registry = "https://pypi.org/simple" }, extra = ["ffmpeg"], marker = "python_full_version >= '3.10'" },
     { name = "ipdb" },
     { name = "loguru" },
+    { name = "matplotlib", version = "3.9.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
+    { name = "matplotlib", version = "3.10.8", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
     { name = "numpy", version = "2.0.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.10.*'" },
     { name = "numpy", version = "2.4.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
@@ -2520,6 +2522,8 @@ dependencies = [
 [package.optional-dependencies]
 d4rl = [
     { name = "minari", extra = ["all"] },
+    { name = "mujoco", version = "3.1.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
+    { name = "mujoco", version = "3.6.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
 ]
 dev = [
     { name = "pytest", version = "8.4.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
@@ -2532,16 +2536,12 @@ icrt = [
     { name = "h5py", version = "3.14.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
     { name = "h5py", version = "3.16.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
     { name = "huggingface-hub" },
-    { name = "matplotlib", version = "3.9.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
-    { name = "matplotlib", version = "3.10.8", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
 ]
 libero = [
     { name = "bddl" },
     { name = "easydict" },
     { name = "h5py", version = "3.14.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
     { name = "h5py", version = "3.16.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
-    { name = "matplotlib", version = "3.9.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
-    { name = "matplotlib", version = "3.10.8", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
     { name = "robosuite" },
 ]
 reward-relabel = [
@@ -2580,9 +2580,9 @@ requires-dist = [
     { name = "imageio", extras = ["ffmpeg"], specifier = ">=2.9.0" },
     { name = "ipdb" },
     { name = "loguru", specifier = ">=0.7.0" },
-    { name = "matplotlib", marker = "extra == 'icrt'", specifier = ">=3.5.0" },
-    { name = "matplotlib", marker = "extra == 'libero'", specifier = ">=3.5.0" },
+    { name = "matplotlib", specifier = ">=3.5.0" },
     { name = "minari", extras = ["all"], marker = "extra == 'd4rl'" },
+    { name = "mujoco", marker = "extra == 'd4rl'", specifier = ">=3.0.0" },
     { name = "numpy", specifier = ">=1.21" },
     { name = "omegaconf", specifier = ">=2.3.0" },
     { name = "opencv-python-headless", specifier = ">=4.5.0" },

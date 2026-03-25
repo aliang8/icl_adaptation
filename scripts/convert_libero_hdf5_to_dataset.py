@@ -121,15 +121,17 @@ def main():
             succ = bool(f.attrs.get("success", False))
             has_primary = "primary_images_jpeg" in f
             has_wrist = "wrist_images_jpeg" in f
-        rows.append({
-            "path": path,
-            "task_description": task_desc or "",
-            "success": succ,
-            "partial_success": 1.0 if succ else 0.0,
-            "n_steps": T,
-            "has_primary": has_primary,
-            "has_wrist": has_wrist,
-        })
+        rows.append(
+            {
+                "path": path,
+                "task_description": task_desc or "",
+                "success": succ,
+                "partial_success": 1.0 if succ else 0.0,
+                "n_steps": T,
+                "has_primary": has_primary,
+                "has_wrist": has_wrist,
+            }
+        )
 
     rows.sort(key=lambda r: (_task_to_slug(r["task_description"]), str(r["path"])))
     task_count = {}
@@ -138,6 +140,7 @@ def main():
         slug = _task_to_slug(r["task_description"])
         if slug == "unknown":
             import ipdb
+
             ipdb.set_trace()
             raise ValueError(
                 "task slug is 'unknown'; task_description may be missing or empty in HDF5 attrs. "
@@ -147,7 +150,16 @@ def main():
         task_count[slug] = idx + 1
         episode_list.append((slug, idx, r))
 
-    manifest_columns = ["episode_id", "task_description", "success", "partial_success", "n_steps", "primary_path", "wrist_path", "lowdim_path"]
+    manifest_columns = [
+        "episode_id",
+        "task_description",
+        "success",
+        "partial_success",
+        "n_steps",
+        "primary_path",
+        "wrist_path",
+        "lowdim_path",
+    ]
     manifest_rows = []
     global_episode_id = 0
 
@@ -228,27 +240,37 @@ def main():
                     rel_wrist = None
             n_steps = T
 
-        manifest_rows.append({
-            "episode_id": global_episode_id,
-            "task_description": r["task_description"],
-            "success": r["success"],
-            "partial_success": r["partial_success"],
-            "n_steps": n_steps,
-            "primary_path": rel_primary,
-            "wrist_path": rel_wrist,
-            "lowdim_path": rel_lowdim,
-        })
+        manifest_rows.append(
+            {
+                "episode_id": global_episode_id,
+                "task_description": r["task_description"],
+                "success": r["success"],
+                "partial_success": r["partial_success"],
+                "n_steps": n_steps,
+                "primary_path": rel_primary,
+                "wrist_path": rel_wrist,
+                "lowdim_path": rel_lowdim,
+            }
+        )
         global_episode_id += 1
 
-    manifest_df = pd.DataFrame(manifest_rows) if manifest_rows else pd.DataFrame(columns=manifest_columns)
+    manifest_df = (
+        pd.DataFrame(manifest_rows) if manifest_rows else pd.DataFrame(columns=manifest_columns)
+    )
     unique_tasks = sorted(manifest_df["task_description"].unique().tolist(), key=str)
     task_to_id = {t: i for i, t in enumerate(unique_tasks)}
     manifest_df["task_id"] = manifest_df["task_description"].map(task_to_id)
     manifest_path = output_root / "manifest.parquet"
     manifest_df.to_parquet(manifest_path, index=False)
 
-    print(f"Saved manifest to {manifest_path} ({len(manifest_df)} episodes, {len(unique_tasks)} tasks)", flush=True)
-    print(f"Episodes under {episodes_dir} (by task: {list(task_count.keys())[:10]}{'...' if len(task_count) > 10 else ''})", flush=True)
+    print(
+        f"Saved manifest to {manifest_path} ({len(manifest_df)} episodes, {len(unique_tasks)} tasks)",
+        flush=True,
+    )
+    print(
+        f"Episodes under {episodes_dir} (by task: {list(task_count.keys())[:10]}{'...' if len(task_count) > 10 else ''})",
+        flush=True,
+    )
     print(
         "Next: python scripts/build_libero_sample_index.py --data-dir " + str(output_root.parent),
         flush=True,

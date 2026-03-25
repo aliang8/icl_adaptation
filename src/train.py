@@ -111,12 +111,11 @@ def _print_dataset_stats(
     if proprio_keys is None:
         proprio_keys = []
 
-    n_trajectories = len(getattr(dataset, "trajectories", []) or [])
+    trajectories = dataset.trajectories if hasattr(dataset, "trajectories") else None
+    n_trajectories = len(trajectories) if trajectories else 0
     n_segments = len(dataset)
     traj_lengths = (
-        [t["rewards"].shape[0] for t in (getattr(dataset, "trajectories", None) or [])]
-        if isinstance(getattr(dataset, "trajectories", None), list)
-        else []
+        [t["rewards"].shape[0] for t in trajectories] if isinstance(trajectories, list) else []
     )
     total_steps = sum(traj_lengths)
     min_len = min(traj_lengths) if traj_lengths else 0
@@ -144,9 +143,9 @@ def _print_dataset_stats(
                 for t in tasks[:max_examples]
             ]
             table.add_row("Example tasks", "\n".join(examples) if examples else "—")
-    return_min = getattr(dataset, "return_min", None)
-    return_max = getattr(dataset, "return_max", None)
-    return_avg = getattr(dataset, "return_avg", None)
+    return_min = dataset.return_min if hasattr(dataset, "return_min") else None
+    return_max = dataset.return_max if hasattr(dataset, "return_max") else None
+    return_avg = dataset.return_avg if hasattr(dataset, "return_avg") else None
     for label, val in [
         ("Return (min)", return_min),
         ("Return (max)", return_max),
@@ -270,10 +269,7 @@ def build_model(cfg, state_dim: int, action_dim: int, num_instructions: Optional
         condition_rtg=m.condition_rtg,
     )
     if m.use_vision or m.use_language:
-        data_cfg = getattr(cfg, "data", None)
-        use_precomputed = (
-            getattr(data_cfg, "use_precomputed_embeddings", False) if data_cfg else False
-        )
+        use_precomputed = cfg.data.use_precomputed_embeddings
         precomputed_dim = m.precomputed_vision_embed_dim
         model = VLADecisionTransformer(
             **common,
@@ -408,7 +404,9 @@ def make_train_step_fn(task_instructions, use_precomputed_embeddings: bool = Fal
         if len(batch) > 13:
             pr, pm = batch[10], batch[13]
             if isinstance(pr, torch.Tensor) and isinstance(pm, torch.Tensor):
-                log.info("[train_batch] --- prompt_r masked sum (first 2 batch rows, pre-trim tensors) ---")
+                log.info(
+                    "[train_batch] --- prompt_r masked sum (first 2 batch rows, pre-trim tensors) ---"
+                )
                 B = min(2, pr.shape[0])
                 for b in range(B):
                     pr_b = pr[b].float()
@@ -473,7 +471,7 @@ def make_train_step_fn(task_instructions, use_precomputed_embeddings: bool = Fal
                     if not _vision_encoder_logged[0]:
                         log.info("Vision encoder input: {} views, shapes {}", len(imgs), shapes_str)
                 else:
-                    shapes_str = getattr(imgs, "shape", type(imgs))
+                    shapes_str = imgs.shape if hasattr(imgs, "shape") else type(imgs)
                     if not _vision_encoder_logged[0]:
                         log.info("Vision encoder input: {}", shapes_str)
                 image_embeddings = model.vision_encoder(batch[15])
@@ -662,6 +660,10 @@ def main():
             str(data_root),
             env_name=data_cfg.env_name,
             data_quality=data_cfg.data_quality,
+            reward_normalization=data_cfg.reward_normalization,
+            reward_norm_constant=float(data_cfg.reward_norm_constant),
+            reward_norm_epsilon=float(data_cfg.reward_norm_epsilon),
+            reward_normalization_stats_path=data_cfg.reward_normalization_stats_path,
         )
         if trajectories:
             log.info(
@@ -770,7 +772,8 @@ def main():
     log.info("Dataset size: {} segments, state_mean/std computed", len(dataset))
     if (
         data_cfg.use_vision
-        and getattr(dataset, "trajectories", None)
+        and hasattr(dataset, "trajectories")
+        and dataset.trajectories
         and not any(isinstance(t, dict) and t.get("images") for t in dataset.trajectories)
     ):
         log.warning(
@@ -832,7 +835,7 @@ def main():
     if args.eval_only:
         model.eval()
         logger.log_scalar("eval/return_mean", 0.0, global_step_start)
-        logger.flush()
+        logger.close()
         log.info("Eval-only: logged placeholder metric. Wire env for full eval.")
         return
 
@@ -850,7 +853,18 @@ def main():
     def eval_fn(step):
         num_rollouts = cfg.experiment.num_eval_rollouts
         eval_mode = cfg.experiment.eval_context_mode
-        eval_k = cfg.experiment.eval_context_k or data_cfg.num_context_trajectories
+        # eval_context_k is overloaded by mode:
+        # - prompt: how many context trajectories to sample (default: data.num_context_trajectories).
+        # - zero_shot_adaptation: last-K env steps of the live trial in the prompt (default: cfg.model.max_length).
+        # Do not use num_context_trajectories for zero-shot K — it wrongly matched e.g. 3 demos -> K=3.
+        if eval_mode == "zero_shot_adaptation":
+            if cfg.experiment.eval_context_k is not None:
+                eval_k = cfg.experiment.eval_context_k
+            else:
+                ml = cfg.model.max_length
+                eval_k = int(ml) if ml is not None else 20
+        else:
+            eval_k = cfg.experiment.eval_context_k or data_cfg.num_context_trajectories
         prompt_trajectories = None
         if eval_mode == "prompt" and hasattr(dataset, "trajectories") and dataset.trajectories:
             prompt_trajectories = sample_context_trajectories(
@@ -893,6 +907,11 @@ def main():
                     task_description=task_desc,
                     logger=logger,
                     eval_render_both_views=eval_render_both_views,
+                    reward_normalization=data_cfg.reward_normalization,
+                    reward_norm_constant=float(data_cfg.reward_norm_constant),
+                    reward_norm_epsilon=float(data_cfg.reward_norm_epsilon),
+                    reward_normalization_stats_path=data_cfg.reward_normalization_stats_path,
+                    wandb_defer_step_commit=use_wandb,
                 )
                 if (
                     cfg.experiment.run_action_compare_eval
@@ -924,7 +943,7 @@ def main():
     export_dir = str(run_dir / "artifacts" / "inference")
     train_step_fn = make_train_step_fn(
         dataset.task_instructions or [],
-        use_precomputed_embeddings=getattr(cfg.data, "use_precomputed_embeddings", False),
+        use_precomputed_embeddings=cfg.data.use_precomputed_embeddings,
     )
     final_step, best_metric = trainer.run_training(
         train_loader=loader,

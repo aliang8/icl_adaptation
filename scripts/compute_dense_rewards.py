@@ -185,7 +185,10 @@ def main() -> None:
 
         if args.debug and not debug_printed and frames_arr.shape[0] > 0:
             debug_printed = True
-            print(f"[debug] ep_id={row['episode_id']} frames.shape={frames_arr.shape} T={T} task={repr(task[:60])}...", flush=True)
+            print(
+                f"[debug] ep_id={row['episode_id']} frames.shape={frames_arr.shape} T={T} task={repr(task[:60])}...",
+                flush=True,
+            )
 
         for model_name, model in reward_models.items():
             key = f"dense_rewards_{model.name}"

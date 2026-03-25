@@ -51,8 +51,8 @@ pip install -e .
 
 | Goal | What to install | Command |
 |------|-----------------|--------|
-| **HalfCheetah (Minari)** | Minarie2e + Gymnasium + MuJoCo 2 | `uv sync --extra d4rl` |
-| **ICRT-MT dataset + viz** | HuggingFace Hub + HDF5 + matplotlib | `uv sync --extra icrt` |
+| **HalfCheetah (Minari)** | Minari + Gymnasium + PyPI **`mujoco`** (for eval envs) | `uv sync --extra d4rl` |
+| **ICRT-MT dataset + viz** | HuggingFace Hub + HDF5 (matplotlib is a core dep) | `uv sync --extra icrt` |
 | **Reward relabeling** (Robometer-4B / RoboDopamine-8B) | robometer from GitHub, without its full dependency tree | `uv pip install "git+https://github.com/robometer/robometer.git" --no-deps` then `uv sync --extra reward-relabel` |
 
 You can install both if you plan to use HalfCheetah and ICRT-style data. **Robometer is not on PyPI**; install it from [GitHub](https://github.com/robometer/robometer). Using `--no-deps` avoids pulling in all of its requirements (e.g. vLLM); the project’s existing torch/transformers deps are enough for the reward model code paths.
@@ -135,7 +135,7 @@ pip install -e .
 
 ## Optional: Minari (HalfCheetah) in one go
 
-Minari uses Gymnasium and MuJoCo 2 (no `mujoco_py`). Run `uv sync --extra d4rl`, then follow **Step 4 (Path A)** and **Step 5** above. Alternatively, use the all-in-one script:
+Minari uses Gymnasium and the **`mujoco`** Python package (MuJoCo 2.x; no `mujoco_py`). Run `uv sync --extra d4rl`, then follow **Step 4 (Path A)** and **Step 5** above. Alternatively, use the all-in-one script:
 
 ```bash
 chmod +x scripts/run_halfcheetah.sh
@@ -169,7 +169,7 @@ chmod +x scripts/run_halfcheetah.sh
 
 For robot manipulation with **language instructions** and **multi-view camera images** (exterior + wrist), similar to [ICRT](https://github.com/Max-Fu/icrt) (ICRA 2025):
 
-1. **Install deps:** `uv sync --extra icrt` (includes huggingface_hub, h5py, matplotlib for download and visualization).
+1. **Install deps:** `uv sync --extra icrt` (includes huggingface_hub, h5py; matplotlib is installed with the base project).
 2. **Install Git LFS** (for large HDF5 files): `sudo apt install git-lfs && git lfs install`.
 3. **Download data:** See **Step 4 (Path B)** above. This fetches [Ravenh97/ICRT-MT](https://huggingface.co/datasets/Ravenh97/ICRT-MT) to `datasets/ICRT-MT/` and writes `dataset_config.json`.
 4. **Visualize dataset** (task distribution, episode lengths, sample frames):
@@ -211,6 +211,9 @@ For robot manipulation with **language instructions** and **multi-view camera im
 
 - **Minari not found**  
   Run `uv sync --extra d4rl` or `pip install "minari[all]"` so the download script and env can use Minari datasets.
+
+- **`No module named 'mujoco'` / Gymnasium “MuJoCo is not installed”**  
+  Eval rollouts use **`HalfCheetah-v5`** (`gymnasium.make`), which **`import mujoco`**. Install the PyPI package: **`uv sync --extra d4rl`** (includes `mujoco`) or `pip install mujoco`.
 
 - **ICRT-MT download fails or files missing**  
   Ensure Git LFS is installed (`git lfs install`) and that you have enough disk space. You can also download the dataset manually from [HuggingFace ICRT-MT](https://huggingface.co/datasets/Ravenh97/ICRT-MT) and place it under `datasets/ICRT-MT/`, then create or adjust `dataset_config.json` to match the file paths.

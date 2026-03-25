@@ -20,7 +20,7 @@ class ModelConfig:
     activation_function: str = "relu"
     resid_pdrop: float = 0.1
     attn_pdrop: float = 0.1
-    n_positions: int = 65536
+    n_positions: int = 20000
     action_tanh: bool = True
     # VLA-DT (vision-language-action): set true in model=vla_dt
     use_vision: bool = False
@@ -107,6 +107,13 @@ class DataConfig:
     # When true, load precomputed embeddings from episodes/{id}/embeddings.npz (run precompute_libero_embeddings.py first)
     use_precomputed_embeddings: bool = False
     seed: int = 0
+    # Reward normalization at data load (HalfCheetah / trajectories.pkl). "none" = use as-is.
+    # constant: rewards /= reward_norm_constant. standardize | minmax: global over all steps.
+    # Optionally provide reward_normalization_stats_path for fixed stats (cross-shard consistency).
+    reward_normalization: str = "none"
+    reward_norm_constant: float = 1.0
+    reward_norm_epsilon: float = 1e-8
+    reward_normalization_stats_path: Optional[str] = None
 
 
 @dataclass
@@ -165,9 +172,9 @@ class ExperimentConfig:
     eval_num_trials: int = (
         5  # for zero_shot_adaptation: number of trials (rollouts) to run, context grows each trial
     )
-    eval_context_k: Optional[int] = (
-        None  # max trajectories in context (default: data.num_context_trajectories)
-    )
+    eval_context_k: Optional[int] = None
+    # If set: prompt mode = this many context trajectories; zero_shot_adaptation = last-K env steps
+    # in the live-trial prompt. If null: prompt defaults to data.num_context_trajectories; zero_shot to model.max_length.
     eval_reward_source: str = (
         "env"  # "env" | "reward_model" (for zero_shot_adaptation return used to sort context)
     )

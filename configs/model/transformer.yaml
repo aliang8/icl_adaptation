@@ -13,7 +13,7 @@ activation_function: relu
 resid_pdrop: 0.1
 attn_pdrop: 0.1
 # GPT-2 max sequence length (tokens). With condition_rtg, tokens ≈ 3 * (prompt_steps + query_steps).
-n_positions: 65536
+n_positions: 20000
 action_tanh: true
 # Backbone: gpt2 (custom) or llama2 (set llama_model_name, e.g. meta-llama/Llama-2-7b-hf)
 transformer_backbone: gpt2

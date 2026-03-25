@@ -15,3 +15,6 @@ context_style: full_trajectory
 lazy_dataset: true
 max_training_examples: 500000
 task_instructions: null
+# Reward normalization at load-time (see docs/D4RL_TRAINING.md)
+# reward_normalization: none
+# reward_norm_constant: 1000.0

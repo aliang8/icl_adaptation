@@ -140,10 +140,7 @@ class Robometer4BRewardModel(RewardModel):
         if T == 0:
             return np.zeros(0, dtype=np.float32)
 
-        segments = [
-            frames_u8[s:s + self.batch_size]
-            for s in range(0, T, self.batch_size)
-        ]
+        segments = [frames_u8[s : s + self.batch_size] for s in range(0, T, self.batch_size)]
         rewards_list: List[np.ndarray] = []
         for i, seg in enumerate(segments):
             sample = self._ProgressSample(
@@ -173,7 +170,11 @@ class Robometer4BRewardModel(RewardModel):
             pred_list = results.get("progress_pred", []) or []
             if not isinstance(pred_list, (list, tuple)):
                 pred_list = [pred_list]
-            arr = np.asarray(pred_list[0], dtype=np.float32).reshape(-1) if pred_list else np.zeros(0, dtype=np.float32)
+            arr = (
+                np.asarray(pred_list[0], dtype=np.float32).reshape(-1)
+                if pred_list
+                else np.zeros(0, dtype=np.float32)
+            )
             rewards_list.append(pad_or_trunc_1d(arr, seg.shape[0]))
         out = np.concatenate(rewards_list, axis=0)
         return pad_or_trunc_1d(out, T)

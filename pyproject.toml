@@ -19,22 +19,23 @@ dependencies = [
     "ipdb",
     "imageio[ffmpeg]>=2.9.0",
     "opencv-python-headless>=4.5.0",
+    "matplotlib>=3.5.0",
     "datasets>=4.5.0",
     "einops"
 ]
 
 [project.optional-dependencies]
-# Minari: offline RL datasets (Gymnasium + MuJoCo 2, no mujoco_py / no Cython).
-d4rl = ["minari[all]"]
+# Minari: offline RL datasets. The `mujoco` package is required for Gymnasium MuJoCo envs
+# (e.g. HalfCheetah-v5 eval); minari[all] alone does not always install it.
+d4rl = ["minari[all]", "mujoco>=3.0.0"]
 # ICRT-style: robot manipulation with language + multi-view images (HuggingFace + HDF5 + viz).
-icrt = ["huggingface_hub>=0.20.0", "h5py>=3.8.0", "matplotlib>=3.5.0", "datasets>=2.0.0"]
+icrt = ["huggingface_hub>=0.20.0", "h5py>=3.8.0", "datasets>=2.0.0"]
 # LIBERO: deps for sim env. Pin robosuite 1.4.x for LIBERO compatibility. Clone LIBERO inside this repo, then: uv sync --extra libero
 libero = [
     "robosuite>=1.4.0,<1.5",
     "bddl>=1.0.1",
     "easydict>=1.9",
     "h5py>=3.8.0",
-    "matplotlib>=3.5.0",
 ]
 # Reward relabeling (compute_dense_rewards.py): Robometer-4B / RoboDopamine-8B. Robometer is not on PyPI; install from GitHub without deps: uv pip install "git+https://github.com/robometer/robometer.git" --no-deps (then uv sync --extra reward-relabel).
 reward-relabel = [

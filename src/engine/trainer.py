@@ -179,6 +179,17 @@ class Trainer:
                 if torch.cuda.is_available()
                 else None
             )
+
+            pbar.set_postfix(loss=f"{loss_val:.4f}", lr=f"{lr:.2e}", gn=f"{grad_norm_val:.3f}")
+
+            # Eval before W&B scalar commit for this step: eval logs media with commit=False so
+            # wandb's internal step does not advance past global_step before eval/return_mean logs.
+            eval_metrics = None
+            if eval_fn and eval_every > 0 and global_step % eval_every == 0 and global_step > 0:
+                pbar.write(f"Evaluating at step {global_step}...")
+                eval_metrics = eval_fn(global_step)
+                log_gpu_vram(self.device, f"GPU VRAM (step {global_step}, after eval)")
+
             log_metrics(
                 self.logger,
                 global_step,
@@ -187,18 +198,10 @@ class Trainer:
                 grad_norm=grad_norm_val,
                 gpu_mem_mb=gpu_mem,
                 batch_metrics=batch_metrics,
+                eval_metrics=eval_metrics,
             )
 
-            pbar.update(1)
-            pbar.set_postfix(loss=f"{loss_val:.4f}", lr=f"{lr:.2e}", gn=f"{grad_norm_val:.3f}")
-
-            # Eval
-            eval_metrics = None
-            if eval_fn and eval_every > 0 and global_step % eval_every == 0 and global_step > 0:
-                pbar.write(f"Evaluating at step {global_step}...")
-                eval_metrics = eval_fn(global_step)
-                log_gpu_vram(self.device, f"GPU VRAM (step {global_step}, after eval)")
-                log_metrics(self.logger, global_step, loss_val, lr, eval_metrics=eval_metrics)
+            if eval_metrics is not None:
                 current = eval_metrics.get(self.best_metric_name)
                 if current is not None:
                     pbar.write(
@@ -256,6 +259,7 @@ class Trainer:
                         rank=self.rank,
                     )
 
+            pbar.update(1)
             global_step += 1
             if global_step > max_steps:
                 break
