@@ -19,7 +19,9 @@ from torch.utils.data import Dataset
 
 from src.data.trajectories import discount_cumsum, sample_context_trajectories
 
-PromptArrays = Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+PromptArrays = Tuple[
+    np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray
+]
 
 
 def _subsample_indices(length: int, cap: Optional[int], strategy: str) -> np.ndarray:
@@ -50,6 +52,7 @@ def _pad_or_trim_prompt(
     prtg: np.ndarray,
     pts: np.ndarray,
     pm: np.ndarray,
+    ptrial: np.ndarray,
     total_plen: int,
     state_dim: int,
     act_dim: int,
@@ -58,22 +61,24 @@ def _pad_or_trim_prompt(
     """Pad at front or trim to total_plen. If take_last, trim from the start; else trim from the end."""
     if ps.shape[0] >= total_plen:
         if take_last:
-            ps, pa, pr, prtg, pts, pm = (
+            ps, pa, pr, prtg, pts, pm, ptrial = (
                 ps[-total_plen:],
                 pa[-total_plen:],
                 pr[-total_plen:],
                 prtg[-total_plen:],
                 pts[-total_plen:],
                 pm[-total_plen:],
+                ptrial[-total_plen:],
             )
         else:
-            ps, pa, pr, prtg, pts, pm = (
+            ps, pa, pr, prtg, pts, pm, ptrial = (
                 ps[:total_plen],
                 pa[:total_plen],
                 pr[:total_plen],
                 prtg[:total_plen],
                 pts[:total_plen],
                 pm[:total_plen],
+                ptrial[:total_plen],
             )
     else:
         pad_len = total_plen - ps.shape[0]
@@ -83,7 +88,22 @@ def _pad_or_trim_prompt(
         prtg = np.concatenate([np.zeros((pad_len, 1)), prtg], axis=0)
         pts = np.concatenate([np.zeros(pad_len), pts], axis=0)
         pm = np.concatenate([np.zeros(pad_len), pm], axis=0)
-    return ps, pa, pr, prtg, pts, pm
+        ptrial = np.concatenate([np.zeros(pad_len, dtype=np.float32), ptrial], axis=0)
+    return ps, pa, pr, prtg, pts, pm, ptrial
+
+
+def _empty_prompt_segment(
+    state_dim: int, act_dim: int
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Length-0 prompt (no context trajectories). No timestep padding."""
+    z = np.zeros((0, state_dim), dtype=np.float32)
+    az = np.ones((0, act_dim), dtype=np.float32) * (-10.0)
+    rz = np.zeros((0, 1), dtype=np.float32)
+    rtz = np.zeros((0, 1), dtype=np.float32)
+    tz = np.zeros(0, dtype=np.float32)
+    mz = np.zeros(0, dtype=np.float32)
+    p_tz = np.zeros(0, dtype=np.float32)
+    return z, az, rz, rtz, tz, mz, p_tz
 
 
 class ICLTrajectoryDatasetBase(Dataset, ABC):
@@ -97,13 +117,12 @@ class ICLTrajectoryDatasetBase(Dataset, ABC):
         trajectories: List[Dict[str, np.ndarray]],
         horizon: int,
         max_episode_steps: int,
-        return_scale: float,
+        rtg_scale: float,
         device: torch.device,
         prompt_trajectories_per_task: Optional[List[List[Dict[str, np.ndarray]]]] = None,
         context_dim: int = 16,
         state_dim: int = 27,
         act_dim: int = 8,
-        scale: float = 500.0,
         total_epi_per_task: int = 100,
         num_context_trajectories: int = 1,
         randomize_num_context_trajectories: bool = False,
@@ -127,13 +146,12 @@ class ICLTrajectoryDatasetBase(Dataset, ABC):
         # Query = last K steps of current trajectory; K=1 = OpenVLA-style; None = use horizon
         self._query_length = horizon if query_history_length is None else query_history_length
         self.max_episode_steps = max_episode_steps
-        self.return_scale = return_scale
+        self.rtg_scale = rtg_scale
         self.device = device
         self.prompt_trajectories_per_task = prompt_trajectories_per_task or []
         self.context_dim = context_dim
         self.state_dim = state_dim
         self.act_dim = act_dim
-        self.scale = scale
         self.total_epi_per_task = total_epi_per_task
         self.num_context_trajectories = num_context_trajectories
         self.randomize_num_context_trajectories = randomize_num_context_trajectories
@@ -163,7 +181,7 @@ class ICLTrajectoryDatasetBase(Dataset, ABC):
         self.return_min = float(returns.min())
         self.return_max = float(returns.max())
         self.return_avg = float(returns.mean())
-    
+
     def _sample_num_context_trajectories(self) -> int:
         """Max prior count N = num_context_trajectories; m in {0..N} when randomize, else always N."""
         n = self.num_context_trajectories
@@ -197,7 +215,7 @@ class ICLTrajectoryDatasetBase(Dataset, ABC):
         state_std: np.ndarray,
         total_plen: int,
     ) -> PromptArrays:
-        """Build (ps, pa, pr, prtg, pts, pm) of length total_plen from chosen context trajectories."""
+        """Build (ps, pa, pr, prtg, pts, pm, ptrial) of length total_plen from chosen context trajectories."""
         raise NotImplementedError
 
     def _build_main_segment(
@@ -205,9 +223,10 @@ class ICLTrajectoryDatasetBase(Dataset, ABC):
         traj: Dict[str, np.ndarray],
         si: int,
         traj_contexts: np.ndarray,
+        query_trial_idx: int,
     ) -> Tuple[np.ndarray, ...]:
-        """Build the 8 main-segment arrays for (traj, si). Uses last K steps ending at si (K = query_history_length or horizon).
-        So: segment = [si-K+1 .. si] padded to length K at front. K=1 is OpenVLA-style (current obs only)."""
+        """Build the 9 main-segment arrays for (traj, si). Uses last K steps ending at si (K = query_history_length or horizon).
+        **Left-pads** with mask 0 when the prefix is shorter than K (same as eval ``get_action`` with ``query_window=K`` when there is no ICL prompt). K=1 is OpenVLA-style (current obs only)."""
         K = self._query_length
         max_ep_len = self.max_episode_steps
         state_mean, state_std = self.state_mean, self.state_std
@@ -233,12 +252,25 @@ class ICLTrajectoryDatasetBase(Dataset, ABC):
         reward_seg = np.concatenate([np.zeros((pad_len, 1)), reward_seg], axis=0)
         done_seg = np.concatenate([np.ones(pad_len) * 2, done_seg], axis=0)
         rtg_seg = discount_cumsum(traj["rewards"][start:], gamma=1.0)[:tlen].reshape(-1, 1)
-        rtg_seg = np.concatenate([np.zeros((pad_len, 1)), rtg_seg], axis=0) / self.return_scale
+        rtg_seg = np.concatenate([np.zeros((pad_len, 1)), rtg_seg], axis=0) / self.rtg_scale
         ts_seg = np.arange(start, start + tlen, dtype=np.float32)
         ts_seg[ts_seg >= max_ep_len] = max_ep_len - 1
         ts_seg = np.concatenate([np.zeros(pad_len), ts_seg], axis=0)
         mask_seg = np.concatenate([np.zeros(pad_len), np.ones(tlen)], axis=0)
-        return state_seg, context_seg, action_seg, reward_seg, done_seg, rtg_seg, ts_seg, mask_seg
+        trial_seg = np.concatenate(
+            [np.zeros(pad_len, dtype=np.float32), np.full(tlen, query_trial_idx, dtype=np.float32)]
+        )
+        return (
+            state_seg,
+            context_seg,
+            action_seg,
+            reward_seg,
+            done_seg,
+            rtg_seg,
+            ts_seg,
+            mask_seg,
+            trial_seg,
+        )
 
     def _log_prompt_context_returns_sample(
         self,
@@ -281,12 +313,20 @@ class ICLTrajectoryDatasetBase(Dataset, ABC):
             )
         chosen = self._choose_context_trajectories(prompt_list, traj)
         self._log_prompt_context_returns_sample(chosen, traj_idx, si)
-        ps, pa, pr, prtg, pts, pm = self._build_prompt(
+        ps, pa, pr, prtg, pts, pm, ppt = self._build_prompt(
             chosen, self.state_mean, self.state_std, self.total_prompt_len
         )
-        (state_seg, context_seg, action_seg, reward_seg, done_seg, rtg_seg, ts_seg, mask_seg) = (
-            self._build_main_segment(traj, si, traj_contexts)
-        )
+        (
+            state_seg,
+            context_seg,
+            action_seg,
+            reward_seg,
+            done_seg,
+            rtg_seg,
+            ts_seg,
+            mask_seg,
+            trial_seg,
+        ) = self._build_main_segment(traj, si, traj_contexts, len(chosen))
         instruction = ""
         if self.task_instructions and task_id < len(self.task_instructions):
             instruction = self.task_instructions[task_id] or ""
@@ -314,12 +354,14 @@ class ICLTrajectoryDatasetBase(Dataset, ABC):
             rtg_seg,
             ts_seg,
             mask_seg,
+            trial_seg,
             ps,
             pa,
             pr,
             prtg,
             pts,
             pm,
+            ppt,
             instruction,
             images_out,
         )
@@ -335,7 +377,16 @@ class ICLTrajectoryDatasetBase(Dataset, ABC):
             [],
             [],
         )
-        prompt_s, prompt_a, prompt_r, prompt_rtg, prompt_ts, prompt_m = [], [], [], [], [], []
+        prompt_s, prompt_a, prompt_r, prompt_rtg, prompt_ts, prompt_m, prompt_trials = (
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+        )
+        query_trials: List[np.ndarray] = []
         if self.task_instructions is not None:
             self._task_ids = []
         state_mean, state_std = self.state_mean, self.state_std
@@ -358,7 +409,7 @@ class ICLTrajectoryDatasetBase(Dataset, ABC):
             for si in range(traj["rewards"].shape[0] - 1):
                 chosen = self._choose_context_trajectories(prompt_list, traj)
                 self._log_prompt_context_returns_sample(chosen, num, si)
-                ps, pa, pr, prtg, pts, pm = self._build_prompt(
+                ps, pa, pr, prtg, pts, pm, ppt = self._build_prompt(
                     chosen, state_mean, state_std, total_plen
                 )
                 prompt_s.append(ps)
@@ -367,6 +418,7 @@ class ICLTrajectoryDatasetBase(Dataset, ABC):
                 prompt_rtg.append(prtg)
                 prompt_ts.append(pts)
                 prompt_m.append(pm)
+                prompt_trials.append(ppt)
 
                 (
                     state_seg,
@@ -377,7 +429,8 @@ class ICLTrajectoryDatasetBase(Dataset, ABC):
                     rtg_seg,
                     ts_seg,
                     mask_seg,
-                ) = self._build_main_segment(traj, si, traj_contexts)
+                    trial_seg,
+                ) = self._build_main_segment(traj, si, traj_contexts, len(chosen))
                 states.append(state_seg)
                 contexts.append(context_seg)
                 actions.append(action_seg)
@@ -386,6 +439,7 @@ class ICLTrajectoryDatasetBase(Dataset, ABC):
                 rtg.append(rtg_seg)
                 timesteps.append(ts_seg)
                 masks.append(mask_seg)
+                query_trials.append(trial_seg)
                 if self.task_instructions is not None:
                     self._task_ids.append(
                         task_id
@@ -405,6 +459,8 @@ class ICLTrajectoryDatasetBase(Dataset, ABC):
         self.prompt_rtg = torch.from_numpy(np.stack(prompt_rtg)).float().to(self.device)
         self.prompt_timesteps = torch.from_numpy(np.stack(prompt_ts)).long().to(self.device)
         self.prompt_masks = torch.from_numpy(np.stack(prompt_m)).float().to(self.device)
+        self.query_trials = torch.from_numpy(np.stack(query_trials)).long().to(self.device)
+        self.prompt_trials = torch.from_numpy(np.stack(prompt_trials)).long().to(self.device)
 
     def __len__(self) -> int:
         if self._lazy:
@@ -431,12 +487,14 @@ class ICLTrajectoryDatasetBase(Dataset, ABC):
             rtg_seg,
             ts_seg,
             mask_seg,
+            trial_seg,
             ps,
             pa,
             pr,
             prtg,
             pts,
             pm,
+            ppt,
             instruction,
             images_out,
         ) = out
@@ -463,12 +521,14 @@ class ICLTrajectoryDatasetBase(Dataset, ABC):
             _to_t(rtg_seg),
             _to_t(ts_seg, True),
             _to_t(mask_seg),
+            _to_t(trial_seg, True),
             _to_t(ps),
             _to_t(pa),
             _to_t(pr),
             _to_t(prtg),
             _to_t(pts, True),
             _to_t(pm),
+            _to_t(ppt, True),
             instruction,
         )
         if self.use_vision:
@@ -492,12 +552,14 @@ class ICLTrajectoryDatasetBase(Dataset, ABC):
             self.rtg[index],
             self.timesteps[index],
             self.masks[index],
+            self.query_trials[index],
             self.prompt_states[index],
             self.prompt_actions[index],
             self.prompt_rewards[index],
             self.prompt_rtg[index],
             self.prompt_timesteps[index],
             self.prompt_masks[index],
+            self.prompt_trials[index],
             instruction,
         )
         if self.use_vision:
@@ -516,14 +578,13 @@ class SubsampledICLTrajectoryDataset(ICLTrajectoryDatasetBase):
         trajectories: List[Dict[str, np.ndarray]],
         horizon: int,
         max_episode_steps: int,
-        return_scale: float,
+        rtg_scale: float,
         device: torch.device,
         prompt_trajectories_per_task: Optional[List[List[Dict[str, np.ndarray]]]] = None,
         context_dim: int = 16,
         state_dim: int = 27,
         act_dim: int = 8,
         prompt_length: int = 5,
-        scale: float = 500.0,
         total_epi_per_task: int = 100,
         num_context_trajectories: int = 1,
         context_sort_ascending: bool = True,
@@ -536,13 +597,12 @@ class SubsampledICLTrajectoryDataset(ICLTrajectoryDatasetBase):
             trajectories=trajectories,
             horizon=horizon,
             max_episode_steps=max_episode_steps,
-            return_scale=return_scale,
+            rtg_scale=rtg_scale,
             device=device,
             prompt_trajectories_per_task=prompt_trajectories_per_task,
             context_dim=context_dim,
             state_dim=state_dim,
             act_dim=act_dim,
-            scale=scale,
             total_epi_per_task=total_epi_per_task,
             num_context_trajectories=num_context_trajectories,
             context_sort_ascending=context_sort_ascending,
@@ -574,6 +634,7 @@ class SubsampledICLTrajectoryDataset(ICLTrajectoryDatasetBase):
         traj: Dict[str, np.ndarray],
         state_mean: np.ndarray,
         state_std: np.ndarray,
+        trial_idx: int,
     ) -> PromptArrays:
         """One segment of length prompt_length from a trajectory (random start)."""
         L = self.prompt_length
@@ -593,10 +654,13 @@ class SubsampledICLTrajectoryDataset(ICLTrajectoryDatasetBase):
         ps = np.concatenate([np.zeros((pad, ps.shape[1])), ps], axis=0)
         pa = np.concatenate([np.ones((pad, pa.shape[1])) * -10.0, pa], axis=0)
         pr = np.concatenate([np.zeros((pad, 1)), pr], axis=0)
-        prtg = np.concatenate([np.zeros((pad, 1)), prtg], axis=0) / self.scale
+        prtg = np.concatenate([np.zeros((pad, 1)), prtg], axis=0) / self.rtg_scale
         pts = np.concatenate([np.zeros(pad), pts], axis=0)
         pm = np.concatenate([np.zeros(pad), np.ones(plen)], axis=0)
-        return ps, pa, pr, prtg, pts, pm
+        ptrial = np.concatenate(
+            [np.zeros(pad, dtype=np.float32), np.full(plen, trial_idx, dtype=np.float32)]
+        )
+        return ps, pa, pr, prtg, pts, pm, ptrial
 
     def _build_prompt(
         self,
@@ -606,32 +670,63 @@ class SubsampledICLTrajectoryDataset(ICLTrajectoryDatasetBase):
         total_plen: int,
     ) -> PromptArrays:
         if not chosen:
-            z = np.zeros((0, self.state_dim), dtype=np.float32)
-            az = np.ones((0, self.act_dim), dtype=np.float32) * (-10.0)
-            rz = np.zeros((0, 1), dtype=np.float32)
-            rtz = np.zeros((0, 1), dtype=np.float32)
-            tz = np.zeros(0, dtype=np.float32)
-            mz = np.zeros(0, dtype=np.float32)
+            # Lazy: true zero-length prompt (collate pads per batch to max prompt len only).
+            # Eager: pad to total_plen so pre-stacked tensors share one fixed width.
+            if self._lazy:
+                return _empty_prompt_segment(self.state_dim, self.act_dim)
+            z, az, rz, rtz, tz, mz, p_tz = _empty_prompt_segment(self.state_dim, self.act_dim)
             return _pad_or_trim_prompt(
-                z, az, rz, rtz, tz, mz, total_plen, self.state_dim, self.act_dim, take_last=False
+                z,
+                az,
+                rz,
+                rtz,
+                tz,
+                mz,
+                p_tz,
+                total_plen,
+                self.state_dim,
+                self.act_dim,
+                take_last=False,
             )
-        segs_ps, segs_pa, segs_pr, segs_prtg, segs_pts, segs_pm = [], [], [], [], [], []
-        for traj in chosen:
-            s, a, r, rtg_, ts, m = self._segment_from_traj(traj, state_mean, state_std)
+        segs_ps, segs_pa, segs_pr, segs_prtg, segs_pts, segs_pm, segs_ptrial = (
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+        )
+        for trial_idx, traj in enumerate(chosen):
+            s, a, r, rtg_, ts, m, pt = self._segment_from_traj(
+                traj, state_mean, state_std, trial_idx
+            )
             segs_ps.append(s)
             segs_pa.append(a)
             segs_pr.append(r)
             segs_prtg.append(rtg_)
             segs_pts.append(ts)
             segs_pm.append(m)
+            segs_ptrial.append(pt)
         ps = np.concatenate(segs_ps, axis=0)
         pa = np.concatenate(segs_pa, axis=0)
         pr = np.concatenate(segs_pr, axis=0)
         prtg = np.concatenate(segs_prtg, axis=0)
         pts = np.concatenate(segs_pts, axis=0)
         pm = np.concatenate(segs_pm, axis=0)
+        ptrial = np.concatenate(segs_ptrial, axis=0)
         return _pad_or_trim_prompt(
-            ps, pa, pr, prtg, pts, pm, total_plen, self.state_dim, self.act_dim, take_last=False
+            ps,
+            pa,
+            pr,
+            prtg,
+            pts,
+            pm,
+            ptrial,
+            total_plen,
+            self.state_dim,
+            self.act_dim,
+            take_last=False,
         )
 
 
@@ -647,13 +742,12 @@ class FullTrajectoryICLTrajectoryDataset(ICLTrajectoryDatasetBase):
         trajectories: List[Dict[str, np.ndarray]],
         horizon: int,
         max_episode_steps: int,
-        return_scale: float,
+        rtg_scale: float,
         device: torch.device,
         prompt_trajectories_per_task: Optional[List[List[Dict[str, np.ndarray]]]] = None,
         context_dim: int = 16,
         state_dim: int = 27,
         act_dim: int = 8,
-        scale: float = 500.0,
         total_epi_per_task: int = 100,
         num_context_trajectories: int = 1,
         context_sort_ascending: bool = True,
@@ -663,19 +757,20 @@ class FullTrajectoryICLTrajectoryDataset(ICLTrajectoryDatasetBase):
         trajectory_contexts: Optional[Dict[int, np.ndarray]] = None,
         **kwargs: Any,
     ):
-        if not max_total_prompt_length:
-            raise ValueError("FullTrajectoryICLTrajectoryDataset requires max_total_prompt_length")
+        if max_total_prompt_length is None:
+            raise ValueError(
+                "FullTrajectoryICLTrajectoryDataset requires max_total_prompt_length (int; use 0 for no context / no prompt padding)."
+            )
         super().__init__(
             trajectories=trajectories,
             horizon=horizon,
             max_episode_steps=max_episode_steps,
-            return_scale=return_scale,
+            rtg_scale=rtg_scale,
             device=device,
             prompt_trajectories_per_task=prompt_trajectories_per_task,
             context_dim=context_dim,
             state_dim=state_dim,
             act_dim=act_dim,
-            scale=scale,
             total_epi_per_task=total_epi_per_task,
             num_context_trajectories=num_context_trajectories,
             context_sort_ascending=context_sort_ascending,
@@ -704,12 +799,15 @@ class FullTrajectoryICLTrajectoryDataset(ICLTrajectoryDatasetBase):
         traj: Dict[str, np.ndarray],
         state_mean: np.ndarray,
         state_std: np.ndarray,
+        trial_idx: int,
     ) -> PromptArrays:
         """Full trajectory arrays with optional per-trajectory subsampling cap."""
         T = traj["rewards"].shape[0]
         if T == 0:
             raise ValueError("Empty trajectory in _prompt_from_full_trajectory")
-        idx = _subsample_indices(T, self.max_prompt_trajectory_length, self.context_subsample_strategy)
+        idx = _subsample_indices(
+            T, self.max_prompt_trajectory_length, self.context_subsample_strategy
+        )
         obs = np.asarray(traj["observations"], dtype=np.float32)
         act = np.asarray(traj["actions"], dtype=np.float32)
         rew = np.asarray(traj["rewards"], dtype=np.float32)
@@ -717,11 +815,12 @@ class FullTrajectoryICLTrajectoryDataset(ICLTrajectoryDatasetBase):
         ps = (obs[idx] - state_mean) / state_std
         pa = act[idx]
         pr = rew[idx].reshape(-1, 1)
-        prtg = full_rtg[idx] / self.scale
+        prtg = full_rtg[idx] / self.rtg_scale
         pts = idx.astype(np.float32)
         T = idx.shape[0]
         pm = np.ones(T, dtype=np.float32)
-        return ps, pa, pr, prtg, pts, pm
+        ptrial = np.full(T, trial_idx, dtype=np.float32)
+        return ps, pa, pr, prtg, pts, pm, ptrial
 
     def _build_prompt(
         self,
@@ -731,32 +830,61 @@ class FullTrajectoryICLTrajectoryDataset(ICLTrajectoryDatasetBase):
         total_plen: int,
     ) -> PromptArrays:
         if not chosen:
-            z = np.zeros((0, self.state_dim), dtype=np.float32)
-            az = np.ones((0, self.act_dim), dtype=np.float32) * (-10.0)
-            rz = np.zeros((0, 1), dtype=np.float32)
-            rtz = np.zeros((0, 1), dtype=np.float32)
-            tz = np.zeros(0, dtype=np.float32)
-            mz = np.zeros(0, dtype=np.float32)
+            if self._lazy:
+                return _empty_prompt_segment(self.state_dim, self.act_dim)
+            z, az, rz, rtz, tz, mz, p_tz = _empty_prompt_segment(self.state_dim, self.act_dim)
             return _pad_or_trim_prompt(
-                z, az, rz, rtz, tz, mz, total_plen, self.state_dim, self.act_dim, take_last=True
+                z,
+                az,
+                rz,
+                rtz,
+                tz,
+                mz,
+                p_tz,
+                total_plen,
+                self.state_dim,
+                self.act_dim,
+                take_last=True,
             )
-        segs_ps, segs_pa, segs_pr, segs_prtg, segs_pts, segs_pm = [], [], [], [], [], []
-        for traj in chosen:
-            s, a, r, rtg_, ts, m = self._prompt_from_full_trajectory(traj, state_mean, state_std)
+        segs_ps, segs_pa, segs_pr, segs_prtg, segs_pts, segs_pm, segs_ptrial = (
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+        )
+        for trial_idx, traj in enumerate(chosen):
+            s, a, r, rtg_, ts, m, pt = self._prompt_from_full_trajectory(
+                traj, state_mean, state_std, trial_idx
+            )
             segs_ps.append(s)
             segs_pa.append(a)
             segs_pr.append(r)
             segs_prtg.append(rtg_)
             segs_pts.append(ts)
             segs_pm.append(m)
+            segs_ptrial.append(pt)
         ps = np.concatenate(segs_ps, axis=0)
         pa = np.concatenate(segs_pa, axis=0)
         pr = np.concatenate(segs_pr, axis=0)
         prtg = np.concatenate(segs_prtg, axis=0)
         pts = np.concatenate(segs_pts, axis=0)
         pm = np.concatenate(segs_pm, axis=0)
+        ptrial = np.concatenate(segs_ptrial, axis=0)
         return _pad_or_trim_prompt(
-            ps, pa, pr, prtg, pts, pm, total_plen, self.state_dim, self.act_dim, take_last=True
+            ps,
+            pa,
+            pr,
+            prtg,
+            pts,
+            pm,
+            ptrial,
+            total_plen,
+            self.state_dim,
+            self.act_dim,
+            take_last=True,
         )
 
 
@@ -791,16 +919,17 @@ def collate_icl_batch(batch: List[Tuple[Any, ...]]) -> Tuple[Any, ...]:
     Collate a list of ICL trajectory samples into a batch. Pads tensors with varying
     first dimension (e.g. prompt length) to the max in the batch so they can be stacked.
     Mask tensors (masks, prompt_m) are padded with 0 so padded positions are ignored.
-    If samples have 16 elements, the 16th is images (list of view tensors); collate pads and stacks per view.
+    Layout: 0–7 query, 8 query_trial_idx, 9–14 prompt (s,a,r,rtg,ts,m), 15 prompt_trial_idx, 16 instructions;
+    optional 17 images/embeddings, 18+ index metadata.
     """
     if not batch:
         return tuple()
     n = len(batch)
     num_elems = len(batch[0])
     out: List[Any] = []
-    for idx in range(15):
+    for idx in range(17):
         items = [sample[idx] for sample in batch]
-        if idx == 14:
+        if idx == 16:
             out.append(items)
             continue
         tensors = [t for t in items if isinstance(t, torch.Tensor)]
@@ -813,33 +942,29 @@ def collate_icl_batch(batch: List[Tuple[Any, ...]]) -> Tuple[Any, ...]:
             out.append(torch.stack(tensors, dim=0))
             continue
         pad_val = 0.0
-        if idx in (5, 7, 13):
-            pad_val = 0.0
-        elif idx in (8, 9, 10, 11, 12):
-            pad_val = 0.0
-        # Prompt tensors (8–13): left-pad so valid content is right-aligned with query (correct for causal attention)
-        if idx in (8, 9, 10, 11, 12, 13):
+        # Prompt tensors (9–15): left-pad so valid content is right-aligned with query (correct for causal attention)
+        if idx in (9, 10, 11, 12, 13, 14, 15):
             padded = [_pad_to_length_left(t, max_len, dim=0, pad_value=pad_val) for t in tensors]
         else:
             padded = [_pad_to_length(t, max_len, dim=0, pad_value=pad_val) for t in tensors]
         out.append(torch.stack(padded, dim=0))
-    if num_elems > 15:
-        elem_15 = batch[0][15]
+    if num_elems > 17:
+        elem_17 = batch[0][17]
         is_precomputed = any(
-            sample[15] is not None
-            and isinstance(sample[15], torch.Tensor)
-            and sample[15].dim() in (2, 3)
+            sample[17] is not None
+            and isinstance(sample[17], torch.Tensor)
+            and sample[17].dim() in (2, 3)
             for sample in batch
         )
         if not is_precomputed and (
-            elem_15 is None or not isinstance(elem_15, torch.Tensor) or elem_15.dim() not in (2, 3)
+            elem_17 is None or not isinstance(elem_17, torch.Tensor) or elem_17.dim() not in (2, 3)
         ):
-            elem_15 = None
-        if elem_15 is None and not is_precomputed:
+            elem_17 = None
+        if elem_17 is None and not is_precomputed:
             out.append(None)
         elif is_precomputed:
             # Precomputed embeddings: each sample (1, T, D) or None; pad T and stack to (B, T_max, D)
-            tensors = [sample[15] for sample in batch]
+            tensors = [sample[17] for sample in batch]
             non_none = [t for t in tensors if t is not None]
             if not non_none:
                 out.append(None)
@@ -911,7 +1036,7 @@ def collate_icl_batch(batch: List[Tuple[Any, ...]]) -> Tuple[Any, ...]:
                         padded.append(p)
                 out.append(torch.stack(padded, dim=0))
         else:
-            images_list = [sample[15] for sample in batch]
+            images_list = [sample[17] for sample in batch]
             if not all(
                 im is not None and isinstance(im, list) and len(im) > 0 for im in images_list
             ):
@@ -942,8 +1067,8 @@ def collate_icl_batch(batch: List[Tuple[Any, ...]]) -> Tuple[Any, ...]:
                         padded_v.append(t)
                     view_batches.append(torch.cat(padded_v, dim=0))
                 out.append(view_batches if view_batches else None)
-    if num_elems > 16:
-        out.append([sample[16] for sample in batch])
+    if num_elems > 18:
+        out.append([sample[18] for sample in batch])
     return tuple(out)
 
 

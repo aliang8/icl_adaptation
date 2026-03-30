@@ -45,6 +45,8 @@ class MetaDecisionTransformer(nn.Module):
         predict_returns: bool = False,
         predict_state: bool = False,
         condition_rtg: bool = True,
+        use_trial_index_embedding: bool = False,
+        max_trial_embeddings: int = 64,
         **kwargs,
     ):
         super().__init__()
@@ -54,6 +56,8 @@ class MetaDecisionTransformer(nn.Module):
         self._predict_returns = predict_returns
         self._predict_state = predict_state
         self._condition_rtg = condition_rtg
+        self.use_trial_index_embedding = use_trial_index_embedding
+        self.max_trial_embeddings = max(1, int(max_trial_embeddings))
         self.act_dim = act_dim
         self.context_dim = context_dim
         self.max_length = max_length
@@ -83,6 +87,12 @@ class MetaDecisionTransformer(nn.Module):
         self.prompt_embed_return = nn.Linear(1, hidden_size)
         self.prompt_embed_state = nn.Linear(state_dim, hidden_size)
         self.prompt_embed_action = nn.Linear(act_dim, hidden_size)
+        # Discrete trial id (which context segment / query), same idea as embed_timestep for time index.
+        self.embed_trial_idx = (
+            nn.Embedding(self.max_trial_embeddings, hidden_size)
+            if use_trial_index_embedding
+            else None
+        )
         self.embed_ln = nn.LayerNorm(hidden_size)
 
         self.predict_state = nn.Linear(hidden_size, state_dim)
@@ -101,6 +111,13 @@ class MetaDecisionTransformer(nn.Module):
         self.use_language = False
         self.vision_encoder = None
 
+    def _embed_trial_idx(self, trial_indices: Tensor) -> Tensor:
+        """Map integer trial indices to hidden_dim vectors (nn.Embedding), clamped to table size."""
+        if self.embed_trial_idx is None:
+            raise RuntimeError("_embed_trial_idx called while use_trial_index_embedding is off")
+        idx = trial_indices.long().clamp(0, self.embed_trial_idx.num_embeddings - 1)
+        return self.embed_trial_idx(idx)
+
     def forward(self, batch: DTBatch) -> DTOutput:
         B, T = batch.states.shape[0], batch.states.shape[1]
         mask = batch.attention_mask
@@ -108,12 +125,23 @@ class MetaDecisionTransformer(nn.Module):
             mask = torch.ones((B, T), dtype=torch.long, device=batch.states.device)
 
         state_emb = self.encode_state(batch)
+        B, T = batch.states.shape[0], batch.states.shape[1]
+        trial_e: Optional[Tensor] = None
+        if self.embed_trial_idx is not None:
+            ti = batch.trial_indices
+            if ti is None:
+                ti = torch.zeros((B, T), dtype=torch.long, device=batch.states.device)
+            trial_e = self._embed_trial_idx(ti)
         return_emb = None
         if self._condition_rtg:
             return_emb = self.embed_return(batch.returns_to_go) + self.embed_timestep(
                 batch.timesteps.long()
             )
+            if trial_e is not None:
+                return_emb = return_emb + trial_e
         action_emb = self.embed_action(batch.actions) + self.embed_timestep(batch.timesteps.long())
+        if trial_e is not None:
+            action_emb = action_emb + trial_e
 
         stacked, stacked_mask, tokens_per_step = self._stack_with_prompt(
             return_emb, state_emb, action_emb, mask, batch.prompt, T
@@ -137,14 +165,9 @@ class MetaDecisionTransformer(nn.Module):
             loss = self.compute_loss(pred_actions, batch.actions, mask)
         else:
             if batch.prompt is not None:
-                (
-                    _,
-                    prompt_actions,
-                    _,
-                    _,
-                    _,
-                    prompt_attention_mask,
-                ) = batch.prompt
+                p = batch.prompt
+                prompt_actions = p[1]
+                prompt_attention_mask = p[5]
                 full_actions = torch.cat(
                     [prompt_actions.to(pred_actions_full.device), batch.actions], dim=1
                 )
@@ -165,7 +188,13 @@ class MetaDecisionTransformer(nn.Module):
         ts = batch.timesteps.long()
         enc = self.state_encoder(batch.states)
         state_emb = self.embed_state(torch.cat((enc, batch.contexts), dim=-1))
-        return state_emb + self.embed_timestep(ts)
+        out = state_emb + self.embed_timestep(ts)
+        if self.embed_trial_idx is not None:
+            ti = batch.trial_indices
+            if ti is None:
+                ti = torch.zeros_like(ts)
+            out = out + self._embed_trial_idx(ti)
+        return out
 
     def _stack_with_prompt(
         self,
@@ -200,14 +229,26 @@ class MetaDecisionTransformer(nn.Module):
         stacked = self.embed_ln(stacked)
 
         if prompt is not None:
-            (
-                prompt_states,
-                prompt_actions,
-                _,
-                prompt_returns_to_go,
-                prompt_timesteps,
-                prompt_attention_mask,
-            ) = prompt
+            prompt_trial = None
+            if len(prompt) >= 7:
+                (
+                    prompt_states,
+                    prompt_actions,
+                    _,
+                    prompt_returns_to_go,
+                    prompt_timesteps,
+                    prompt_attention_mask,
+                    prompt_trial,
+                ) = prompt[:7]
+            else:
+                (
+                    prompt_states,
+                    prompt_actions,
+                    _,
+                    prompt_returns_to_go,
+                    prompt_timesteps,
+                    prompt_attention_mask,
+                ) = prompt[:6]
             # If RTG has one extra element (e.g. data quirk), drop last step from all prompt tensors so lengths align
             if prompt_returns_to_go.shape[1] % 10 == 1 and prompt_returns_to_go.shape[1] > 1:
                 prompt_states = prompt_states[:, :-1]
@@ -215,15 +256,31 @@ class MetaDecisionTransformer(nn.Module):
                 prompt_returns_to_go = prompt_returns_to_go[:, :-1]
                 prompt_timesteps = prompt_timesteps[:, :-1]
                 prompt_attention_mask = prompt_attention_mask[:, :-1]
+                if prompt_trial is not None:
+                    prompt_trial = prompt_trial[:, :-1]
             prompt_ts = prompt_timesteps.long()
             prompt_T = prompt_states.shape[1]
+            if prompt_trial is None:
+                prompt_trial = torch.zeros(
+                    (prompt_states.shape[0], prompt_T),
+                    dtype=torch.long,
+                    device=prompt_states.device,
+                )
+            else:
+                prompt_trial = prompt_trial.long()
             ps_emb = self.prompt_embed_state(prompt_states) + self.prompt_embed_timestep(prompt_ts)
             pa_emb = self.prompt_embed_action(prompt_actions) + self.prompt_embed_timestep(
                 prompt_ts
             )
+            if self.embed_trial_idx is not None:
+                pt_e = self._embed_trial_idx(prompt_trial)
+                ps_emb = ps_emb + pt_e
+                pa_emb = pa_emb + pt_e
             if return_emb is not None:
                 prtg = self.prompt_embed_return(prompt_returns_to_go)
                 prtg_emb = prtg + self.prompt_embed_timestep(prompt_ts)
+                if self.embed_trial_idx is not None:
+                    prtg_emb = prtg_emb + self._embed_trial_idx(prompt_trial)
                 prompt_stacked = (
                     torch.stack((prtg_emb, ps_emb, pa_emb), dim=1)
                     .permute(0, 2, 1, 3)
@@ -321,21 +378,67 @@ class MetaDecisionTransformer(nn.Module):
         current_step: int,
         **kwargs,
     ) -> Tensor:
-        """Single-step action for inference; pads to max_length and calls forward."""
+        """Single-step inference forward.
+
+        **Action length:** Same as training ``_build_main_segment``, there is one action vector per
+        state timestep. Rollouts may pass only executed actions (length ``T-1``); we append a **zero**
+        row for the current decision step, then read ``pred_actions[..., -1, :]``.
+
+        Query segment matches training (``query_window`` / ``max_length``): left-pad with mask 0 when
+        shorter than K; once history reaches K, use the last K timesteps only.
+        """
         states = states.reshape(1, -1, self.state_dim)
         contexts = contexts.reshape(1, -1, self.context_dim)
         actions = actions.reshape(1, -1, self.act_dim)
         returns_to_go = returns_to_go.reshape(1, -1, 1)
         timesteps = timesteps.reshape(1, -1)
 
-        if self.max_length is not None:
-            states = states[:, -self.max_length :]
-            contexts = contexts[:, -self.max_length :]
-            actions = actions[:, -self.max_length :]
-            returns_to_go = returns_to_go[:, -self.max_length :]
-            timesteps = timesteps[:, -self.max_length :]
+        L_s0 = states.shape[1]
+        # Match training windows: one action slot per state; rollout historically passed one fewer
+        # action (past acts only). Append a dummy action for the current decision timestep.
+        if contexts.shape[1] == 1 and L_s0 > 1:
+            contexts = contexts.expand(1, L_s0, -1)
+        L_a0 = actions.shape[1]
+        if L_a0 == L_s0 - 1:
+            z = torch.zeros(1, 1, self.act_dim, device=actions.device, dtype=actions.dtype)
+            actions = torch.cat([actions, z], dim=1)
+        elif L_a0 != L_s0:
+            raise ValueError(
+                f"get_action: need len(actions)==len(states) or len(states)-1; "
+                f"got states T={L_s0}, actions T={L_a0}"
+            )
+
+        trial_indices_kw = kwargs.get("trial_indices")
+        query_trial_index = int(kwargs.get("query_trial_index", 0))
+
+        qw = kwargs.get("query_window")
+        if qw is not None:
+            query_cap = int(qw)
+        elif self.max_length is not None:
+            query_cap = int(self.max_length)
+        else:
+            query_cap = None
+
+        if query_cap is not None:
+            states = states[:, -query_cap:]
+            contexts = contexts[:, -query_cap:]
+            actions = actions[:, -query_cap:]
+            returns_to_go = returns_to_go[:, -query_cap:]
+            timesteps = timesteps[:, -query_cap:]
+            if trial_indices_kw is not None:
+                trial_indices_kw = trial_indices_kw[:, -query_cap:]
 
         device = states.device
+        if trial_indices_kw is not None:
+            trial_indices = trial_indices_kw.reshape(1, -1).long().to(device)
+        else:
+            trial_indices = torch.full(
+                (1, timesteps.shape[1]),
+                query_trial_index,
+                device=device,
+                dtype=torch.long,
+            )
+
         L_s, L_c, L_a, L_r, L_t = (
             states.shape[1],
             contexts.shape[1],
@@ -343,32 +446,40 @@ class MetaDecisionTransformer(nn.Module):
             returns_to_go.shape[1],
             timesteps.shape[1],
         )
-        pad_s = self.max_length - L_s
-        pad_c = self.max_length - L_c
-        pad_a = self.max_length - L_a
-        pad_r = self.max_length - L_r
-        pad_t = self.max_length - L_t
-        states = torch.cat(
-            [torch.zeros(1, pad_s, self.state_dim, device=device), states], dim=1
-        ).float()
-        contexts = torch.cat(
-            [torch.zeros(1, pad_c, self.context_dim, device=device), contexts], dim=1
-        ).float()
-        actions = torch.cat(
-            [torch.ones(1, pad_a, self.act_dim, device=device) * -10.0, actions], dim=1
-        ).float()
-        returns_to_go = torch.cat(
-            [torch.zeros(1, pad_r, 1, device=device), returns_to_go], dim=1
-        ).float()
-        timesteps = torch.cat(
-            [torch.zeros(1, pad_t, device=device, dtype=torch.long), timesteps], dim=1
-        )
-        attention_mask = torch.cat(
-            [
-                torch.zeros(pad_s, device=device, dtype=torch.long),
-                torch.ones(L_s, device=device, dtype=torch.long),
-            ]
-        ).reshape(1, -1)
+        L_tr = trial_indices.shape[1]
+        if query_cap is not None:
+            pad_s = query_cap - L_s
+            pad_c = query_cap - L_c
+            pad_a = query_cap - L_a
+            pad_r = query_cap - L_r
+            pad_t = query_cap - L_t
+            pad_tr = query_cap - L_tr
+            states = torch.cat(
+                [torch.zeros(1, pad_s, self.state_dim, device=device), states], dim=1
+            ).float()
+            contexts = torch.cat(
+                [torch.zeros(1, pad_c, self.context_dim, device=device), contexts], dim=1
+            ).float()
+            actions = torch.cat(
+                [torch.ones(1, pad_a, self.act_dim, device=device) * -10.0, actions], dim=1
+            ).float()
+            returns_to_go = torch.cat(
+                [torch.zeros(1, pad_r, 1, device=device), returns_to_go], dim=1
+            ).float()
+            timesteps = torch.cat(
+                [torch.zeros(1, pad_t, device=device, dtype=torch.long), timesteps], dim=1
+            )
+            trial_indices = torch.cat(
+                [torch.zeros(1, pad_tr, device=device, dtype=torch.long), trial_indices], dim=1
+            )
+            attention_mask = torch.cat(
+                [
+                    torch.zeros(pad_s, device=device, dtype=torch.long),
+                    torch.ones(L_s, device=device, dtype=torch.long),
+                ]
+            ).reshape(1, -1)
+        else:
+            attention_mask = torch.ones(1, L_s, device=device, dtype=torch.long)
 
         image_embeddings = kwargs.get("image_embeddings")
         instruction_indices = kwargs.get("instruction_indices")
@@ -376,17 +487,35 @@ class MetaDecisionTransformer(nn.Module):
             image_embeddings = image_embeddings.to(device)
             L_img = image_embeddings.shape[1]
             D_img = image_embeddings.shape[2]
-            if L_img >= self.max_length:
-                image_embeddings = image_embeddings[:, -self.max_length :, :]
+            if query_cap is not None:
+                if L_img >= query_cap:
+                    image_embeddings = image_embeddings[:, -query_cap:, :]
+                else:
+                    pad_img = query_cap - L_img
+                    image_embeddings = torch.cat(
+                        [
+                            torch.zeros(
+                                1, pad_img, D_img, device=device, dtype=image_embeddings.dtype
+                            ),
+                            image_embeddings,
+                        ],
+                        dim=1,
+                    )
             else:
-                pad_img = self.max_length - L_img
-                image_embeddings = torch.cat(
-                    [
-                        torch.zeros(1, pad_img, D_img, device=device, dtype=image_embeddings.dtype),
-                        image_embeddings,
-                    ],
-                    dim=1,
-                )
+                Tq = states.shape[1]
+                if L_img >= Tq:
+                    image_embeddings = image_embeddings[:, -Tq:, :]
+                elif L_img < Tq:
+                    pad_img = Tq - L_img
+                    image_embeddings = torch.cat(
+                        [
+                            torch.zeros(
+                                1, pad_img, D_img, device=device, dtype=image_embeddings.dtype
+                            ),
+                            image_embeddings,
+                        ],
+                        dim=1,
+                    )
 
         use_prompt = prompt is not None and current_step > warm_train_steps
         batch = DTBatch(
@@ -396,6 +525,7 @@ class MetaDecisionTransformer(nn.Module):
             returns_to_go=returns_to_go,
             timesteps=timesteps,
             attention_mask=attention_mask,
+            trial_indices=trial_indices,
             prompt=prompt if use_prompt else None,
             image_embeddings=image_embeddings,
             instruction_indices=instruction_indices,

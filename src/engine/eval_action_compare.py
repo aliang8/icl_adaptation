@@ -86,7 +86,7 @@ def run_action_compare_eval(
             states = torch.from_numpy(states_np).float().reshape(1, L, state_dim).to(device)
             contexts = torch.zeros(1, L, context_dim, device=device)
             if t == 0:
-                actions_input = torch.ones(1, 1, act_dim, device=device) * -10.0
+                actions_input = torch.zeros(1, 1, act_dim, device=device)
             else:
                 if use_gt_action:
                     prev_actions = torch.from_numpy(gt_actions[:t].astype(np.float32)).to(device)
@@ -95,21 +95,25 @@ def run_action_compare_eval(
                         device
                     )
                 prev_actions = prev_actions.reshape(1, t, act_dim)
-                pad_last = torch.ones(1, 1, act_dim, device=device) * -10.0
+                pad_last = torch.zeros(1, 1, act_dim, device=device)
                 actions_input = torch.cat([prev_actions, pad_last], dim=1)
             returns_to_go = torch.from_numpy(rtg_seg).float().to(device)
             timesteps = torch.from_numpy(timesteps_np).long().to(device)
+            rewards_unused = torch.zeros(0, device=device, dtype=torch.float32)
 
             with torch.no_grad():
+                qwin = int(model.max_length) if model.max_length is not None else None
                 pred_a = model.get_action(
                     states,
                     contexts,
                     actions_input,
-                    returns_to_go=returns_to_go,
-                    timesteps=timesteps,
+                    rewards_unused,
+                    returns_to_go,
+                    timesteps,
                     prompt=None,
                     warm_train_steps=warm_train_steps,
                     current_step=step,
+                    **({"query_window": qwin} if qwin is not None else {}),
                 )
             pred_np = pred_a.cpu().numpy().flatten()
             pred_list.append(pred_np)

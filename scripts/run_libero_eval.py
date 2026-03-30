@@ -116,7 +116,7 @@ def main():
 
     horizon = cfg.data.horizon
     max_ep_len = cfg.data.max_episode_steps
-    return_scale = cfg.data.return_scale
+    rs_rtg = float(cfg.data.rtg_scale)
 
     results_by_suite = {}
     all_mse = []
@@ -146,7 +146,7 @@ def main():
                 )
                 rewards = traj["rewards"][start : end - 1]
                 rtg = np.array(
-                    [rewards[i:].sum() / return_scale for i in range(len(rewards))],
+                    [rewards[i:].sum() / rs_rtg for i in range(len(rewards))],
                     dtype=np.float32,
                 ).reshape(-1, 1)
                 rtg_t = torch.from_numpy(rtg).float().unsqueeze(0).to(device)

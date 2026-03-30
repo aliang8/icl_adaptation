@@ -36,5 +36,5 @@ vd4rl_max_episodes: null
 vd4rl_shuffle_npz_order: false
 horizon: 20
 max_episode_steps: 1000
-return_scale: 500.0
+rtg_scale: 500.0
 batch_size: 32

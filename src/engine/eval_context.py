@@ -39,12 +39,13 @@ def _prompt_segment_from_traj(
     traj: Dict[str, np.ndarray],
     state_mean: np.ndarray,
     state_std: np.ndarray,
-    scale: float,
+    rtg_scale: float,
     max_prompt_trajectory_length: Optional[int],
     context_subsample_strategy: str,
     state_dim: int,
     act_dim: int,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    trial_idx: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """One trajectory as prompt segment with optional per-trajectory subsampling."""
     T = traj["rewards"].shape[0]
     if T == 0:
@@ -57,11 +58,12 @@ def _prompt_segment_from_traj(
     ps = (obs[idx] - state_mean) / state_std
     pa = act[idx]
     pr = rew[idx].reshape(-1, 1)
-    prtg = full_rtg[idx] / scale
+    prtg = full_rtg[idx] / rtg_scale
     pts = idx.astype(np.float32)
     T = idx.shape[0]
     pm = np.ones(T, dtype=np.float32)
-    return ps, pa, pr, prtg, pts, pm
+    ptrial = np.full(T, trial_idx, dtype=np.float32)
+    return ps, pa, pr, prtg, pts, pm, ptrial
 
 
 def _pad_or_trim_prompt(
@@ -71,6 +73,7 @@ def _pad_or_trim_prompt(
     prtg: np.ndarray,
     pts: np.ndarray,
     pm: np.ndarray,
+    ptrial: np.ndarray,
     total_plen: int,
     state_dim: int,
     act_dim: int,
@@ -83,22 +86,24 @@ def _pad_or_trim_prompt(
     """
     if ps.shape[0] >= total_plen:
         if take_last:
-            ps, pa, pr, prtg, pts, pm = (
+            ps, pa, pr, prtg, pts, pm, ptrial = (
                 ps[-total_plen:],
                 pa[-total_plen:],
                 pr[-total_plen:],
                 prtg[-total_plen:],
                 pts[-total_plen:],
                 pm[-total_plen:],
+                ptrial[-total_plen:],
             )
         else:
-            ps, pa, pr, prtg, pts, pm = (
+            ps, pa, pr, prtg, pts, pm, ptrial = (
                 ps[:total_plen],
                 pa[:total_plen],
                 pr[:total_plen],
                 prtg[:total_plen],
                 pts[:total_plen],
                 pm[:total_plen],
+                ptrial[:total_plen],
             )
     else:
         pad_len = total_plen - ps.shape[0]
@@ -108,7 +113,8 @@ def _pad_or_trim_prompt(
         prtg = np.concatenate([np.zeros((pad_len, 1)), prtg], axis=0)
         pts = np.concatenate([np.zeros(pad_len), pts], axis=0)
         pm = np.concatenate([np.zeros(pad_len), pm], axis=0)
-    return ps, pa, pr, prtg, pts, pm
+        ptrial = np.concatenate([np.zeros(pad_len, dtype=np.float32), ptrial], axis=0)
+    return ps, pa, pr, prtg, pts, pm, ptrial
 
 
 def build_prompt_tuple(
@@ -119,15 +125,15 @@ def build_prompt_tuple(
     max_prompt_trajectory_length: Optional[int],
     state_dim: int,
     act_dim: int,
-    scale: float,
+    rtg_scale: float,
     device: torch.device,
     sort_ascending: bool = True,
     trajectory_returns: Optional[List[float]] = None,
     context_subsample_strategy: str = "none",
 ) -> Optional[Tuple[torch.Tensor, ...]]:
     """
-    Build the 6-tuple (prompt_states, prompt_actions, prompt_rewards, prompt_rtg, prompt_timesteps, prompt_mask)
-    from K trajectories, sorted by return (ascending = worst first, like training context).
+    Build the 7-tuple (prompt_states, prompt_actions, prompt_rewards, prompt_rtg, prompt_timesteps,
+    prompt_mask, prompt_trial_idx) from K trajectories, sorted by return (ascending = worst first, like training).
     If trajectory_returns is provided (same length as trajectories), sort by those instead of sum(rewards).
     Returns None if trajectories is empty.
 
@@ -143,17 +149,26 @@ def build_prompt_tuple(
         sorted_trajs = [trajectories[i] for i in order]
     else:
         sorted_trajs = sort_trajectories_by_return(trajectories, ascending=sort_ascending)
-    segs_ps, segs_pa, segs_pr, segs_prtg, segs_pts, segs_pm = [], [], [], [], [], []
-    for traj in sorted_trajs:
-        ps, pa, pr, prtg, pts, pm = _prompt_segment_from_traj(
+    segs_ps, segs_pa, segs_pr, segs_prtg, segs_pts, segs_pm, segs_ptrial = (
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+    )
+    for trial_idx, traj in enumerate(sorted_trajs):
+        ps, pa, pr, prtg, pts, pm, pt = _prompt_segment_from_traj(
             traj,
             state_mean,
             state_std,
-            scale,
+            rtg_scale,
             max_prompt_trajectory_length,
             context_subsample_strategy,
             state_dim,
             act_dim,
+            trial_idx,
         )
         segs_ps.append(ps)
         segs_pa.append(pa)
@@ -161,14 +176,16 @@ def build_prompt_tuple(
         segs_prtg.append(prtg)
         segs_pts.append(pts)
         segs_pm.append(pm)
+        segs_ptrial.append(pt)
     ps = np.concatenate(segs_ps, axis=0)
     pa = np.concatenate(segs_pa, axis=0)
     pr = np.concatenate(segs_pr, axis=0)
     prtg = np.concatenate(segs_prtg, axis=0)
     pts = np.concatenate(segs_pts, axis=0)
     pm = np.concatenate(segs_pm, axis=0)
-    ps, pa, pr, prtg, pts, pm = _pad_or_trim_prompt(
-        ps, pa, pr, prtg, pts, pm, total_prompt_len, state_dim, act_dim, take_last=True
+    ptrial = np.concatenate(segs_ptrial, axis=0)
+    ps, pa, pr, prtg, pts, pm, ptrial = _pad_or_trim_prompt(
+        ps, pa, pr, prtg, pts, pm, ptrial, total_prompt_len, state_dim, act_dim, take_last=True
     )
     return (
         torch.from_numpy(ps).float().unsqueeze(0).to(device),
@@ -177,4 +194,5 @@ def build_prompt_tuple(
         torch.from_numpy(prtg).float().unsqueeze(0).to(device),
         torch.from_numpy(pts).float().unsqueeze(0).to(device),
         torch.from_numpy(pm).float().unsqueeze(0).to(device),
+        torch.from_numpy(ptrial).float().unsqueeze(0).to(device),
     )

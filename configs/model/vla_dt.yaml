@@ -44,3 +44,5 @@ predict_returns: false
 predict_state: false
 # If true, condition on return-to-go in input (RTG in sequence). If false, input is (state, action) only.
 condition_rtg: true
+use_trial_index_embedding: false
+max_trial_embeddings: 64

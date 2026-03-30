@@ -1,6 +1,9 @@
 """
 Transformer backbones for the decision transformer.
-- gpt2: custom GPT-2 (random init, config-driven).
+- gpt2: custom GPT-2 (random init, config-driven). Replaces HF ``wte`` / ``wpe`` with parameter-free
+  modules that return zeros (same ``forward`` signature as ``nn.Embedding``). Stock ``GPT2Model.forward``
+  is unmodified; adding zero keeps ``inputs_embeds`` unchanged. Old checkpoints with ``wte``/``wpe``
+  weights need ``strict=False`` or key stripping.
 - llama2: HuggingFace LLaMA 2 pretrained; input/output projection to match hidden_size.
 """
 
@@ -11,6 +14,22 @@ from typing import Any, Optional
 import torch
 import torch.nn as nn
 from transformers import GPT2Config, GPT2Model
+
+
+class _ZeroEmbedLike(nn.Module):
+    """Drop-in for ``nn.Embedding``: long indices in, float tensor ``(*, dim)`` out, all zeros."""
+
+    def __init__(self, embedding_dim: int):
+        super().__init__()
+        self.embedding_dim = embedding_dim
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return torch.zeros(
+            *input_ids.shape,
+            self.embedding_dim,
+            device=input_ids.device,
+            dtype=torch.float32,
+        )
 
 
 def build_gpt2_backbone(
@@ -38,7 +57,11 @@ def build_gpt2_backbone(
         n_positions=n_positions,
         **kwargs,
     )
-    return GPT2Model(config)
+    model = GPT2Model(config)
+    d = int(config.n_embd)
+    model.wte = _ZeroEmbedLike(d)
+    model.wpe = _ZeroEmbedLike(d)
+    return model
 
 
 class Llama2BackboneWrapper(nn.Module):

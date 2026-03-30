@@ -1,7 +1,7 @@
 """Typed config schema (OmegaConf structured configs / dataclasses)."""
 
 from dataclasses import dataclass, field
-from typing import Optional, List
+from typing import List, Optional
 
 
 @dataclass
@@ -56,6 +56,10 @@ class ModelConfig:
     predict_state: bool = False
     # Condition on return-to-go in the input (RTG embedding in sequence). If False, input is (state, action) only.
     condition_rtg: bool = True
+    # If True, add learned embedding of trial index (context demo index + query) on each DT token.
+    use_trial_index_embedding: bool = False
+    # Embedding table size; indices are clamped to [0, max_trial_embeddings - 1].
+    max_trial_embeddings: int = 64
 
 
 @dataclass
@@ -66,11 +70,13 @@ class DataConfig:
     data_quality: str = "medium"
     data_dir: str = "all_datasets"
     horizon: int = 20
-    # Query = last K steps of current trajectory; K=1 = OpenVLA-style; None = use horizon
+    # Query = last K steps of current trajectory; K=1 = OpenVLA-style; None = use horizon.
+    # Eval passes this (or horizon) as get_action(query_window=K) so query-only rollouts match train padding.
     query_history_length: Optional[int] = None
     # Used only when context_style=subsampled (steps per context trajectory); ignored when context_style=full_trajectory
     prompt_length: int = 5
-    return_scale: float = 500.0
+    # DT RTG tokens: cumsum(env rewards) / rtg_scale
+    rtg_scale: float = 1.0
     batch_size: int = 128
     num_workers: int = 0
     # tasks
@@ -86,7 +92,7 @@ class DataConfig:
     randomize_num_context_trajectories: bool = True
     context_sort_ascending: bool = True
     context_sampling: str = "random"
-    # Omit/null -> resolved_max_total_prompt_length (max_episode_steps * (num_context_trajectories + 1))
+    # Omit/null -> resolved_max_total_prompt_length (0 if num_context_trajectories<=0 else eps*(n+1))
     max_total_prompt_length: Optional[int] = None
     # Per context demo: null = use full trajectory (within strategy); int = last N steps of each demo before concat
     max_prompt_trajectory_length: Optional[int] = None
@@ -112,13 +118,6 @@ class DataConfig:
     # When true, load precomputed embeddings from episodes/{id}/embeddings.npz (run precompute_libero_embeddings.py first)
     use_precomputed_embeddings: bool = False
     seed: int = 0
-    # Reward normalization at data load (HalfCheetah / trajectories.pkl). "none" = use as-is.
-    # constant: rewards /= reward_norm_constant. standardize | minmax: global over all steps.
-    # Optionally provide reward_normalization_stats_path for fixed stats (cross-shard consistency).
-    reward_normalization: str = "none"
-    reward_norm_constant: float = 1.0
-    reward_norm_epsilon: float = 1e-8
-    reward_normalization_stats_path: Optional[str] = None
     # V-D4RL (https://github.com/conglu1997/v-d4rl): leaf dir data_root/suite/task/split/pixel_size with *.npz (64px) or *.hdf5 (84px)
     vd4rl_suite: str = "main"
     vd4rl_task: str = "walker_walk"
@@ -138,13 +137,17 @@ def resolved_max_total_prompt_length(data_cfg: DataConfig) -> int:
     """
     Total prompt timesteps after concatenating context demos (then pad/trim to this length).
 
-    If ``data.max_total_prompt_length`` is set, returns that value. Otherwise returns
-    ``max_episode_steps * (num_context_trajectories + 1)``.
+    If ``data.max_total_prompt_length`` is set, returns that value.
+    If ``num_context_trajectories <= 0`` and the override is unset, returns **0** (no prompt;
+    query-only sequences use ``horizon`` / ``model.max_length`` only — no filler prompt padding).
+    Otherwise returns ``max_episode_steps * (num_context_trajectories + 1)``.
     """
     if data_cfg.max_total_prompt_length is not None:
         return int(data_cfg.max_total_prompt_length)
-    eps = int(data_cfg.max_episode_steps)
     n = int(data_cfg.num_context_trajectories)
+    if n <= 0:
+        return 0
+    eps = int(data_cfg.max_episode_steps)
     return eps * (n + 1)
 
 
@@ -213,6 +216,8 @@ class ExperimentConfig:
     eval_reward_model: Optional[str] = (
         None  # e.g. "roboreward_8b" | "robometer_4b"; used when eval_reward_source=reward_model
     )
+    # Target future cumulative return G (env reward units) for eval RTG init (token G/rtg_scale). None = token 1.0.
+    eval_target_return: Optional[float] = None
     save_eval_video: bool = (
         False  # if True, wrap eval env with RecordVideo and save to viz/samples/step_XXX/videos/
     )

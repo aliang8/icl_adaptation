@@ -81,36 +81,9 @@ ls datasets/HalfCheetah-v2/expert/trajectories.pkl
 
 ---
 
-## 3b. Reward normalization (optional)
+## 3b. RTG scaling (`data.rtg_scale`)
 
-Offline step rewards in `trajectories.pkl` can be scaled **before** training so RTG / returns sit in a nicer range for the Decision Transformer.
-
-**Modes**
-
-| Mode | Effect |
-|------|--------|
-| `none` | Use rewards as stored in the pkl. |
-| `constant` | `reward <- reward / data.reward_norm_constant` (e.g. `1000`). Episode ranking by return is unchanged. |
-| `standardize` | Global z-score over **all steps**: `(r - mean) / (std + eps)`. Episode **ordering by return can change** vs raw sums. |
-| `minmax` | Global map to **[0, 1]** using dataset min/max of step rewards. |
-
-Apply normalization at data load time (inside training):
-
-```bash
-uv run python -m src.train --override data=[base,halfcheetah] \
-  data.reward_normalization=constant data.reward_norm_constant=1000
-```
-
-Or:
-
-```bash
-uv run python -m src.train --override data=[base,halfcheetah] \
-  data.reward_normalization=standardize
-```
-
-Tune **`data.return_scale`** with the chosen normalization.
-
-**Fixed stats JSON** (same mean/std on another shard): set `data.reward_normalization_stats_path` to a JSON file (matching mode stats) when using `standardize` or `minmax`.
+Step rewards in `trajectories.pkl` stay **as stored** (raw env rewards). Only the **return-to-go targets** divide cumulative reward by **`data.rtg_scale`** so DT RTG tokens are ~O(1). Default in `configs/data/base.yaml` is **`1.0`**; HalfCheetah uses **`5000`** in `configs/data/halfcheetah.yaml`.
 
 ---
 
@@ -168,6 +141,50 @@ Config pieces live in:
 
 ---
 
+## 4b. Policy checkpoints and offline eval
+
+**Checkpointing (already in training)** — While training, `src.engine.trainer.Trainer` saves resumable checkpoints under your run directory:
+
+| Location | When |
+|----------|------|
+| `<run_dir>/ckpts/last/checkpoint.pt` | Every `experiment.save_latest_every_steps` (if set) |
+| `<run_dir>/ckpts/best/checkpoint.pt` | When eval improves `experiment.best_metric_name` (if `experiment.save_best`) |
+| `<run_dir>/ckpts/step_XXXXXX/checkpoint.pt` | Every `experiment.save_periodic_every_steps` (if set) |
+
+Each file contains `model`, optimizer/scheduler state, `global_step`, `config` (full Hydra snapshot), RNG, etc. Optional end-of-run export: **`model_export.pt`** under `<run_dir>/artifacts/inference/` (weights + config + `state_mean` / `state_std`) when `experiment.export_final` is true — see `src/engine/checkpointing.py`.
+
+**Note:** `src.train --eval-only` currently logs a placeholder only; it does **not** run Gymnasium rollouts.
+
+**Standalone eval (same rollouts as training eval)** — Load a checkpoint and call `run_rollouts_and_save_viz` (prompt or zero-shot mode, RTG handling, plots under `viz/samples/...`). The script merges **current Hydra defaults** with the **config stored in the checkpoint**, then applies your CLI overrides (so you can fix `paths.data_root` if data moved).
+
+```bash
+uv run python scripts/run_d4rl_policy_eval.py \
+  --checkpoint outputs/<project>/<date>/<run>/ckpts/best/checkpoint.pt \
+  --override paths.data_root=/path/to/your/datasets \
+  --override data=[base,halfcheetah]
+```
+
+Useful flags:
+
+- `--step 20000` — label for output folder `viz/samples/step_020000/`
+- `--output-dir /tmp/my_eval_run` — where to write viz (default: inferred parent of `ckpts/` from the checkpoint path)
+- `--strict` — `load_state_dict(strict=True)` if the architecture must match exactly
+- `--no-weights-only` — if `torch.load` fails on an older checkpoint format
+
+Align **`data.data_quality`**, **`data.rtg_scale`**, **`experiment.eval_*`**, and **`model.*`** with the training run (they are restored from the checkpoint config; overrides can change them intentionally).
+
+**Export a light inference artifact from a full checkpoint:**
+
+```bash
+uv run python -m src.train \
+  --export-only outputs/.../ckpts/best/checkpoint.pt \
+  --override data=[base,halfcheetah]
+```
+
+Writes `artifacts/inference/model_export.pt` next to that run (includes normalization stats when the trainer passed them at export time).
+
+---
+
 ## 5. One-shot script (download + train)
 
 From repo root:
@@ -189,7 +206,9 @@ This runs the download command in §3, then training with W&B and `data=[base,ha
 | Download (default qualities) | `uv run python scripts/download_d4rl_halfcheetah.py --output-dir datasets --qualities medium expert medium_expert` |
 | Train | `uv run python -m src.train --wandb --override data=[base,halfcheetah]` |
 | Resume | `uv run python -m src.train --resume <path/to/checkpoint.pt> --override data=[base,halfcheetah]` |
-| Reward normalization (load-time) | `uv run python -m src.train --override data=[base,halfcheetah] data.reward_normalization=constant data.reward_norm_constant=1000` |
+| Eval saved policy (rollouts + viz) | `uv run python scripts/run_d4rl_policy_eval.py --checkpoint <run>/ckpts/best/checkpoint.pt --override paths.data_root=... data=[base,halfcheetah]` |
+| Export inference-only weights | `uv run python -m src.train --export-only <run>/ckpts/best/checkpoint.pt --override data=[base,halfcheetah]` |
+| RTG divisor override | e.g. `data.rtg_scale=5000` |
 
 ---
 

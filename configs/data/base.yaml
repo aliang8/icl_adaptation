@@ -6,7 +6,8 @@ horizon: 20
 # Query = last K steps of current trajectory (K=1 is OpenVLA-style; null = use horizon)
 query_history_length: null
 prompt_length: 5
-return_scale: 500.0
+# DT RTG: cumsum(raw env rewards) / rtg_scale (step rewards unchanged in trajectories).
+rtg_scale: 1.0
 batch_size: 128
 num_workers: 0
 num_tasks: 50
@@ -45,9 +46,3 @@ max_trajectory_length: 450
 # LIBERO
 libero_repo_id: nvidia/LIBERO-Cosmos-Policy
 seed: 0
-# Reward preprocessing for offline trajectories (HalfCheetah pkl). none | constant | standardize | minmax
-reward_normalization: none
-reward_norm_constant: 1000.0
-reward_norm_epsilon: 1.0e-8
-# Optional JSON stats path (standardize/minmax use fixed stats)
-reward_normalization_stats_path: null

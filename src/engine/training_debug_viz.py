@@ -46,7 +46,7 @@ def save_training_sample_videos(
     run_dir: Path,
     dataset: Any,
     *,
-    return_scale: float,
+    rtg_scale: float,
     num_clips: int = 3,
     fps: int = 8,
 ) -> None:
@@ -91,12 +91,14 @@ def save_training_sample_videos(
             rtg_seg,
             ts_seg,
             mask_seg,
+            _qtrial,
             _ps,
             _pa,
             _pr,
             _prtg,
             _pts,
             pm,
+            _pptrial,
             _instr,
             images_out,
         ) = sample
@@ -122,8 +124,8 @@ def save_training_sample_videos(
             ts = float(tarr[ri, 0]) if tarr.ndim == 2 else float(tarr[ri])
             lines = [
                 f"train sample | traj={traj_idx} si={si} q_t={t}/{K - 1}",
-                f"env_t={ts:.0f}  mask={m:.0f}  RTG(/return_scale)={rtg:.4f}",
-                f"context valid steps={prompt_valid:.0f}/{prompt_total:.0f}  scale={return_scale}",
+                f"env_t={ts:.0f}  mask={m:.0f}  RTG(/rtg_scale)={rtg:.4f}",
+                f"context valid steps={prompt_valid:.0f}/{prompt_total:.0f}  rtg_scale={rtg_scale}",
             ]
             frames.append(_annotate_eval_frame(img, lines))
         path = out_dir / f"clip_{clip_id:02d}_traj{traj_idx:05d}_si{si:04d}.mp4"

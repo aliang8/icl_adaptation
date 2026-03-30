@@ -24,14 +24,10 @@ _STEP_LAST = 2
 _STEP_FIRST = 0
 
 
-def _resize_flatten_observation(
-    image_hwc: np.ndarray, out_size: int, cv2: Any
-) -> np.ndarray:
+def _resize_flatten_observation(image_hwc: np.ndarray, out_size: int, cv2: Any) -> np.ndarray:
     """uint8 (H,W,3) -> float32 (out_size*out_size*3,) in [0,1]."""
     if cv2 is not None:
-        small = cv2.resize(
-            image_hwc, (out_size, out_size), interpolation=cv2.INTER_AREA
-        )
+        small = cv2.resize(image_hwc, (out_size, out_size), interpolation=cv2.INTER_AREA)
     else:
         h, w = image_hwc.shape[:2]
         if h >= out_size and w >= out_size:
@@ -233,8 +229,7 @@ def _load_vd4rl_hdf5_trajectories(
     sorted_pool = sort_trajectories_by_return(trajectories, ascending=False)
     prompt_per_task = [sorted_pool]
     log.info(
-        "Loaded {} V-D4RL trajectories from {} hdf5 files under {} "
-        "(obs_downsample={}, images={})",
+        "Loaded {} V-D4RL trajectories from {} hdf5 files under {} (obs_downsample={}, images={})",
         len(trajectories),
         len(paths),
         root,

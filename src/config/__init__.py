@@ -1,11 +1,11 @@
 from src.config.schema import (
-    ModelConfig,
+    AppConfig,
     DataConfig,
+    ExperimentConfig,
+    ModelConfig,
     OptimConfig,
     PathsConfig,
     SystemConfig,
-    ExperimentConfig,
-    AppConfig,
 )
 
 __all__ = [

@@ -17,7 +17,7 @@ use_language: true
 use_vision: true
 horizon: 32
 prompt_length: 8
-return_scale: 1.0
+rtg_scale: 1.0
 batch_size: 16
 num_workers: 2
 num_tasks: 20

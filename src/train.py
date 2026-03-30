@@ -316,6 +316,8 @@ def build_model(cfg, state_dim: int, action_dim: int, num_instructions: Optional
         predict_returns=m.predict_returns,
         predict_state=m.predict_state,
         condition_rtg=m.condition_rtg,
+        use_trial_index_embedding=m.use_trial_index_embedding,
+        max_trial_embeddings=m.max_trial_embeddings,
     )
     if m.use_vision or m.use_language:
         use_precomputed = cfg.data.use_precomputed_embeddings
@@ -373,25 +375,32 @@ def make_train_step_fn(task_instructions, use_precomputed_embeddings: bool = Fal
         "rtg",
         "timesteps",
         "masks",
+        "query_trial_idx",
         "prompt_s",
         "prompt_a",
         "prompt_r",
         "prompt_rtg",
         "prompt_ts",
         "prompt_m",
+        "prompt_trial_idx",
         "instructions",
     ]
 
     def _print_shapes(model, batch, dt_batch, image_embeddings):
         log.info("[train_batch] === shapes (first train step) ===")
         log.info(
-            "[train_batch] layout: [0-7] query (states,contexts,actions,rewards,dones,rtg,timesteps,masks); "
-            "[8-13] prompt (prompt_s,a,r,rtg,ts,m); [14] instructions; [15] images/embeddings; "
-            "[16] sample index (LIBERO index-backed: query_episode_id, ...)."
+            "[train_batch] layout: [0-7] query; [8] query_trial_idx; [9-14] prompt (s,a,r,rtg,ts,m); "
+            "[15] prompt_trial_idx; [16] instructions; [17] images/embeddings; "
+            "[18] sample index (LIBERO)."
         )
+        prompt_t_len = 0
+        if len(batch) > 9 and isinstance(batch[9], torch.Tensor) and batch[9].dim() >= 2:
+            prompt_t_len = int(batch[9].shape[1])
         for i, name in enumerate(_BATCH_NAMES):
             if i >= len(batch):
                 break
+            if prompt_t_len == 0 and 9 <= i <= 15:
+                continue
             x = batch[i]
             if isinstance(x, torch.Tensor):
                 log.info("[train_batch]   {}: {} {}", name, x.dtype, tuple(x.shape))
@@ -413,8 +422,10 @@ def make_train_step_fn(task_instructions, use_precomputed_embeddings: bool = Fal
                     type(x).__name__,
                     lx,
                 )
-        if len(batch) > 15 and batch[15] is not None:
-            imgs = batch[15]
+        if prompt_t_len == 0:
+            log.info("[train_batch]   prompt_*: (no ICL context, T=0 — skipped per-field lines)")
+        if len(batch) > 17 and batch[17] is not None:
+            imgs = batch[17]
             if isinstance(imgs, (list, tuple)):
                 for v, t in enumerate(imgs):
                     if isinstance(t, torch.Tensor):
@@ -423,12 +434,15 @@ def make_train_step_fn(task_instructions, use_precomputed_embeddings: bool = Fal
                 log.info("[train_batch]   image_embeddings (precomputed): {}", tuple(imgs.shape))
             else:
                 log.info("[train_batch]   images/embeddings: {}", type(imgs).__name__)
-        log.info("[train_batch]   --- DTBatch (prompt trimmed for RTG align in step) ---")
+        if prompt_t_len > 0:
+            log.info("[train_batch]   --- DTBatch (prompt trimmed for RTG align in step) ---")
+        else:
+            log.info("[train_batch]   --- DTBatch (query only) ---")
         log.info("[train_batch]   states: {}", tuple(dt_batch.states.shape))
         log.info("[train_batch]   actions: {}", tuple(dt_batch.actions.shape))
-        if dt_batch.prompt and dt_batch.prompt[0] is not None:
+        if dt_batch.prompt and dt_batch.prompt[0] is not None and dt_batch.prompt[0].shape[1] > 0:
             log.info(
-                "[train_batch]   prompt (s,a,r,rtg,ts,m): {}",
+                "[train_batch]   prompt (s,a,r,rtg,ts,m[,trial]): {}",
                 [tuple(p.shape) for p in dt_batch.prompt],
             )
         if image_embeddings is not None:
@@ -438,9 +452,9 @@ def make_train_step_fn(task_instructions, use_precomputed_embeddings: bool = Fal
                 "[train_batch]   instruction_indices: {}",
                 tuple(dt_batch.instruction_indices.shape),
             )
-        if len(batch) > 16 and batch[16] is not None:
+        if len(batch) > 18 and batch[18] is not None:
             log.info("[train_batch]   --- sample index (first 2 rows) ---")
-            for b_idx, row in enumerate(batch[16][:2]):
+            for b_idx, row in enumerate(batch[18][:2]):
                 if isinstance(row, dict):
                     log.info(
                         "[train_batch]   [{}] query_ep={} query_start={} query_len={} task_id={} "
@@ -454,9 +468,14 @@ def make_train_step_fn(task_instructions, use_precomputed_embeddings: bool = Fal
                         row.get("prompt_starts", []),
                         row.get("prompt_lens", []),
                     )
-        if len(batch) > 13:
-            pr, pm = batch[10], batch[13]
-            if isinstance(pr, torch.Tensor) and isinstance(pm, torch.Tensor):
+        if len(batch) > 14:
+            pr, pm = batch[11], batch[14]
+            if (
+                isinstance(pr, torch.Tensor)
+                and isinstance(pm, torch.Tensor)
+                and pr.dim() >= 2
+                and pr.shape[1] > 0
+            ):
                 log.info(
                     "[train_batch] --- prompt_r masked sum (first 2 batch rows, pre-trim tensors) ---"
                 )
@@ -476,7 +495,7 @@ def make_train_step_fn(task_instructions, use_precomputed_embeddings: bool = Fal
         log.info("[train_batch] === end ===")
 
     def train_step_fn(model, batch):
-        """One step: forward, MSE loss on actions. Batch: 15 elements (14 tensors + instructions); optional 16th = images."""
+        """One step: forward, MSE on actions. Batch: 17 slots (tensors + instructions); optional images at [17]."""
         (
             states,
             contexts,
@@ -486,14 +505,16 @@ def make_train_step_fn(task_instructions, use_precomputed_embeddings: bool = Fal
             rtg,
             timesteps,
             masks,
+            query_trial_idx,
             prompt_s,
             prompt_a,
             prompt_r,
             prompt_rtg,
             prompt_ts,
             prompt_m,
+            prompt_trial_idx,
             instructions,
-        ) = batch[:15]
+        ) = batch[:17]
         # Trim last step from all prompt tensors so lengths match
         prompt_rtg = prompt_rtg[:, :-1, :]
         prompt_s = prompt_s[:, :-1, :]
@@ -501,8 +522,21 @@ def make_train_step_fn(task_instructions, use_precomputed_embeddings: bool = Fal
         prompt_r = prompt_r[:, :-1, :]
         prompt_ts = prompt_ts[:, :-1]
         prompt_m = prompt_m[:, :-1]
-        prompt = (prompt_s, prompt_a, prompt_r, prompt_rtg, prompt_ts, prompt_m)
-
+        prompt_trial_idx = prompt_trial_idx[:, :-1]
+        if model.use_trial_index_embedding:
+            prompt = (
+                prompt_s,
+                prompt_a,
+                prompt_r,
+                prompt_rtg,
+                prompt_ts,
+                prompt_m,
+                prompt_trial_idx,
+            )
+            trial_batch = query_trial_idx.long()
+        else:
+            prompt = (prompt_s, prompt_a, prompt_r, prompt_rtg, prompt_ts, prompt_m)
+            trial_batch = None
         # VLA-DT: instruction indices (one per sample) from task_instructions
         instruction_indices = None
         if model.use_language and task_list and instructions is not None:
@@ -512,13 +546,13 @@ def make_train_step_fn(task_instructions, use_precomputed_embeddings: bool = Fal
             ]
             instruction_indices = torch.tensor(idx_list, dtype=torch.long, device=device)
 
-        # VLA-DT: image_embeddings from precomputed npz or from vision encoder (optional 16th element)
+        # VLA-DT: image_embeddings from precomputed npz or from vision encoder (optional [17])
         image_embeddings = None
-        if len(batch) > 15 and batch[15] is not None:
+        if len(batch) > 17 and batch[17] is not None:
             if use_precomputed_embeddings:
-                image_embeddings = batch[15]
+                image_embeddings = batch[17]
             elif model.vision_encoder is not None:
-                imgs = batch[15]
+                imgs = batch[17]
                 if isinstance(imgs, (list, tuple)):
                     shapes_str = [tuple(t.shape) for t in imgs]
                     if not _vision_encoder_logged[0]:
@@ -529,7 +563,7 @@ def make_train_step_fn(task_instructions, use_precomputed_embeddings: bool = Fal
                     )
                     if not _vision_encoder_logged[0]:
                         log.info("Vision encoder input: {}", shapes_str)
-                image_embeddings = model.vision_encoder(batch[15])
+                image_embeddings = model.vision_encoder(batch[17])
                 if not _vision_encoder_logged[0]:
                     if image_embeddings is not None:
                         log.info("Vision encoder output: {}", tuple(image_embeddings.shape))
@@ -542,6 +576,7 @@ def make_train_step_fn(task_instructions, use_precomputed_embeddings: bool = Fal
             returns_to_go=rtg,
             timesteps=timesteps,
             attention_mask=masks,
+            trial_indices=trial_batch,
             prompt=prompt,
             image_embeddings=image_embeddings,
             instruction_indices=instruction_indices,
@@ -715,10 +750,6 @@ def main():
             str(data_root),
             env_name=data_cfg.env_name,
             data_quality=data_cfg.data_quality,
-            reward_normalization=data_cfg.reward_normalization,
-            reward_norm_constant=float(data_cfg.reward_norm_constant),
-            reward_norm_epsilon=float(data_cfg.reward_norm_epsilon),
-            reward_normalization_stats_path=data_cfg.reward_normalization_stats_path,
         )
         if trajectories:
             log.info(
@@ -818,37 +849,6 @@ def main():
             trajectories = merged
             prompt_per_task = [sort_trajectories_by_return(merged, ascending=False)]
         if trajectories:
-            from src.data.reward_normalization import apply_reward_normalization, load_stats
-
-            rn_mode = (data_cfg.reward_normalization or "none").strip().lower()
-            if rn_mode not in ("none", "", "off", "false"):
-                stats_pre = None
-                sp_str = data_cfg.reward_normalization_stats_path
-                if isinstance(sp_str, str) and sp_str.strip().lower() in ("", "null", "none", "~"):
-                    sp_str = None
-                if sp_str:
-                    sp = Path(sp_str)
-                    if sp.is_file():
-                        stats_pre = load_stats(sp)
-                        log.info("VD4RL: loaded reward norm stats from {}", sp)
-                    else:
-                        log.warning(
-                            "reward_normalization_stats_path={} not found; computing stats from VD4RL data",
-                            sp,
-                        )
-                trajectories, st = apply_reward_normalization(
-                    trajectories,
-                    data_cfg.reward_normalization,
-                    reward_norm_constant=float(data_cfg.reward_norm_constant),
-                    epsilon=float(data_cfg.reward_norm_epsilon),
-                    stats=stats_pre,
-                    in_place=True,
-                )
-                log.info(
-                    "VD4RL: applied data.reward_normalization={} stats_keys={}",
-                    data_cfg.reward_normalization,
-                    list(st.keys()),
-                )
             state_dim = int(trajectories[0]["observations"].shape[1])
             action_dim = int(trajectories[0]["actions"].shape[1])
             log.info(
@@ -908,14 +908,13 @@ def main():
             trajectories=trajectories,
             horizon=data_cfg.horizon,
             max_episode_steps=data_cfg.max_episode_steps,
-            return_scale=data_cfg.return_scale,
+            rtg_scale=float(data_cfg.rtg_scale),
             device=device,
             prompt_trajectories_per_task=prompt_per_task,
             context_dim=data_cfg.context_dim,
             state_dim=state_dim,
             act_dim=action_dim,
             prompt_length=data_cfg.prompt_length,
-            scale=data_cfg.return_scale,
             total_epi_per_task=max(1, len(trajectories) // max(1, data_cfg.num_train_tasks)),
             num_context_trajectories=data_cfg.num_context_trajectories,
             randomize_num_context_trajectories=data_cfg.randomize_num_context_trajectories,
@@ -980,7 +979,7 @@ def main():
             save_training_sample_videos(
                 Path(run_dir),
                 dataset,
-                return_scale=float(data_cfg.return_scale),
+                rtg_scale=float(data_cfg.rtg_scale),
                 num_clips=int(cfg.experiment.num_training_sample_videos),
                 fps=int(cfg.experiment.training_sample_video_fps),
             )
@@ -1056,6 +1055,11 @@ def main():
                 eval_k = int(ml) if ml is not None else 20
         else:
             eval_k = cfg.experiment.eval_context_k or data_cfg.num_context_trajectories
+        eval_query_window = (
+            int(data_cfg.query_history_length)
+            if data_cfg.query_history_length is not None
+            else int(data_cfg.horizon)
+        )
         prompt_trajectories = None
         if eval_mode == "prompt" and dataset.trajectories:
             prompt_trajectories = sample_context_trajectories(
@@ -1098,7 +1102,7 @@ def main():
                     step=step,
                     num_rollouts=num_rollouts,
                     max_episode_steps=data_cfg.max_episode_steps,
-                    return_scale=float(data_cfg.return_scale),
+                    rtg_scale=float(data_cfg.rtg_scale),
                     save_video=cfg.experiment.save_eval_video,
                     eval_context_mode=eval_mode,
                     prompt_trajectories=prompt_trajectories,
@@ -1112,14 +1116,14 @@ def main():
                     task_description=task_desc,
                     logger=logger,
                     eval_render_both_views=eval_render_both_views,
-                    reward_normalization=data_cfg.reward_normalization,
-                    reward_norm_constant=float(data_cfg.reward_norm_constant),
-                    reward_norm_epsilon=float(data_cfg.reward_norm_epsilon),
-                    reward_normalization_stats_path=data_cfg.reward_normalization_stats_path,
                     wandb_defer_step_commit=use_wandb,
                     vd4rl_eval_pixel_hw=vd4rl_px,
                     vd4rl_eval_obs_downsample=vd4rl_ds,
                     vd4rl_eval_seed=int(data_cfg.seed),
+                    eval_target_return=OmegaConf.select(
+                        cfg, "experiment.eval_target_return", default=None
+                    ),
+                    query_window=eval_query_window,
                 )
                 if cfg.experiment.run_action_compare_eval and dataset.trajectories:
                     action_metrics = run_action_compare_eval(
@@ -1132,7 +1136,7 @@ def main():
                         step=step,
                         num_demos=cfg.experiment.num_action_compare_demos,
                         max_episode_steps=data_cfg.max_episode_steps,
-                        scale=data_cfg.return_scale,
+                        scale=float(data_cfg.rtg_scale),
                         use_gt_action=True,
                         warm_train_steps=cfg.experiment.warm_train_steps,
                     )

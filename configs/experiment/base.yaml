@@ -7,6 +7,8 @@ eval_num_trials: 5
 eval_context_k: null
 eval_reward_source: env
 eval_reward_model: null
+# Target future cumulative return G (env units) for eval RTG init; null -> initial token 1.0
+eval_target_return: null
 save_eval_video: true  # set true to save eval rollout videos to viz/samples/step_XXX/videos/
 # LIBERO only: stitch primary|wrist in eval video. Gymnasium envs (HalfCheetah, etc.) use a single camera; train.py ignores this flag for non-LIBERO.
 eval_render_both_views: true

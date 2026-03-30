@@ -190,7 +190,7 @@ def make_libero_index_loader(
     act_dim: int,
     context_dim: int,
     device: torch.device,
-    return_scale: float,
+    rtg_scale: float,
     total_prompt_len: Optional[int],
     max_prompt_trajectory_length: Optional[int],
     use_vision: bool = False,
@@ -200,8 +200,8 @@ def make_libero_index_loader(
     """
     Build a loader_fn(row) for IndexBackedDataset. Each row has query_episode_id, query_start,
     query_len, prompt_episode_ids, prompt_starts, prompt_lens, task_id. Returns the same tuple
-    as ICL dataset __getitem__: (states, context, actions, rewards, dones, rtg, timesteps, masks,
-    prompt_s, prompt_a, prompt_r, prompt_rtg, prompt_ts, prompt_m, instruction [, images]).
+    as ICL dataset __getitem__: query (+ query_trial_idx), prompt (+ prompt_trial_idx), instruction,
+    optional images, optional index row (see collate_icl_batch layout).
     """
     from src.data.dataset import _pad_or_trim_prompt
     from src.data.trajectories import discount_cumsum
@@ -234,7 +234,7 @@ def make_libero_index_loader(
             dones = np.zeros(1, dtype=np.float32)
 
         obs_norm = (obs - state_mean) / state_std
-        rtg = discount_cumsum(rewards, gamma=1.0).reshape(-1, 1) / return_scale
+        rtg = discount_cumsum(rewards, gamma=1.0).reshape(-1, 1) / rtg_scale
         timesteps = np.arange(q_start, q_start + seg_len, dtype=np.float32)
         mask = np.ones(seg_len, dtype=np.float32)
         context = np.zeros((seg_len, context_dim), dtype=np.float32)
@@ -253,7 +253,15 @@ def make_libero_index_loader(
         prompt_starts = _to_list(row.get("prompt_starts"))
         prompt_lens = _to_list(row.get("prompt_lens"))
 
-        segs_ps, segs_pa, segs_pr, segs_prtg, segs_pts, segs_pm = [], [], [], [], [], []
+        segs_ps, segs_pa, segs_pr, segs_prtg, segs_pts, segs_pm, segs_ptrial = (
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+        )
         for i, (p_ep, p_start, p_len) in enumerate(
             zip(prompt_episode_ids, prompt_starts, prompt_lens)
         ):
@@ -269,15 +277,17 @@ def make_libero_index_loader(
             ps = (p_seg["observations"] - state_mean) / state_std
             pa = p_seg["actions"]
             pr = p_seg["rewards"].reshape(-1, 1)
-            prtg = discount_cumsum(p_seg["rewards"], gamma=1.0)[:T].reshape(-1, 1) / return_scale
+            prtg = discount_cumsum(p_seg["rewards"], gamma=1.0)[:T].reshape(-1, 1) / rtg_scale
             pts = np.arange(p_start, p_start + T, dtype=np.float32)
             pm = np.ones(T, dtype=np.float32)
+            ptrial = np.full(T, i, dtype=np.float32)
             segs_ps.append(ps)
             segs_pa.append(pa)
             segs_pr.append(pr)
             segs_prtg.append(prtg)
             segs_pts.append(pts)
             segs_pm.append(pm)
+            segs_ptrial.append(ptrial)
         if segs_ps:
             ps = np.concatenate(segs_ps, axis=0)
             pa = np.concatenate(segs_pa, axis=0)
@@ -285,10 +295,11 @@ def make_libero_index_loader(
             prtg = np.concatenate(segs_prtg, axis=0)
             pts = np.concatenate(segs_pts, axis=0)
             pm = np.concatenate(segs_pm, axis=0)
+            ptrial = np.concatenate(segs_ptrial, axis=0)
             actual_len = ps.shape[0]
             plen = min(actual_len, total_prompt_len) if total_prompt_len is not None else actual_len
-            ps, pa, pr, prtg, pts, pm = _pad_or_trim_prompt(
-                ps, pa, pr, prtg, pts, pm, plen, state_dim, act_dim, take_last=True
+            ps, pa, pr, prtg, pts, pm, ptrial = _pad_or_trim_prompt(
+                ps, pa, pr, prtg, pts, pm, ptrial, plen, state_dim, act_dim, take_last=True
             )
         else:
             plen = total_prompt_len if total_prompt_len is not None else 256
@@ -298,6 +309,9 @@ def make_libero_index_loader(
             prtg = np.zeros((plen, 1), dtype=np.float32)
             pts = np.zeros(plen, dtype=np.float32)
             pm = np.zeros(plen, dtype=np.float32)
+            ptrial = np.zeros(plen, dtype=np.float32)
+
+        query_trial = np.full(seg_len, len(prompt_episode_ids), dtype=np.float32)
 
         def _t(x: np.ndarray, long_type: bool = False) -> torch.Tensor:
             t = torch.from_numpy(np.asarray(x))
@@ -312,12 +326,14 @@ def make_libero_index_loader(
             _t(rtg),
             _t(timesteps, True),
             _t(mask),
+            _t(query_trial, True),
             _t(ps),
             _t(pa),
             _t(pr),
             _t(prtg),
             _t(pts, True),
             _t(pm),
+            _t(ptrial, True),
             instruction,
         )
         if use_precomputed_embeddings:
@@ -410,7 +426,7 @@ def build_libero_in_context_dataset(
         action_dim,
         data_cfg.context_dim,
         device,
-        data_cfg.return_scale,
+        float(data_cfg.rtg_scale),
         total_plen,
         data_cfg.max_prompt_trajectory_length,
         use_vision=data_cfg.use_vision and not use_precomputed_embeddings,
@@ -450,7 +466,13 @@ def build_libero_in_context_dataset(
             return self._d[i]
 
     dataset = _Wrapper(
-        idx_dataset, task_instructions, total_plen, data_cfg.max_prompt_trajectory_length, state_dim, action_dim, data_cfg
+        idx_dataset,
+        task_instructions,
+        total_plen,
+        data_cfg.max_prompt_trajectory_length,
+        state_dim,
+        action_dim,
+        data_cfg,
     )
     batch_sampler = GroupedBatchSampler(
         index, data_cfg.batch_size, shuffle=True, seed=data_cfg.seed
