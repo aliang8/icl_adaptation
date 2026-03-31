@@ -18,6 +18,7 @@ uv run python -m src.train \
   model.query_loss_only=false \
   --wandb 
 
+# Regular DT
 CUDA_VISIBLE_DEVICES=7 uv run python -m src.train \
   --override data=[base,halfcheetah] \
   experiment.max_steps=100000 \
@@ -33,6 +34,7 @@ CUDA_VISIBLE_DEVICES=7 uv run python -m src.train \
   model.max_length=20 \
   model.query_loss_only=false \
   optim.lr=1e-4 \
+  system.run_name=halfcheetah-medium-expert_rtg_1000_lr_1e-4 \
   paths.data_root=/scr2/shared/icl_adaptation/datasets \
   --wandb
 
@@ -41,3 +43,24 @@ uv run python -m src.eval \
   --checkpoint outputs/icl_adaptation/2026-03-31/train__seed_412/ckpts/step_000000/checkpoint.pt \
   --step 0 \
   --num-episodes 3
+
+# Multiple trial DT
+# HalfCheetah multi-pool: use Hydra list (no comma ambiguity): data.data_quality=[medium,medium_expert]
+uv run python -m src.train \
+  --override data=[base,halfcheetah] \
+  experiment.max_steps=100000 \
+  data.batch_size=4 \
+  data.num_context_trajectories=3 \
+  experiment.eval_every_steps=10 \
+  experiment.eval_num_trials=3 \
+  experiment.eval_target_return=6000 \
+  experiment.num_eval_rollouts=3 \
+  data.rtg_scale=1000 \
+  data.data_quality=[medium,medium_expert] \
+  data.horizon=20 \
+  model.max_length=20 \
+  model.query_loss_only=false \
+  optim.lr=1e-4 \
+  system.run_name=halfcheetah-medium-expert_rtg_1000_lr_1e-4_context_3 \
+  paths.data_root=/scr2/shared/icl_adaptation/datasets \
+  --wandb

@@ -6,6 +6,10 @@ sorted ascending for zero-shot adaptation.
 Two dataset classes:
 - SubsampledICLTrajectoryDataset: prompt = fixed-length segments (prompt_length steps per traj).
 - FullTrajectoryICLTrajectoryDataset: prompt = full trajectory(ies), capped by max_total_prompt_length.
+
+Trial index convention (prompt_trial_idx / query_trial_idx): **0** = padded timestep (masked);
+**1 …** = context demos in prompt order. **Query** id = **max(valid prompt trial ids) + 1**, or **1**
+when there is no valid prompt.
 """
 
 import random
@@ -194,7 +198,7 @@ class ICLTrajectoryDatasetBase(Dataset, ABC):
     def _choose_context_trajectories(
         self, prompt_list: List[Dict[str, np.ndarray]], query_traj: Dict[str, np.ndarray]
     ) -> List[Dict[str, np.ndarray]]:
-        """Prior demos for the prompt; [] if m=0 or no pool; [query_traj] only when pool is empty (legacy)."""
+        """Prior demos for the prompt; [] if m=0 or no pool; [query_traj] only when pool is empty."""
         if not prompt_list:
             return [query_traj]
         m = self._sample_num_context_trajectories()
@@ -206,6 +210,12 @@ class ICLTrajectoryDatasetBase(Dataset, ABC):
             ascending=self.context_sort_ascending,
             sampling=self.context_sampling,
         )
+
+    @staticmethod
+    def _query_trial_id_from_prompt(pm: np.ndarray, ppt: np.ndarray) -> int:
+        pmv = np.asarray(pm, dtype=np.float32).reshape(-1)
+        ptv = np.asarray(ppt, dtype=np.float32).reshape(-1)
+        return int(np.max(ptv[pmv > 0])) + 1 if np.any(pmv > 0) else 1
 
     @abstractmethod
     def _build_prompt(
@@ -226,7 +236,10 @@ class ICLTrajectoryDatasetBase(Dataset, ABC):
         query_trial_idx: int,
     ) -> Tuple[np.ndarray, ...]:
         """Build the 9 main-segment arrays for (traj, si). Uses last K steps ending at si (K = query_history_length or horizon).
-        **Left-pads** with mask 0 when the prefix is shorter than K (same as eval ``get_action`` with ``query_window=K`` when there is no ICL prompt). K=1 is OpenVLA-style (current obs only)."""
+        **Left-pads** with mask 0 when the prefix is shorter than K (same as eval ``get_action`` with ``query_window=K`` when there is no ICL prompt). K=1 is OpenVLA-style (current obs only).
+
+        ``query_trial_idx``: 1-based query id: ``max(prompt_trial where mask>0) + 1``, or ``1`` if no valid
+        prompt. Padded query steps use **0**."""
         K = self._query_length
         max_ep_len = self.max_episode_steps
         state_mean, state_std = self.state_mean, self.state_std
@@ -316,6 +329,7 @@ class ICLTrajectoryDatasetBase(Dataset, ABC):
         ps, pa, pr, prtg, pts, pm, ppt = self._build_prompt(
             chosen, self.state_mean, self.state_std, self.total_prompt_len
         )
+        q_tid = self._query_trial_id_from_prompt(pm, ppt)
         (
             state_seg,
             context_seg,
@@ -326,7 +340,7 @@ class ICLTrajectoryDatasetBase(Dataset, ABC):
             ts_seg,
             mask_seg,
             trial_seg,
-        ) = self._build_main_segment(traj, si, traj_contexts, len(chosen))
+        ) = self._build_main_segment(traj, si, traj_contexts, q_tid)
         instruction = ""
         if self.task_instructions and task_id < len(self.task_instructions):
             instruction = self.task_instructions[task_id] or ""
@@ -420,6 +434,7 @@ class ICLTrajectoryDatasetBase(Dataset, ABC):
                 prompt_m.append(pm)
                 prompt_trials.append(ppt)
 
+                q_tid = self._query_trial_id_from_prompt(pm, ppt)
                 (
                     state_seg,
                     context_seg,
@@ -430,7 +445,7 @@ class ICLTrajectoryDatasetBase(Dataset, ABC):
                     ts_seg,
                     mask_seg,
                     trial_seg,
-                ) = self._build_main_segment(traj, si, traj_contexts, len(chosen))
+                ) = self._build_main_segment(traj, si, traj_contexts, q_tid)
                 states.append(state_seg)
                 contexts.append(context_seg)
                 actions.append(action_seg)
@@ -647,9 +662,11 @@ class SubsampledICLTrajectoryDataset(ICLTrajectoryDatasetBase):
         pa = traj["actions"][p_start : p_start + plen]
         pr = traj["rewards"][p_start : p_start + plen].reshape(-1, 1)
         pts = np.arange(p_start, p_start + plen, dtype=np.float32)
-        prtg = discount_cumsum(traj["rewards"][p_start:], gamma=1.0)[: plen + 1].reshape(-1, 1)
-        if prtg.shape[0] <= plen:
-            prtg = np.concatenate([prtg, np.zeros((1, 1))], axis=0)
+        prtg = discount_cumsum(traj["rewards"][p_start:], gamma=1.0)[:plen].reshape(-1, 1)
+        if prtg.shape[0] < plen:
+            prtg = np.concatenate(
+                [prtg, np.zeros((plen - prtg.shape[0], 1), dtype=np.float32)], axis=0
+            )
         pad = L - plen
         ps = np.concatenate([np.zeros((pad, ps.shape[1])), ps], axis=0)
         pa = np.concatenate([np.ones((pad, pa.shape[1])) * -10.0, pa], axis=0)
@@ -658,7 +675,10 @@ class SubsampledICLTrajectoryDataset(ICLTrajectoryDatasetBase):
         pts = np.concatenate([np.zeros(pad), pts], axis=0)
         pm = np.concatenate([np.zeros(pad), np.ones(plen)], axis=0)
         ptrial = np.concatenate(
-            [np.zeros(pad, dtype=np.float32), np.full(plen, trial_idx, dtype=np.float32)]
+            [
+                np.zeros(pad, dtype=np.float32),
+                np.full(plen, float(trial_idx + 1), dtype=np.float32),
+            ]
         )
         return ps, pa, pr, prtg, pts, pm, ptrial
 
@@ -819,7 +839,7 @@ class FullTrajectoryICLTrajectoryDataset(ICLTrajectoryDatasetBase):
         pts = idx.astype(np.float32)
         T = idx.shape[0]
         pm = np.ones(T, dtype=np.float32)
-        ptrial = np.full(T, trial_idx, dtype=np.float32)
+        ptrial = np.full(T, float(trial_idx + 1), dtype=np.float32)
         return ps, pa, pr, prtg, pts, pm, ptrial
 
     def _build_prompt(
@@ -919,7 +939,7 @@ def collate_icl_batch(batch: List[Tuple[Any, ...]]) -> Tuple[Any, ...]:
     Collate a list of ICL trajectory samples into a batch. Pads tensors with varying
     first dimension (e.g. prompt length) to the max in the batch so they can be stacked.
     Mask tensors (masks, prompt_m) are padded with 0 so padded positions are ignored.
-    Layout: 0–7 query, 8 query_trial_idx, 9–14 prompt (s,a,r,rtg,ts,m), 15 prompt_trial_idx, 16 instructions;
+    Layout: 0–7 query, 8 query_trial_idx (1-based; 0=pad), 9–14 prompt (s,a,r,rtg,ts,m), 15 prompt_trial_idx (1-based demos; 0=pad), 16 instructions;
     optional 17 images/embeddings, 18+ index metadata.
     """
     if not batch:
@@ -978,12 +998,6 @@ def collate_icl_batch(batch: List[Tuple[Any, ...]]) -> Tuple[Any, ...]:
                     if not isinstance(t, torch.Tensor):
                         raise TypeError(
                             f"Expected torch.Tensor for precomputed embeddings, got {type(t)}"
-                        )
-                    if t.dim() == 2:
-                        # Support legacy (T, D) by unsqueezing to (1, T, D)
-                        raise ValueError(
-                            "Found precomputed embeddings with shape (T, D) (dim=2). "
-                            "Expected shape (1, T, D). Please regenerate embeddings.npz."
                         )
                     if t.dim() != 3:
                         raise ValueError(
@@ -1075,13 +1089,7 @@ def collate_icl_batch(batch: List[Tuple[Any, ...]]) -> Tuple[Any, ...]:
 def get_icl_trajectory_dataset(
     context_style: str = "subsampled", **kwargs: Any
 ) -> ICLTrajectoryDatasetBase:
-    """Factory: return SubsampledICLTrajectoryDataset or FullTrajectoryICLTrajectoryDataset by context_style."""
+    """Return SubsampledICLTrajectoryDataset or FullTrajectoryICLTrajectoryDataset by ``context_style``."""
     if context_style == "full_trajectory":
         return FullTrajectoryICLTrajectoryDataset(**kwargs)
     return SubsampledICLTrajectoryDataset(**kwargs)
-
-
-def ICLTrajectoryDataset(**kwargs: Any) -> ICLTrajectoryDatasetBase:
-    """Backward-compatible alias: dispatches to Subsampled or FullTrajectory based on context_style."""
-    context_style = kwargs.pop("context_style", "subsampled")
-    return get_icl_trajectory_dataset(context_style=context_style, **kwargs)

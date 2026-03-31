@@ -9,6 +9,8 @@ eval_reward_source: env
 eval_reward_model: null
 # Target future cumulative return G (env units) for eval RTG init; null -> initial token 1.0
 eval_target_return: null
+# Zero-shot: optional list of G per trial (len must match eval_num_trials). null -> use eval_target_return with (i+1)/K*G per trial when K>1
+eval_target_returns: null
 save_eval_video: true  # set true to save eval rollout videos to viz/samples/step_XXX/videos/
 # null = record every rollout/trial; int = only first N (still run all rollouts for metrics)
 num_eval_rollout_videos: null
@@ -16,7 +18,6 @@ num_eval_rollout_videos: null
 eval_render_both_views: true
 run_action_compare_eval: false  # set true to save pred vs GT action plots to viz/action_compare/step_XXX/
 num_action_compare_demos: 3
-warm_train_steps: 70000
 zero_shot: false
 save_latest_every_steps: 5000
 save_best: true

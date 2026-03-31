@@ -74,9 +74,7 @@ def save_checkpoint(
         return ""
     os.makedirs(save_dir, exist_ok=True)
     config_container = (
-        OmegaConf.to_container(cfg, resolve=True)
-        if hasattr(cfg, "__dict__") or hasattr(cfg, "items")
-        else cfg
+        OmegaConf.to_container(cfg, resolve=True) if OmegaConf.is_config(cfg) else cfg
     )
 
     ckpt = {

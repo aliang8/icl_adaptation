@@ -280,7 +280,7 @@ def make_libero_index_loader(
             prtg = discount_cumsum(p_seg["rewards"], gamma=1.0)[:T].reshape(-1, 1) / rtg_scale
             pts = np.arange(p_start, p_start + T, dtype=np.float32)
             pm = np.ones(T, dtype=np.float32)
-            ptrial = np.full(T, i, dtype=np.float32)
+            ptrial = np.full(T, float(i + 1), dtype=np.float32)
             segs_ps.append(ps)
             segs_pa.append(pa)
             segs_pr.append(pr)
@@ -311,7 +311,10 @@ def make_libero_index_loader(
             pm = np.zeros(plen, dtype=np.float32)
             ptrial = np.zeros(plen, dtype=np.float32)
 
-        query_trial = np.full(seg_len, len(prompt_episode_ids), dtype=np.float32)
+        pmv = np.asarray(pm, dtype=np.float32).reshape(-1)
+        ptv = np.asarray(ptrial, dtype=np.float32).reshape(-1)
+        query_tid = int(np.max(ptv[pmv > 0])) + 1 if np.any(pmv > 0) else 1
+        query_trial = np.full(seg_len, float(query_tid), dtype=np.float32)
 
         def _t(x: np.ndarray, long_type: bool = False) -> torch.Tensor:
             t = torch.from_numpy(np.asarray(x))
@@ -345,7 +348,7 @@ def make_libero_index_loader(
                 if emb.ndim != 2:
                     print(
                         f"[precomputed_embeddings] Bad embeddings.ndim for episode={q_ep} "
-                        f"query_start={q_start} query_len={q_len}: emb.shape={emb.shape if hasattr(emb, 'shape') else None}; "
+                        f"query_start={q_start} query_len={q_len}: emb.shape={emb.shape}; "
                         "regenerate embeddings.npz.",
                         file=sys.stderr,
                         flush=True,
@@ -416,7 +419,7 @@ def build_libero_in_context_dataset(
     if data_cfg.max_total_prompt_length is None:
         log.info(
             "LIBERO: data.max_total_prompt_length unset -> using {} "
-            "(max_episode_steps * (num_context_trajectories + 1))",
+            "(max_episode_steps * num_context_trajectories)",
             total_plen,
         )
     loader_fn = make_libero_index_loader(

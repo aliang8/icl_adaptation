@@ -117,7 +117,7 @@ def main():
             task_desc = None
             if "task_description" in f.attrs:
                 td = f.attrs["task_description"]
-                task_desc = td.decode("utf-8") if hasattr(td, "decode") else td
+                task_desc = td.decode("utf-8") if isinstance(td, bytes) else str(td)
             succ = bool(f.attrs.get("success", False))
             has_primary = "primary_images_jpeg" in f
             has_wrist = "wrist_images_jpeg" in f

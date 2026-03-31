@@ -26,7 +26,6 @@ def run_action_compare_eval(
     max_episode_steps: int = 200,
     scale: float = 5000.0,
     use_gt_action: bool = True,
-    warm_train_steps: int = 0,
 ) -> Dict[str, float]:
     """
     For each of the first `num_demos` trajectories, run step-by-step action prediction
@@ -111,8 +110,6 @@ def run_action_compare_eval(
                     returns_to_go,
                     timesteps,
                     prompt=None,
-                    warm_train_steps=warm_train_steps,
-                    current_step=step,
                     **({"query_window": qwin} if qwin is not None else {}),
                 )
             pred_np = pred_a.cpu().numpy().flatten()

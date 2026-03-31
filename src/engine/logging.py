@@ -119,7 +119,9 @@ class Logger:
             return
         import wandb
 
-        if hasattr(image, "savefig"):
+        from matplotlib.figure import Figure
+
+        if isinstance(image, Figure):
             import io
 
             buf = io.BytesIO()

@@ -1,7 +1,7 @@
 """Typed config schema (OmegaConf structured configs / dataclasses)."""
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Union
 
 
 @dataclass
@@ -56,9 +56,9 @@ class ModelConfig:
     predict_state: bool = False
     # Condition on return-to-go in the input (RTG embedding in sequence). If False, input is (state, action) only.
     condition_rtg: bool = True
-    # If True, add learned embedding of trial index (context demo index + query) on each DT token.
-    use_trial_index_embedding: bool = False
-    # Embedding table size; indices are clamped to [0, max_trial_embeddings - 1].
+    # If True, add learned trial-index embeddings when data.num_context_trajectories > 1 (no-op if N<=1).
+    use_trial_index_embedding: bool = True
+    # Embedding table size; index 0 = padding, 1+ = trial ids (clamped to [0, max_trial_embeddings - 1]).
     max_trial_embeddings: int = 64
 
 
@@ -67,7 +67,8 @@ class DataConfig:
     """Dataset and dataloader."""
 
     env_name: str = "AntDir-v0"
-    data_quality: str = "medium"
+    # HalfCheetah multi-pool: use Hydra list [medium,medium_expert] or comma-separated string.
+    data_quality: Union[str, List[str]] = "medium"
     data_dir: str = "all_datasets"
     horizon: int = 20
     # Query = last K steps of current trajectory; K=1 = OpenVLA-style; None = use horizon.
@@ -93,7 +94,7 @@ class DataConfig:
     randomize_num_context_trajectories: bool = True
     context_sort_ascending: bool = True
     context_sampling: str = "random"
-    # Omit/null -> resolved_max_total_prompt_length (0 if num_context_trajectories<=0 else eps*(n+1))
+    # Omit/null -> resolved_max_total_prompt_length (0 if num_context_trajectories<=0 else eps*n)
     max_total_prompt_length: Optional[int] = None
     # Per context demo: null = use full trajectory (within strategy); int = last N steps of each demo before concat
     max_prompt_trajectory_length: Optional[int] = None
@@ -141,7 +142,7 @@ def resolved_max_total_prompt_length(data_cfg: DataConfig) -> int:
     If ``data.max_total_prompt_length`` is set, returns that value.
     If ``num_context_trajectories <= 0`` and the override is unset, returns **0** (no prompt;
     query-only sequences use ``horizon`` / ``model.max_length`` only — no filler prompt padding).
-    Otherwise returns ``max_episode_steps * (num_context_trajectories + 1)``.
+    Otherwise returns ``max_episode_steps * num_context_trajectories`` (prompt only; query is separate).
     """
     if data_cfg.max_total_prompt_length is not None:
         return int(data_cfg.max_total_prompt_length)
@@ -149,7 +150,7 @@ def resolved_max_total_prompt_length(data_cfg: DataConfig) -> int:
     if n <= 0:
         return 0
     eps = int(data_cfg.max_episode_steps)
-    return eps * (n + 1)
+    return eps * n
 
 
 @dataclass
@@ -184,7 +185,7 @@ class SystemConfig:
     project_name: str = "icl_adaptation"
     run_name: Optional[str] = None  # CLI --run-name or override system.run_name=...
     save_dir: str = (
-        "outputs/checkpoints"  # deprecated when run_dir used; ckpts live under run_dir/ckpts
+        "outputs/checkpoints"  # default; checkpoints are stored under run_dir/ckpts during training
     )
     # distributed (rank 0 saves)
     world_size: int = 1
@@ -203,7 +204,7 @@ class ExperimentConfig:
     eval_every_steps: int = 5000
     # prompt / no-prompt: one env episode per rollout. zero_shot_adaptation: one adaptation *session* per rollout; trials are inside the session (eval_num_trials).
     num_eval_rollouts: int = 5
-    eval_context_mode: str = "prompt"  # prompt | zero_shot_adaptation
+    eval_context_mode: str = "zero_shot_adaptation"  # prompt | zero_shot_adaptation
     eval_num_trials: int = 5  # zero_shot only: sequential in-session trials per rollout (ignored for prompt mode for this count)
     eval_context_k: Optional[int] = None
     # If set: prompt mode = this many context trajectories; zero_shot_adaptation = last-K env steps
@@ -216,6 +217,10 @@ class ExperimentConfig:
     )
     # Target future cumulative return G (env reward units) for eval RTG init (token G/rtg_scale). None = token 1.0.
     eval_target_return: Optional[float] = None
+    # Zero-shot only: explicit per-trial G; length must equal eval_num_trials. If set, overrides the
+    # scalar schedule below. If null and eval_num_trials>1 with eval_target_return set, trial i gets
+    # (i+1)/K * G (evenly spaced up to full G).
+    eval_target_returns: Optional[List[float]] = None
     save_eval_video: bool = (
         False  # if True, wrap eval env with RecordVideo and save to viz/samples/step_XXX/videos/
     )
@@ -228,7 +233,6 @@ class ExperimentConfig:
         False  # if True, plot predicted vs GT actions on demos to viz/action_compare/
     )
     num_action_compare_demos: int = 3  # number of trajectories to use for action-comparison plots
-    warm_train_steps: int = 70_000
     zero_shot: bool = False
     # checkpoint types
     save_latest_every_steps: Optional[int] = 5000

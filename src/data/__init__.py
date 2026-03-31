@@ -1,6 +1,5 @@
 from src.data.dataset import (
     FullTrajectoryICLTrajectoryDataset,
-    ICLTrajectoryDataset,
     ICLTrajectoryDatasetBase,
     SubsampledICLTrajectoryDataset,
     collate_icl_batch,
@@ -23,7 +22,6 @@ from src.data.icrt_dataset import (
 
 __all__ = [
     "FullTrajectoryICLTrajectoryDataset",
-    "ICLTrajectoryDataset",
     "ICLTrajectoryDatasetBase",
     "SubsampledICLTrajectoryDataset",
     "convert_data_to_trajectories",

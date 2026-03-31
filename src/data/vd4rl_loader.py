@@ -88,7 +88,7 @@ def _npz_to_trajectory(
     store_images: bool,
     cv2: Any,
 ) -> Dict[str, np.ndarray]:
-    """Build one trajectory dict compatible with ICLTrajectoryDataset."""
+    """Build one trajectory dict compatible with ``get_icl_trajectory_dataset`` / ICL dataset classes."""
     image = np.asarray(episode["image"])
     action = np.asarray(episode["action"], dtype=np.float32)
     reward = np.asarray(episode["reward"], dtype=np.float32).reshape(-1)

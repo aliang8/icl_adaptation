@@ -47,7 +47,7 @@ class MetaDecisionTransformer(nn.Module):
         predict_returns: bool = False,
         predict_state: bool = False,
         condition_rtg: bool = True,
-        use_trial_index_embedding: bool = False,
+        use_trial_index_embedding: bool = True,
         max_trial_embeddings: int = 64,
         **kwargs,
     ):
@@ -96,7 +96,7 @@ class MetaDecisionTransformer(nn.Module):
         self.prompt_embed_return = nn.Linear(1, hidden_size)
         self.prompt_embed_state = nn.Linear(state_dim, hidden_size)
         self.prompt_embed_action = nn.Linear(act_dim, hidden_size)
-        # Discrete trial id (which context segment / query), same idea as embed_timestep for time index.
+        # Discrete trial id: embedding row **0** = padding; rows **1+** = context / query (1-based trial ids).
         self.embed_trial_idx = (
             nn.Embedding(self.max_trial_embeddings, hidden_size)
             if use_trial_index_embedding
@@ -121,7 +121,7 @@ class MetaDecisionTransformer(nn.Module):
         self.vision_encoder = None
 
     def _embed_trial_idx(self, trial_indices: Tensor) -> Tensor:
-        """Map integer trial indices to hidden_dim vectors (nn.Embedding), clamped to table size."""
+        """Map integer trial indices to hidden_dim vectors (nn.Embedding), clamped to table size. **0** = padding."""
         if self.embed_trial_idx is None:
             raise RuntimeError("_embed_trial_idx called while use_trial_index_embedding is off")
         idx = trial_indices.long().clamp(0, self.embed_trial_idx.num_embeddings - 1)
@@ -267,15 +267,6 @@ class MetaDecisionTransformer(nn.Module):
                     prompt_timesteps,
                     prompt_attention_mask,
                 ) = prompt[:6]
-            # If RTG has one extra element (e.g. data quirk), drop last step from all prompt tensors so lengths align
-            if prompt_returns_to_go.shape[1] % 10 == 1 and prompt_returns_to_go.shape[1] > 1:
-                prompt_states = prompt_states[:, :-1]
-                prompt_actions = prompt_actions[:, :-1]
-                prompt_returns_to_go = prompt_returns_to_go[:, :-1]
-                prompt_timesteps = prompt_timesteps[:, :-1]
-                prompt_attention_mask = prompt_attention_mask[:, :-1]
-                if prompt_trial is not None:
-                    prompt_trial = prompt_trial[:, :-1]
             prompt_ts = prompt_timesteps.long()
             prompt_T = prompt_states.shape[1]
             if prompt_trial is None:
@@ -392,8 +383,6 @@ class MetaDecisionTransformer(nn.Module):
         returns_to_go: Tensor,
         timesteps: Tensor,
         prompt: Optional[Tuple[Tensor, ...]],
-        warm_train_steps: int,
-        current_step: int,
         **kwargs,
     ) -> Tensor:
         """Single-step inference forward.
@@ -427,7 +416,17 @@ class MetaDecisionTransformer(nn.Module):
             )
 
         trial_indices_kw = kwargs.get("trial_indices")
-        query_trial_index = int(kwargs.get("query_trial_index", 0))
+        if prompt is not None and len(prompt) >= 7:
+            pm, pt = prompt[5], prompt[6]
+            valid = pm > 0
+            if valid.any():
+                query_trial_index = int(pt[valid].max().item()) + 1
+            else:
+                query_trial_index = 1
+        elif "query_trial_index" in kwargs:
+            query_trial_index = int(kwargs["query_trial_index"])
+        else:
+            query_trial_index = 1
 
         qw = kwargs.get("query_window")
         if qw is not None:
@@ -535,7 +534,6 @@ class MetaDecisionTransformer(nn.Module):
                         dim=1,
                     )
 
-        use_prompt = prompt is not None and current_step > warm_train_steps
         batch = DTBatch(
             states=states,
             contexts=contexts,
@@ -544,7 +542,7 @@ class MetaDecisionTransformer(nn.Module):
             timesteps=timesteps,
             attention_mask=attention_mask,
             trial_indices=trial_indices,
-            prompt=prompt if use_prompt else None,
+            prompt=prompt,
             image_embeddings=image_embeddings,
             instruction_indices=instruction_indices,
         )

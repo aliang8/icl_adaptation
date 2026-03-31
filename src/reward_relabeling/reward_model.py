@@ -14,6 +14,7 @@ from __future__ import annotations
 from typing import List, Optional, Sequence
 
 import numpy as np
+import torch
 
 
 def pad_or_trunc_1d(arr: np.ndarray, target_len: int) -> np.ndarray:
@@ -108,8 +109,6 @@ class Robometer4BRewardModel(RewardModel):
         self._ProgressSample = ProgressSample
         self._compute_batch_outputs = compute_batch_outputs
 
-        import torch
-
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device)
@@ -157,7 +156,7 @@ class Robometer4BRewardModel(RewardModel):
             batch = self.batch_collator([sample])
             progress_inputs = batch["progress_inputs"]
             for key, value in progress_inputs.items():
-                if hasattr(value, "to"):
+                if isinstance(value, torch.Tensor):
                     progress_inputs[key] = value.to(self.device)
             results = self._compute_batch_outputs(
                 self.reward_model,

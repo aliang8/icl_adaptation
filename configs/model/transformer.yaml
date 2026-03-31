@@ -29,5 +29,5 @@ predict_returns: false
 predict_state: false
 condition_rtg: true
 # Trial index: which context trajectory (sorted prompt order) each token belongs to; query uses index = num_context.
-use_trial_index_embedding: false
+use_trial_index_embedding: true
 max_trial_embeddings: 64

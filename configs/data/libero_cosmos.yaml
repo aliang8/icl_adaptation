@@ -35,5 +35,5 @@ image_size: [256, 256]
 min_trajectory_length: 10
 max_trajectory_length: 400
 
-# null -> resolved default max_episode_steps * (num_context_trajectories + 1); set int to trim/pad prompt to N steps
+# null -> resolved default max_episode_steps * num_context_trajectories; set int to trim/pad prompt to N steps
 max_total_prompt_length: null

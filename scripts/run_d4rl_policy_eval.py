@@ -34,8 +34,8 @@ if str(_REPO) not in sys.path:
 from hydra import compose, initialize_config_dir
 
 from src.config.schema import resolved_max_total_prompt_length
-from src.data import ICLTrajectoryDataset
-from src.data.d4rl_loader import load_halfcheetah_trajectories
+from src.data import get_icl_trajectory_dataset
+from src.data.d4rl_loader import load_halfcheetah_trajectories, parse_halfcheetah_data_qualities
 from src.data.trajectories import sample_context_trajectories
 from src.engine.eval_viz import run_rollouts_and_save_viz
 from src.train import (
@@ -152,14 +152,15 @@ def main() -> None:
         data_quality=data_cfg.data_quality,
     )
     if not trajectories:
-        raise SystemExit(
-            f"No trajectories loaded. Expected: {paths.data_root}/{data_cfg.env_name}/"
-            f"{data_cfg.data_quality}/trajectories.pkl"
+        qs = parse_halfcheetah_data_qualities(data_cfg.data_quality)
+        expected = "\n".join(
+            f"  {paths.data_root}/{data_cfg.env_name}/{q}/trajectories.pkl" for q in qs
         )
+        raise SystemExit(f"No trajectories loaded. Expected one of:\n{expected}")
 
     state_dim, action_dim = ENV_DIMS.get(env_name, (cfg.model.state_dim, cfg.model.act_dim))
     total_plen = resolved_max_total_prompt_length(data_cfg)
-    dataset = ICLTrajectoryDataset(
+    dataset = get_icl_trajectory_dataset(
         trajectories=trajectories,
         horizon=data_cfg.horizon,
         max_episode_steps=data_cfg.max_episode_steps,
@@ -245,7 +246,9 @@ def main() -> None:
     if "halfcheetah" in str(data_cfg.env_name).lower():
         from src.envs.minari_halfcheetah_eval import resolve_minari_halfcheetah_eval_id
 
-        minari_halfcheetah_id = resolve_minari_halfcheetah_eval_id(str(data_cfg.data_quality))
+        minari_halfcheetah_id = resolve_minari_halfcheetah_eval_id(
+            ",".join(parse_halfcheetah_data_qualities(data_cfg.data_quality))
+        )
 
     _env_l = str(data_cfg.env_name).lower()
     d4rl_score_ref = None
@@ -255,6 +258,10 @@ def main() -> None:
         from src.envs.d4rl_normalized_score import MUJOCO_HALFCHEETAH_D4RL_REF
 
         d4rl_score_ref = MUJOCO_HALFCHEETAH_D4RL_REF
+
+    eval_target_returns_list = OmegaConf.select(cfg, "experiment.eval_target_returns", default=None)
+    if eval_target_returns_list is not None:
+        eval_target_returns_list = [float(x) for x in list(eval_target_returns_list)]
 
     num_rollouts = int(exp.num_eval_rollouts)
     log.info(
@@ -297,6 +304,8 @@ def main() -> None:
             vd4rl_eval_obs_downsample=None,
             vd4rl_eval_seed=int(data_cfg.seed),
             eval_target_return=OmegaConf.select(cfg, "experiment.eval_target_return", default=None),
+            eval_target_returns=eval_target_returns_list,
+            num_context_trajectories=int(data_cfg.num_context_trajectories),
             query_window=eval_query_window,
             minari_halfcheetah_dataset_id=minari_halfcheetah_id,
             num_eval_rollout_videos=OmegaConf.select(

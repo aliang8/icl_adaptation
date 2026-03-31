@@ -32,7 +32,8 @@ from src.engine.trainer import Trainer
 from src.models import MetaDecisionTransformer, RNNContextEncoder, VLADecisionTransformer
 from src.models.types import DTBatch
 from src.config.schema import resolved_max_total_prompt_length
-from src.data import ICLTrajectoryDataset, collate_icl_batch
+from src.data import collate_icl_batch, get_icl_trajectory_dataset
+from src.data.d4rl_loader import format_data_quality_for_log, parse_halfcheetah_data_qualities
 from src.data.trajectories import (
     convert_data_to_trajectories,
     sample_context_trajectories,
@@ -296,6 +297,12 @@ def build_model(cfg, state_dim: int, action_dim: int, num_instructions: Optional
     m = cfg.model
     n_inner = m.n_inner or (4 * m.hidden_size)
     num_ctx = int(cfg.data.num_context_trajectories)
+    enable_trial_index_embedding = bool(m.use_trial_index_embedding) and num_ctx > 1
+    if m.use_trial_index_embedding and not enable_trial_index_embedding:
+        log.info(
+            "Trial index embedding off: requires data.num_context_trajectories > 1; got {}",
+            num_ctx,
+        )
     common = dict(
         state_dim=state_dim,
         act_dim=action_dim,
@@ -318,7 +325,7 @@ def build_model(cfg, state_dim: int, action_dim: int, num_instructions: Optional
         predict_returns=m.predict_returns,
         predict_state=m.predict_state,
         condition_rtg=m.condition_rtg,
-        use_trial_index_embedding=m.use_trial_index_embedding,
+        use_trial_index_embedding=enable_trial_index_embedding,
         max_trial_embeddings=m.max_trial_embeddings,
     )
     if m.use_vision or m.use_language:
@@ -437,7 +444,7 @@ def make_train_step_fn(task_instructions, use_precomputed_embeddings: bool = Fal
             else:
                 log.info("[train_batch]   images/embeddings: {}", type(imgs).__name__)
         if prompt_t_len > 0:
-            log.info("[train_batch]   --- DTBatch (prompt trimmed for RTG align in step) ---")
+            log.info("[train_batch]   --- DTBatch (prompt + query) ---")
         else:
             log.info("[train_batch]   --- DTBatch (query only) ---")
         log.info("[train_batch]   states: {}", tuple(dt_batch.states.shape))
@@ -517,28 +524,21 @@ def make_train_step_fn(task_instructions, use_precomputed_embeddings: bool = Fal
             prompt_trial_idx,
             instructions,
         ) = batch[:17]
-        # Trim last step from all prompt tensors so lengths match
-        prompt_rtg = prompt_rtg[:, :-1, :]
-        prompt_s = prompt_s[:, :-1, :]
-        prompt_a = prompt_a[:, :-1, :]
-        prompt_r = prompt_r[:, :-1, :]
-        prompt_ts = prompt_ts[:, :-1]
-        prompt_m = prompt_m[:, :-1]
-        prompt_trial_idx = prompt_trial_idx[:, :-1]
-        if model.use_trial_index_embedding:
-            prompt = (
-                prompt_s,
-                prompt_a,
-                prompt_r,
-                prompt_rtg,
-                prompt_ts,
-                prompt_m,
-                prompt_trial_idx,
-            )
-            trial_batch = query_trial_idx.long()
-        else:
-            prompt = (prompt_s, prompt_a, prompt_r, prompt_rtg, prompt_ts, prompt_m)
-            trial_batch = None
+
+        # Always pass trial id tensors from the dataset. MetaDecisionTransformer only applies
+        # nn.Embedding when model.use_trial_index_embedding / embed_trial_idx is set; if that flag
+        # is off, indices are ignored but must still be passed when the flag is on (otherwise
+        # forward() substitutes zeros and trial conditioning is silently disabled).
+        trial_batch = query_trial_idx.long()
+        prompt = (
+            prompt_s,
+            prompt_a,
+            prompt_r,
+            prompt_rtg,
+            prompt_ts,
+            prompt_m,
+            prompt_trial_idx.long(),
+        )
         # VLA-DT: instruction indices (one per sample) from task_instructions
         instruction_indices = None
         if model.use_language and task_list and instructions is not None:
@@ -591,8 +591,8 @@ def make_train_step_fn(task_instructions, use_precomputed_embeddings: bool = Fal
         with torch.no_grad():
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1e9)
 
-        # Batch stats for logging (min/max/mean return and in-context prompt length)
-        batch_stats = _batch_stats(rewards, masks, prompt_m)
+        # Batch stats for logging (min/max/mean return, RTG, and in-context prompt length)
+        batch_stats = _batch_stats(rewards, masks, prompt_m, rtg)
         return loss, grad_norm, batch_stats
 
     return train_step_fn
@@ -602,8 +602,9 @@ def _batch_stats(
     rewards: torch.Tensor,
     masks: torch.Tensor,
     prompt_m: torch.Tensor,
+    rtg: Optional[torch.Tensor] = None,
 ) -> dict:
-    """Compute min/max/mean return and prompt length per batch for W&B."""
+    """Compute min/max/mean return, RTG (query), and prompt length per batch for W&B."""
     # Return per sample: sum of rewards over valid (masked) steps. rewards (B,T,1), masks (B,T)
     valid_return = (rewards.squeeze(-1) * masks).sum(dim=1)
     n = valid_return.shape[0]
@@ -617,7 +618,7 @@ def _batch_stats(
     pl_min = prompt_len.min().cpu().item()
     pl_max = prompt_len.max().cpu().item()
     pl_mean = prompt_len.mean().cpu().item()
-    return {
+    out: dict = {
         "batch/return_min": r_min,
         "batch/return_max": r_max,
         "batch/return_mean": r_mean,
@@ -625,6 +626,17 @@ def _batch_stats(
         "batch/prompt_len_max": pl_max,
         "batch/prompt_len_mean": pl_mean,
     }
+    # RTG: per-timestep targets on the query segment; stats over masked positions only.
+    if rtg is not None and rtg.numel() > 0:
+        rtg_2d = rtg.squeeze(-1) if rtg.dim() == 3 else rtg
+        if rtg_2d.shape == masks.shape:
+            valid = masks > 0 if masks.dtype != torch.bool else masks
+            flat = rtg_2d[valid]
+            if flat.numel() > 0:
+                out["batch/rtg_min"] = flat.min().cpu().item()
+                out["batch/rtg_max"] = flat.max().cpu().item()
+                out["batch/rtg_mean"] = flat.float().mean().cpu().item()
+    return out
 
 
 def main():
@@ -738,7 +750,12 @@ def main():
     data_root = paths.data_root
     data_dir = data_root / data_cfg.env_name
     if data_cfg.data_quality:
-        data_dir = data_dir / data_cfg.data_quality
+        if env_name == "HalfCheetah-v2":
+            _qs = parse_halfcheetah_data_qualities(data_cfg.data_quality)
+            if len(_qs) == 1:
+                data_dir = data_dir / _qs[0]
+        else:
+            data_dir = data_dir / str(data_cfg.data_quality)
     if env_name in LIBERO_SUITES:
         data_dir = data_root
     trajectories = []
@@ -903,10 +920,10 @@ def main():
         if data_cfg.max_total_prompt_length is None:
             log.info(
                 "data.max_total_prompt_length unset -> using {} "
-                "(max_episode_steps * (num_context_trajectories + 1))",
+                "(max_episode_steps * num_context_trajectories)",
                 total_plen,
             )
-        dataset = ICLTrajectoryDataset(
+        dataset = get_icl_trajectory_dataset(
             trajectories=trajectories,
             horizon=data_cfg.horizon,
             max_episode_steps=data_cfg.max_episode_steps,
@@ -960,7 +977,9 @@ def main():
         dataset,
         loader,
         env_name=data_cfg.env_name,
-        data_quality=data_cfg.data_quality or "",
+        data_quality=(
+            format_data_quality_for_log(data_cfg.data_quality) if data_cfg.data_quality else ""
+        ),
         image_keys=data_cfg.image_keys or [],
         proprio_keys=data_cfg.proprio_keys or [],
         use_vision=data_cfg.use_vision,
@@ -1083,7 +1102,9 @@ def main():
         if "halfcheetah" in str(eval_rollout_env).lower():
             from src.envs.minari_halfcheetah_eval import resolve_minari_halfcheetah_eval_id
 
-            minari_halfcheetah_id = resolve_minari_halfcheetah_eval_id(str(data_cfg.data_quality))
+            minari_halfcheetah_id = resolve_minari_halfcheetah_eval_id(
+                ",".join(parse_halfcheetah_data_qualities(data_cfg.data_quality))
+            )
         vd4rl_px = None
         vd4rl_ds = None
         if str(eval_rollout_env).startswith("VD4RL/dmc/"):
@@ -1098,6 +1119,11 @@ def main():
             from src.envs.d4rl_normalized_score import MUJOCO_HALFCHEETAH_D4RL_REF
 
             d4rl_score_ref = MUJOCO_HALFCHEETAH_D4RL_REF
+        eval_target_returns_list = OmegaConf.select(
+            cfg, "experiment.eval_target_returns", default=None
+        )
+        if eval_target_returns_list is not None:
+            eval_target_returns_list = [float(x) for x in list(eval_target_returns_list)]
         # Dual-camera stitch is LIBERO-only; Gymnasium (HalfCheetah, etc.) has a single render view.
         eval_render_both_views = bool(cfg.experiment.eval_render_both_views) and (
             env_name in LIBERO_SUITES
@@ -1139,6 +1165,8 @@ def main():
                     eval_target_return=OmegaConf.select(
                         cfg, "experiment.eval_target_return", default=None
                     ),
+                    eval_target_returns=eval_target_returns_list,
+                    num_context_trajectories=int(data_cfg.num_context_trajectories),
                     query_window=eval_query_window,
                     minari_halfcheetah_dataset_id=minari_halfcheetah_id,
                     num_eval_rollout_videos=exp_e.num_eval_rollout_videos,
@@ -1157,7 +1185,6 @@ def main():
                         max_episode_steps=data_cfg.max_episode_steps,
                         scale=float(data_cfg.rtg_scale),
                         use_gt_action=True,
-                        warm_train_steps=cfg.experiment.warm_train_steps,
                     )
                     metrics = {**metrics, **action_metrics}
         finally:

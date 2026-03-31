@@ -121,7 +121,10 @@ class SampleIndex:
         if isinstance(data, (str, Path)):
             self._df = pd.read_parquet(data)
         else:
-            self._df = data.copy() if hasattr(data, "copy") else pd.DataFrame(data)
+            if isinstance(data, pd.DataFrame):
+                self._df = data.copy()
+            else:
+                self._df = pd.DataFrame(data)
         self._weight_col = weight_column
         self._length_bin_cols = length_bin_columns or []
         self._length_bin_bins = length_bin_bins or {}

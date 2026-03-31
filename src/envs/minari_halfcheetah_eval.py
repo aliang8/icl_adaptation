@@ -24,9 +24,22 @@ HALFCHEETAH_QUALITY_TO_MINARI_ID: Dict[str, str] = {
 
 
 def resolve_minari_halfcheetah_eval_id(data_quality: str) -> Optional[str]:
-    """Map ``data_quality`` to Minari id, or None -> plain ``gym.make`` (e.g. medium_expert)."""
-    q = (data_quality or "").strip().lower().replace("-", "_")
-    return HALFCHEETAH_QUALITY_TO_MINARI_ID.get(q)
+    """Map ``data_quality`` to Minari id, or None -> plain ``gym.make`` (e.g. medium_expert).
+
+    Comma-separated qualities: return the first segment that has a Minari mapping (e.g.
+    ``random,medium`` -> medium).
+    """
+    raw = (data_quality or "").strip()
+    if not raw:
+        return None
+    for seg in raw.split(","):
+        q = seg.strip().lower().replace("-", "_")
+        if not q:
+            continue
+        hit = HALFCHEETAH_QUALITY_TO_MINARI_ID.get(q)
+        if hit is not None:
+            return hit
+    return None
 
 
 def make_halfcheetah_env_via_minari(

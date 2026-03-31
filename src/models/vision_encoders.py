@@ -322,8 +322,12 @@ def _build_paligemma_encoder(
                 if im.dim() == 5:
                     im = im.reshape(B * T, *im.shape[2:])
                 h = self.model(pixel_values=im)
-                if self.do_pool and hasattr(h, "pooler_output") and h.pooler_output is not None:
-                    tok = h.pooler_output
+                try:
+                    po = h.pooler_output
+                except AttributeError:
+                    po = None
+                if self.do_pool and po is not None:
+                    tok = po
                 else:
                     tok = h.last_hidden_state.mean(dim=1)
                 if T > 1:

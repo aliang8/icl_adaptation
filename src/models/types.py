@@ -21,7 +21,7 @@ class DTBatch:
     returns_to_go: Tensor  # [B, T, 1]
     timesteps: Tensor  # [B, T]
     attention_mask: Optional[Tensor] = None  # [B, T]
-    # Which in-context trial each timestep belongs to (0..num_context-1 for prompt order; query = num_context).
+    # Trial id per timestep: **0** = padding; prompt uses **1..**; query = max(valid prompt trial) + 1.
     trial_indices: Optional[Tensor] = None  # [B, T], long
     # In-context prompt: (prompt_states, prompt_actions, prompt_rewards, prompt_rtg, prompt_ts, prompt_mask [, prompt_trial_idx])
     prompt: Optional[Tuple[Tensor, ...]] = None

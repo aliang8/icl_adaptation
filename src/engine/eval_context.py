@@ -1,12 +1,14 @@
 """
-Eval context: build prompt tuple from K trajectories (sorted by return) for prompt mode
-or zero_shot_adaptation. Same format as training (state, action, rtg, timestep, mask).
+Eval context: build prompt tuples for prompt mode or zero_shot_adaptation.
+
+Tensor layout matches training (state, action, reward, RTG, timestep, mask, trial id). Inference
+builds variable-length prompts and only trims when over ``total_prompt_len``; batched training
+still left-pads in ``dataset.py`` / collate.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -62,11 +64,11 @@ def _prompt_segment_from_traj(
     pts = idx.astype(np.float32)
     T = idx.shape[0]
     pm = np.ones(T, dtype=np.float32)
-    ptrial = np.full(T, trial_idx, dtype=np.float32)
+    ptrial = np.full(T, float(trial_idx + 1), dtype=np.float32)
     return ps, pa, pr, prtg, pts, pm, ptrial
 
 
-def _pad_or_trim_prompt(
+def _trim_prompt_to_cap(
     ps: np.ndarray,
     pa: np.ndarray,
     pr: np.ndarray,
@@ -74,47 +76,24 @@ def _pad_or_trim_prompt(
     pts: np.ndarray,
     pm: np.ndarray,
     ptrial: np.ndarray,
-    total_plen: int,
-    state_dim: int,
-    act_dim: int,
-    take_last: bool,
+    max_plen: int,
 ) -> Tuple[np.ndarray, ...]:
+    """If concatenated prompt is longer than ``max_plen``, keep the last ``max_plen`` timesteps.
+
+    Short prompts are **not** left-padded (sequential eval does not need fixed-width prompts).
+    Training batches still use ``dataset._pad_or_trim_prompt`` for left-pad + trim.
     """
-    If shorter than total_plen: **left-pad** so valid prompt timesteps are **right-aligned**
-    (abutting the query segment), matching training collate. If longer: trim from start (take_last)
-    or from end (not take_last).
-    """
-    if ps.shape[0] >= total_plen:
-        if take_last:
-            ps, pa, pr, prtg, pts, pm, ptrial = (
-                ps[-total_plen:],
-                pa[-total_plen:],
-                pr[-total_plen:],
-                prtg[-total_plen:],
-                pts[-total_plen:],
-                pm[-total_plen:],
-                ptrial[-total_plen:],
-            )
-        else:
-            ps, pa, pr, prtg, pts, pm, ptrial = (
-                ps[:total_plen],
-                pa[:total_plen],
-                pr[:total_plen],
-                prtg[:total_plen],
-                pts[:total_plen],
-                pm[:total_plen],
-                ptrial[:total_plen],
-            )
-    else:
-        pad_len = total_plen - ps.shape[0]
-        ps = np.concatenate([np.zeros((pad_len, state_dim)), ps], axis=0)
-        pa = np.concatenate([np.ones((pad_len, act_dim)) * -10.0, pa], axis=0)
-        pr = np.concatenate([np.zeros((pad_len, 1)), pr], axis=0)
-        prtg = np.concatenate([np.zeros((pad_len, 1)), prtg], axis=0)
-        pts = np.concatenate([np.zeros(pad_len), pts], axis=0)
-        pm = np.concatenate([np.zeros(pad_len), pm], axis=0)
-        ptrial = np.concatenate([np.zeros(pad_len, dtype=np.float32), ptrial], axis=0)
-    return ps, pa, pr, prtg, pts, pm, ptrial
+    if max_plen <= 0 or ps.shape[0] <= max_plen:
+        return ps, pa, pr, prtg, pts, pm, ptrial
+    return (
+        ps[-max_plen:],
+        pa[-max_plen:],
+        pr[-max_plen:],
+        prtg[-max_plen:],
+        pts[-max_plen:],
+        pm[-max_plen:],
+        ptrial[-max_plen:],
+    )
 
 
 def build_prompt_tuple(
@@ -134,11 +113,13 @@ def build_prompt_tuple(
     """
     Build the 7-tuple (prompt_states, prompt_actions, prompt_rewards, prompt_rtg, prompt_timesteps,
     prompt_mask, prompt_trial_idx) from K trajectories, sorted by return (ascending = worst first, like training).
+    Trial indices are **1-based** per demo (**1..K**); **0** is reserved for padding in batched training.
     If trajectory_returns is provided (same length as trajectories), sort by those instead of sum(rewards).
     Returns None if trajectories is empty.
 
-    Uses take_last=True when trimming/padding: short prompts are **left-padded** so real tokens sit at the
-    end next to the query (same as training _pad_or_trim_prompt with take_last=True).
+    **Inference-only:** concatenates segments at their natural length. If longer than ``total_prompt_len``,
+    trims to the last ``total_prompt_len`` timesteps (same tail as training trim). Does **not** left-pad
+    short prompts—batch training/collate still pads in ``dataset.py``.
     """
     if not trajectories:
         return None
@@ -184,8 +165,8 @@ def build_prompt_tuple(
     pts = np.concatenate(segs_pts, axis=0)
     pm = np.concatenate(segs_pm, axis=0)
     ptrial = np.concatenate(segs_ptrial, axis=0)
-    ps, pa, pr, prtg, pts, pm, ptrial = _pad_or_trim_prompt(
-        ps, pa, pr, prtg, pts, pm, ptrial, total_prompt_len, state_dim, act_dim, take_last=True
+    ps, pa, pr, prtg, pts, pm, ptrial = _trim_prompt_to_cap(
+        ps, pa, pr, prtg, pts, pm, ptrial, total_prompt_len
     )
     return (
         torch.from_numpy(ps).float().unsqueeze(0).to(device),

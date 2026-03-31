@@ -38,7 +38,7 @@ IMAGE_H, IMAGE_W, IMAGE_C = 180, 320, 3
 
 def decode_image_frame(raw) -> np.ndarray:
     """Decode one frame from HDF5 (bytes or array) to (H, W, 3) uint8."""
-    if hasattr(raw, "tobytes"):
+    if isinstance(raw, (np.ndarray, memoryview)):
         raw = raw.tobytes()
     if isinstance(raw, bytes):
         arr = np.frombuffer(raw, dtype=np.uint8)

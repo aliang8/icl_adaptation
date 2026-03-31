@@ -154,9 +154,9 @@ def read_episode_obs_act(
     for name in ("language_instruction", "language_instruction_2", "language_instruction_3"):
         if name in grp:
             val = grp[name]
-            if hasattr(val, "asstr"):
+            try:
                 lang = val.asstr()[()]
-            else:
+            except AttributeError:
                 lang = str(val[()])
             break
 
@@ -191,7 +191,7 @@ def load_icrt_trajectories(
 ) -> Tuple[List[Dict[str, Any]], List[List[Dict[str, Any]]], List[str]]:
     """
     Load ICRT HDF5 into (trajectories, prompt_trajectories_per_task, task_instructions).
-    Each trajectory has observations (proprio only, for ICLTrajectoryDataset), actions, rewards, terminals.
+    Each trajectory has observations (proprio only, for ICL trajectory datasets), actions, rewards, terminals.
     """
     import h5py
 
