@@ -1,195 +1,315 @@
 """
-Evaluation: load checkpoint or inference artifact, run env episodes, report metrics.
-Use for eval-only runs and for validating exported models.
+Evaluation: offline rollouts + viz under ``<experiment_root>/offline_eval/``.
+
+Run from repo root: ``uv run python -m src.eval --checkpoint ...``. Merges Hydra defaults with the
+checkpoint config (like ``scripts/run_d4rl_policy_eval.py``), uses ``build_model``, and calls
+``run_rollouts_and_save_viz`` for training-aligned RTG, prompts, and plots.
 """
 
-import os
+from __future__ import annotations
+
 import argparse
+import os
+import sys
 from pathlib import Path
-from typing import Optional
+from typing import Any, List, Optional
+
+_REPO = Path(__file__).resolve().parent.parent
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
 
 import numpy as np
 import torch
+from hydra import compose, initialize_config_dir
+from loguru import logger as log
+from omegaconf import OmegaConf
 
-# Add project root
-import sys
+from src.config.schema import resolved_max_total_prompt_length
+from src.data import ICLTrajectoryDataset
+from src.data.d4rl_loader import load_halfcheetah_trajectories
+from src.data.trajectories import sample_context_trajectories
+from src.engine.eval_viz import run_rollouts_and_save_viz
+from src.engine.run_dir import infer_experiment_root_from_checkpoint
+from src.train import (
+    ENV_DIMS,
+    LIBERO_SUITES,
+    build_model,
+    resolve_paths,
+    validate_dataset_paths,
+)
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.models import MetaDecisionTransformer, RNNContextEncoder
-from src.data.trajectories import sort_trajectories_by_return, discount_cumsum
-from src.data.rtg import initial_rtg_token
+def _get_config(config_dir: str, overrides: Optional[List[str]] = None):
+    with initialize_config_dir(config_dir=config_dir, version_base=None):
+        return compose(config_name="config", overrides=overrides or [])
 
 
-def load_model_for_eval(
-    checkpoint_path: str, device: torch.device, inference_artifact: bool = False
-):
-    """Load model from training checkpoint or inference artifact."""
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=inference_artifact)
-    state_dim = ckpt.get("config", {}).get("model", {}).get("state_dim", 27)
-    act_dim = ckpt.get("config", {}).get("model", {}).get("act_dim", 8)
-    if inference_artifact:
-        cfg = ckpt.get("config", {})
-        m = cfg.get("model", cfg)
-    else:
-        m = ckpt.get("config", {}).get("model", {})
-    model = MetaDecisionTransformer(
-        state_dim=state_dim,
-        act_dim=act_dim,
-        hidden_size=m.get("hidden_size", 128),
-        context_dim=m.get("context_dim", 16),
-        max_length=m.get("max_length", 20),
-        max_ep_len=m.get("max_ep_len", 200),
-        n_layer=m.get("n_layer", 3),
-        n_head=m.get("n_head", 1),
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Offline eval: rollouts + viz under <experiment_root>/offline_eval/ (uses eval_viz)."
+        )
     )
-    model.load_state_dict(ckpt["model"], strict=True)
-    model.to(device)
-    model.eval()
-    state_mean = ckpt.get("state_mean")
-    state_std = ckpt.get("state_std")
-    return model, state_mean, state_std
-
-
-def build_context_prompt_from_rollouts(
-    rollouts: list,
-    prompt_length: int,
-    state_dim: int,
-    action_dim: int,
-    scale: float,
-    state_mean: np.ndarray,
-    state_std: np.ndarray,
-    device: torch.device,
-    ascending: bool = True,
-):
-    """
-    Build prompt from previous rollouts for zero-shot adaptation.
-    Sorted ascending (worst to best) as per project spec.
-    """
-    sorted_rollouts = sort_trajectories_by_return(rollouts, ascending=ascending)
-    if not sorted_rollouts:
-        return None
-    traj = sorted_rollouts[0]
-    L = min(prompt_length, len(traj["rewards"]))
-    start = max(0, len(traj["rewards"]) - L)
-    s = (traj["observations"][start : start + L] - state_mean) / state_std
-    a = traj["actions"][start : start + L]
-    r = traj["rewards"][start : start + L].reshape(-1, 1)
-    rtg = discount_cumsum(traj["rewards"][start:], gamma=1.0)[: L + 1].reshape(-1, 1)
-    if rtg.shape[0] <= L:
-        rtg = np.concatenate([rtg, np.zeros((1, 1))], axis=0)
-    rtg = rtg / scale
-    ts = np.arange(start, start + L)
-    pad = prompt_length - L
-    s = np.concatenate([np.zeros((pad, s.shape[1])), s], axis=0)
-    a = np.concatenate([np.ones((pad, a.shape[1])) * -10.0, a], axis=0)
-    r = np.concatenate([np.zeros((pad, 1)), r], axis=0)
-    rtg = np.concatenate([np.zeros((pad, 1)), rtg], axis=0)
-    ts = np.concatenate([np.zeros(pad), ts], axis=0)
-    mask = np.concatenate([np.zeros(pad), np.ones(L)], axis=0)
-    return (
-        torch.from_numpy(s).float().unsqueeze(0).to(device),
-        torch.from_numpy(a).float().unsqueeze(0).to(device),
-        torch.from_numpy(r).float().unsqueeze(0).to(device),
-        torch.from_numpy(rtg[:, :-1]).float().unsqueeze(0).to(device),
-        torch.from_numpy(ts).long().unsqueeze(0).to(device),
-        torch.from_numpy(mask).float().unsqueeze(0).to(device),
-    )
-
-
-def run_eval_episodes(
-    model,
-    env,
-    context_encoder,
-    state_mean,
-    state_std,
-    device,
-    num_episodes: int = 5,
-    max_episode_steps: int = 200,
-    rtg_scale: float = 500.0,
-    warm_train_steps: int = 0,
-    current_step: int = 0,
-    prompt=None,
-    eval_target_return: Optional[float] = None,
-):
-    """Run evaluation episodes and return mean return and mean length.
-
-    ``rtg_scale`` must match ``data.rtg_scale``. Per-step env rewards are raw;
-    RTG tokens match ``eval_viz._run_one_rollout`` (``initial_rtg_token`` + ``r_env/rtg_scale``).
-    """
-    model.eval()
-    if context_encoder is not None:
-        context_encoder.eval()
-    state_mean_t = torch.from_numpy(state_mean).to(device) if state_mean is not None else 0.0
-    state_std_t = torch.from_numpy(state_std).to(device) if state_std is not None else 1.0
-
-    rs = float(rtg_scale)
-    rtg0 = initial_rtg_token(rs, eval_target_return=eval_target_return)
-    returns = []
-    lengths = []
-    for _ in range(num_episodes):
-        state = env.reset()
-        if isinstance(state, tuple):
-            state = state[0]
-        context_dim = model.context_dim
-        states = torch.from_numpy(state).float().reshape(1, -1).to(device)
-        contexts = torch.zeros(1, context_dim, device=device)
-        actions = torch.zeros(0, model.act_dim, device=device)
-        rewards = torch.zeros(0, device=device)
-        returns_to_go = torch.tensor([[rtg0]], device=device, dtype=torch.float32)
-        timesteps = torch.zeros(1, 1, dtype=torch.long, device=device)
-        ep_return = 0.0
-        for t in range(max_episode_steps):
-            action = model.get_action(
-                (states - state_mean_t) / state_std_t,
-                contexts,
-                actions,
-                rewards,
-                returns_to_go,
-                timesteps,
-                prompt=prompt,
-                warm_train_steps=warm_train_steps,
-                current_step=current_step,
-            )
-            action_np = action.detach().cpu().numpy()
-            next_state, reward, done, _ = env.step(action_np)
-            r_env = float(reward)
-            ep_return += r_env
-            actions = torch.cat([actions, action.unsqueeze(0)], dim=0)
-            rewards = torch.cat([rewards, torch.tensor([r_env], device=device)])
-            states = torch.cat(
-                [states, torch.from_numpy(next_state).float().reshape(1, -1).to(device)], dim=0
-            )
-            if context_encoder is not None:
-                # Update context from recent (s,a,r) segment
-                pass  # Stub: compute context from last context_horizon steps
-            returns_to_go = torch.cat(
-                [returns_to_go, (returns_to_go[0, -1] - r_env / rs).reshape(1, 1)], dim=1
-            )
-            timesteps = torch.cat([timesteps, torch.tensor([[t + 1]], device=device)], dim=1)
-            if done:
-                break
-        returns.append(ep_return)
-        lengths.append(t + 1)
-    return float(np.mean(returns)), float(np.mean(lengths))
-
-
-def main():
-    parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=str, required=True)
-    parser.add_argument("--inference-artifact", action="store_true")
-    parser.add_argument("--output-dir", type=str, default="outputs/eval")
-    parser.add_argument("--device", type=str, default="cuda:0")
-    args = parser.parse_args()
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    model, state_mean, state_std = load_model_for_eval(
-        args.checkpoint, device, inference_artifact=args.inference_artifact
+    parser.add_argument(
+        "--num-episodes",
+        type=int,
+        default=3,
+        help="Number of env rollouts (maps to num_eval_rollouts for this run).",
     )
-    os.makedirs(args.output_dir, exist_ok=True)
-    # Without a real env we only load and optionally save metrics placeholder
-    print("Model loaded. Run with a real env (e.g. AntDir) to compute returns.")
-    print("state_mean:", state_mean is not None)
-    print("state_std:", state_std is not None)
+    parser.add_argument(
+        "--step",
+        type=int,
+        default=0,
+        help="Step label for viz path: offline_eval/viz/samples/step_XXXXXX/",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Override rollout/viz root (default: <experiment_root>/offline_eval).",
+    )
+    parser.add_argument(
+        "--experiment-root",
+        type=str,
+        default=None,
+        help=(
+            "Experiment root for default offline_eval path "
+            "(default: parent of ckpts/ inferred from --checkpoint)."
+        ),
+    )
+    parser.add_argument("--config-dir", type=str, default="configs")
+    parser.add_argument(
+        "--override",
+        action="append",
+        nargs="*",
+        default=[],
+        metavar="KEY=VAL",
+        help="Hydra overrides (e.g. paths.data_root=/data).",
+    )
+    parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--strict", action="store_true", help="load_state_dict(strict=True).")
+    parser.add_argument(
+        "--weights-only",
+        action="store_true",
+        help="torch.load(weights_only=True); usually fails on full training checkpoints.",
+    )
+    parser.add_argument(
+        "--save-video",
+        action="store_true",
+        help="Record rollout videos under offline_eval/viz/.../videos/.",
+    )
+    args = parser.parse_args()
+
+    overrides: List[str] = []
+    for ov in args.override:
+        overrides.extend(ov if isinstance(ov, list) else [ov])
+
+    config_dir = os.path.abspath(args.config_dir)
+    if not os.path.isdir(config_dir):
+        config_dir = str(_REPO / "configs")
+
+    ckpt_path = Path(args.checkpoint).resolve()
+    if not ckpt_path.is_file():
+        raise SystemExit(f"Checkpoint not found: {ckpt_path}")
+
+    ckpt: dict[str, Any] = torch.load(
+        str(ckpt_path), map_location="cpu", weights_only=bool(args.weights_only)
+    )
+    if "model" not in ckpt:
+        raise SystemExit("Checkpoint missing 'model' state_dict.")
+
+    cfg = _get_config(config_dir, overrides)
+    if "config" in ckpt and ckpt["config"]:
+        cfg = OmegaConf.merge(cfg, OmegaConf.create(ckpt["config"]))
+    OmegaConf.resolve(cfg)
+
+    sys_cfg = cfg.system
+    data_cfg = cfg.data
+    device = torch.device(args.device or (sys_cfg.device if torch.cuda.is_available() else "cpu"))
+    env_name = str(data_cfg.env_name)
+
+    if env_name != "HalfCheetah-v2":
+        raise SystemExit(
+            f"src.eval currently supports HalfCheetah-v2 only; got {env_name!r}. "
+            "Extend like scripts/run_d4rl_policy_eval.py or use Hydra overrides."
+        )
+
+    paths = resolve_paths(cfg)
+    validate_dataset_paths(env_name, paths, data_cfg)
+
+    trajectories, prompt_per_task = load_halfcheetah_trajectories(
+        str(paths.data_root),
+        env_name=data_cfg.env_name,
+        data_quality=data_cfg.data_quality,
+    )
+    if not trajectories:
+        raise SystemExit(
+            f"No trajectories loaded. Expected: {paths.data_root}/{data_cfg.env_name}/"
+            f"{data_cfg.data_quality}/trajectories.pkl"
+        )
+
+    state_dim, action_dim = ENV_DIMS.get(env_name, (cfg.model.state_dim, cfg.model.act_dim))
+    total_plen = resolved_max_total_prompt_length(data_cfg)
+    dataset = ICLTrajectoryDataset(
+        trajectories=trajectories,
+        horizon=data_cfg.horizon,
+        max_episode_steps=data_cfg.max_episode_steps,
+        rtg_scale=float(data_cfg.rtg_scale),
+        device=device,
+        prompt_trajectories_per_task=prompt_per_task,
+        context_dim=data_cfg.context_dim,
+        state_dim=state_dim,
+        act_dim=action_dim,
+        prompt_length=data_cfg.prompt_length,
+        total_epi_per_task=max(1, len(trajectories) // max(1, data_cfg.num_train_tasks)),
+        num_context_trajectories=data_cfg.num_context_trajectories,
+        randomize_num_context_trajectories=data_cfg.randomize_num_context_trajectories,
+        context_sort_ascending=data_cfg.context_sort_ascending,
+        context_sampling=data_cfg.context_sampling,
+        max_total_prompt_length=total_plen,
+        max_prompt_trajectory_length=data_cfg.max_prompt_trajectory_length,
+        context_subsample_strategy=data_cfg.context_subsample_strategy,
+        context_style=data_cfg.context_style,
+        lazy_dataset=data_cfg.lazy_dataset,
+        max_training_examples=data_cfg.max_training_examples,
+        task_instructions=data_cfg.task_instructions,
+        seed=data_cfg.seed,
+        query_history_length=data_cfg.query_history_length,
+        use_vision=data_cfg.use_vision,
+        image_keys=data_cfg.image_keys or [],
+    )
+
+    sm_ckpt = ckpt["state_mean"] if "state_mean" in ckpt else None
+    std_ckpt = ckpt["state_std"] if "state_std" in ckpt else None
+    if sm_ckpt is not None and std_ckpt is not None:
+        state_mean = np.asarray(sm_ckpt, dtype=np.float32)
+        state_std = np.asarray(std_ckpt, dtype=np.float32)
+        log.info("Using state_mean/state_std from checkpoint.")
+    else:
+        state_mean = dataset.state_mean
+        state_std = dataset.state_std
+        log.info("Using state_mean/state_std from dataset.")
+
+    num_instructions = len(dataset.task_instructions) if dataset.task_instructions else None
+    model = build_model(cfg, state_dim, action_dim, num_instructions=num_instructions).to(device)
+    inc = model.load_state_dict(ckpt["model"], strict=bool(args.strict))
+    if not args.strict:
+        log.info(
+            "load_state_dict strict=False | missing_keys={} unexpected_keys={}",
+            len(inc.missing_keys),
+            len(inc.unexpected_keys),
+        )
+    model.eval()
+
+    exp_root = (
+        Path(args.experiment_root).resolve()
+        if args.experiment_root
+        else infer_experiment_root_from_checkpoint(ckpt_path)
+    )
+    if args.output_dir:
+        run_dir = Path(args.output_dir).resolve()
+    else:
+        run_dir = exp_root / "offline_eval"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    log.info("Rollout viz directory: {}", run_dir.resolve())
+
+    exp = cfg.experiment
+    eval_mode = exp.eval_context_mode
+    if eval_mode == "zero_shot_adaptation":
+        if exp.eval_context_k is not None:
+            eval_k = exp.eval_context_k
+        else:
+            ml = cfg.model.max_length
+            eval_k = int(ml) if ml is not None else 20
+    else:
+        eval_k = exp.eval_context_k or data_cfg.num_context_trajectories
+
+    eval_query_window = (
+        int(data_cfg.query_history_length)
+        if data_cfg.query_history_length is not None
+        else int(data_cfg.horizon)
+    )
+
+    prompt_trajectories = None
+    if eval_mode == "prompt" and dataset.trajectories:
+        prompt_trajectories = sample_context_trajectories(
+            dataset.trajectories,
+            n=eval_k,
+            ascending=True,
+            sampling=data_cfg.context_sampling,
+        )
+
+    task_desc = (dataset.task_instructions or [None])[0] if dataset.task_instructions else None
+    eval_render_both_views = bool(exp.eval_render_both_views) and (env_name in LIBERO_SUITES)
+    minari_halfcheetah_id = None
+    if "halfcheetah" in str(data_cfg.env_name).lower():
+        from src.envs.minari_halfcheetah_eval import resolve_minari_halfcheetah_eval_id
+
+        minari_halfcheetah_id = resolve_minari_halfcheetah_eval_id(str(data_cfg.data_quality))
+
+    _env_l = str(data_cfg.env_name).lower()
+    d4rl_score_ref = None
+    if minari_halfcheetah_id is not None or (
+        "halfcheetah" in _env_l and not _env_l.startswith("vd4rl/")
+    ):
+        from src.envs.d4rl_normalized_score import MUJOCO_HALFCHEETAH_D4RL_REF
+
+        d4rl_score_ref = MUJOCO_HALFCHEETAH_D4RL_REF
+
+    num_rollouts = max(0, int(args.num_episodes))
+    save_video = bool(args.save_video) or bool(exp.save_eval_video)
+
+    log.info(
+        "Offline eval: mode={} rollouts={} eval_num_trials={} max_episode_steps={} rtg_scale={}",
+        eval_mode,
+        num_rollouts,
+        int(exp.eval_num_trials),
+        data_cfg.max_episode_steps,
+        float(data_cfg.rtg_scale),
+    )
+
+    with torch.inference_mode():
+        metrics = run_rollouts_and_save_viz(
+            model=model,
+            env_name=str(data_cfg.env_name),
+            state_mean=state_mean,
+            state_std=state_std,
+            device=device,
+            run_dir=run_dir,
+            step=int(args.step),
+            num_rollouts=num_rollouts,
+            max_episode_steps=int(data_cfg.max_episode_steps),
+            rtg_scale=float(data_cfg.rtg_scale),
+            save_video=save_video,
+            eval_context_mode=eval_mode,
+            prompt_trajectories=prompt_trajectories,
+            eval_num_trials=int(exp.eval_num_trials),
+            eval_context_k=eval_k,
+            eval_reward_source=str(exp.eval_reward_source),
+            eval_reward_model=exp.eval_reward_model,
+            total_prompt_len=dataset.total_prompt_len,
+            max_prompt_trajectory_length=dataset.max_prompt_trajectory_length,
+            context_subsample_strategy=dataset.context_subsample_strategy,
+            task_description=task_desc,
+            logger=None,
+            eval_render_both_views=eval_render_both_views,
+            wandb_defer_step_commit=False,
+            vd4rl_eval_pixel_hw=None,
+            vd4rl_eval_obs_downsample=None,
+            vd4rl_eval_seed=int(data_cfg.seed),
+            eval_target_return=OmegaConf.select(cfg, "experiment.eval_target_return", default=None),
+            query_window=eval_query_window,
+            minari_halfcheetah_dataset_id=minari_halfcheetah_id,
+            num_eval_rollout_videos=OmegaConf.select(
+                cfg, "experiment.num_eval_rollout_videos", default=None
+            ),
+            d4rl_score_ref=d4rl_score_ref,
+        )
+
+    for k, v in sorted(metrics.items()):
+        log.info("{} = {:.6g}", k, v)
+    print(metrics)
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@ context_dim: 16
 hidden_size: 128
 max_length: 20
 # Timestep embedding: indices must be < max_ep_len (raise for very long single-trajectory prompts).
-max_ep_len: 16384
+max_ep_len: 1000
 n_layer: 3
 n_head: 1
 n_inner: null

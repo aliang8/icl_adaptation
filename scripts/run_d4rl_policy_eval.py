@@ -101,13 +101,10 @@ def main() -> None:
     parser.add_argument(
         "--weights-only",
         action="store_true",
-        default=True,
-        help="torch.load(weights_only=True) (default True).",
-    )
-    parser.add_argument(
-        "--no-weights-only",
-        action="store_true",
-        help="Disable weights_only load (needed for very old PyTorch checkpoints).",
+        help=(
+            "torch.load(weights_only=True). Default is False: full training checkpoints include "
+            "NumPy arrays (state_mean/std) and config; PyTorch 2.6+ rejects those under weights_only."
+        ),
     )
     args = parser.parse_args()
 
@@ -123,8 +120,9 @@ def main() -> None:
     if not ckpt_path.is_file():
         raise SystemExit(f"Checkpoint not found: {ckpt_path}")
 
-    wo = args.weights_only and not args.no_weights_only
-    ckpt: dict[str, Any] = torch.load(str(ckpt_path), map_location="cpu", weights_only=wo)
+    ckpt: dict[str, Any] = torch.load(
+        str(ckpt_path), map_location="cpu", weights_only=bool(args.weights_only)
+    )
     if "model" not in ckpt:
         raise SystemExit("Checkpoint missing 'model' state_dict.")
 
@@ -243,11 +241,27 @@ def main() -> None:
 
     task_desc = (dataset.task_instructions or [None])[0] if dataset.task_instructions else None
     eval_render_both_views = bool(exp.eval_render_both_views) and (env_name in LIBERO_SUITES)
+    minari_halfcheetah_id = None
+    if "halfcheetah" in str(data_cfg.env_name).lower():
+        from src.envs.minari_halfcheetah_eval import resolve_minari_halfcheetah_eval_id
 
+        minari_halfcheetah_id = resolve_minari_halfcheetah_eval_id(str(data_cfg.data_quality))
+
+    _env_l = str(data_cfg.env_name).lower()
+    d4rl_score_ref = None
+    if minari_halfcheetah_id is not None or (
+        "halfcheetah" in _env_l and not _env_l.startswith("vd4rl/")
+    ):
+        from src.envs.d4rl_normalized_score import MUJOCO_HALFCHEETAH_D4RL_REF
+
+        d4rl_score_ref = MUJOCO_HALFCHEETAH_D4RL_REF
+
+    num_rollouts = int(exp.num_eval_rollouts)
     log.info(
-        "Running eval: mode={} rollouts={} max_episode_steps={} rtg_scale={} run_dir={}",
+        "Running eval: mode={} num_rollouts={} eval_num_trials={} max_episode_steps={} rtg_scale={} run_dir={}",
         eval_mode,
-        exp.num_eval_rollouts,
+        num_rollouts,
+        int(exp.eval_num_trials),
         data_cfg.max_episode_steps,
         float(data_cfg.rtg_scale),
         run_dir,
@@ -262,7 +276,7 @@ def main() -> None:
             device=device,
             run_dir=run_dir,
             step=int(args.step),
-            num_rollouts=int(exp.num_eval_rollouts),
+            num_rollouts=num_rollouts,
             max_episode_steps=int(data_cfg.max_episode_steps),
             rtg_scale=float(data_cfg.rtg_scale),
             save_video=bool(exp.save_eval_video),
@@ -284,6 +298,11 @@ def main() -> None:
             vd4rl_eval_seed=int(data_cfg.seed),
             eval_target_return=OmegaConf.select(cfg, "experiment.eval_target_return", default=None),
             query_window=eval_query_window,
+            minari_halfcheetah_dataset_id=minari_halfcheetah_id,
+            num_eval_rollout_videos=OmegaConf.select(
+                cfg, "experiment.num_eval_rollout_videos", default=None
+            ),
+            d4rl_score_ref=d4rl_score_ref,
         )
 
     for k, v in sorted(metrics.items()):

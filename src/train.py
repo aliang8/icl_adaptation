@@ -235,7 +235,7 @@ def resolve_paths(cfg):
 
 def _vd4rl_split_list(data_cfg) -> list:
     """Use vd4rl_splits when set; otherwise single vd4rl_split."""
-    splits = getattr(data_cfg, "vd4rl_splits", None)
+    splits = OmegaConf.select(data_cfg, "vd4rl_splits", default=None)
     if splits is not None:
         raw = OmegaConf.to_container(splits, resolve=True)
         if isinstance(raw, list) and len(raw) > 0:
@@ -295,11 +295,13 @@ def validate_dataset_paths(env_name: str, paths, data_cfg) -> None:
 def build_model(cfg, state_dim: int, action_dim: int, num_instructions: Optional[int] = None):
     m = cfg.model
     n_inner = m.n_inner or (4 * m.hidden_size)
+    num_ctx = int(cfg.data.num_context_trajectories)
     common = dict(
         state_dim=state_dim,
         act_dim=action_dim,
         hidden_size=m.hidden_size,
         context_dim=m.context_dim,
+        num_context_trajectories=num_ctx,
         max_length=m.max_length,
         max_ep_len=m.max_ep_len,
         n_layer=m.n_layer,
@@ -1041,20 +1043,21 @@ def main():
     )
 
     def eval_fn(step):
-        num_rollouts = cfg.experiment.num_eval_rollouts
-        eval_mode = cfg.experiment.eval_context_mode
+        exp_e = cfg.experiment
+        num_rollouts = int(exp_e.num_eval_rollouts)
+        eval_mode = exp_e.eval_context_mode
         # eval_context_k is overloaded by mode:
         # - prompt: how many context trajectories to sample (default: data.num_context_trajectories).
         # - zero_shot_adaptation: last-K env steps of the live trial in the prompt (default: cfg.model.max_length).
         # Do not use num_context_trajectories for zero-shot K — it wrongly matched e.g. 3 demos -> K=3.
         if eval_mode == "zero_shot_adaptation":
-            if cfg.experiment.eval_context_k is not None:
-                eval_k = cfg.experiment.eval_context_k
+            if exp_e.eval_context_k is not None:
+                eval_k = exp_e.eval_context_k
             else:
                 ml = cfg.model.max_length
                 eval_k = int(ml) if ml is not None else 20
         else:
-            eval_k = cfg.experiment.eval_context_k or data_cfg.num_context_trajectories
+            eval_k = exp_e.eval_context_k or data_cfg.num_context_trajectories
         eval_query_window = (
             int(data_cfg.query_history_length)
             if data_cfg.query_history_length is not None
@@ -1071,17 +1074,30 @@ def main():
         task_desc = (dataset.task_instructions or [None])[0] if dataset.task_instructions else None
         eval_rollout_env = env_name
         if env_name == "VD4RL":
-            override_eval = getattr(data_cfg, "eval_env_name", None)
+            override_eval = OmegaConf.select(data_cfg, "eval_env_name", default=None)
             if override_eval is not None and str(override_eval).strip():
                 eval_rollout_env = str(override_eval)
             else:
                 eval_rollout_env = f"VD4RL/dmc/{data_cfg.vd4rl_task}"
+        minari_halfcheetah_id = None
+        if "halfcheetah" in str(eval_rollout_env).lower():
+            from src.envs.minari_halfcheetah_eval import resolve_minari_halfcheetah_eval_id
+
+            minari_halfcheetah_id = resolve_minari_halfcheetah_eval_id(str(data_cfg.data_quality))
         vd4rl_px = None
         vd4rl_ds = None
         if str(eval_rollout_env).startswith("VD4RL/dmc/"):
             px_str = str(data_cfg.vd4rl_pixel_size).replace("px", "").strip()
             vd4rl_px = int(px_str) if px_str else 64
             vd4rl_ds = int(data_cfg.vd4rl_obs_downsample)
+        _er_l = str(eval_rollout_env).lower()
+        d4rl_score_ref = None
+        if minari_halfcheetah_id is not None or (
+            "halfcheetah" in _er_l and not _er_l.startswith("vd4rl/")
+        ):
+            from src.envs.d4rl_normalized_score import MUJOCO_HALFCHEETAH_D4RL_REF
+
+            d4rl_score_ref = MUJOCO_HALFCHEETAH_D4RL_REF
         # Dual-camera stitch is LIBERO-only; Gymnasium (HalfCheetah, etc.) has a single render view.
         eval_render_both_views = bool(cfg.experiment.eval_render_both_views) and (
             env_name in LIBERO_SUITES
@@ -1103,13 +1119,13 @@ def main():
                     num_rollouts=num_rollouts,
                     max_episode_steps=data_cfg.max_episode_steps,
                     rtg_scale=float(data_cfg.rtg_scale),
-                    save_video=cfg.experiment.save_eval_video,
+                    save_video=exp_e.save_eval_video,
                     eval_context_mode=eval_mode,
                     prompt_trajectories=prompt_trajectories,
-                    eval_num_trials=cfg.experiment.eval_num_trials,
+                    eval_num_trials=exp_e.eval_num_trials,
                     eval_context_k=eval_k,
-                    eval_reward_source=cfg.experiment.eval_reward_source,
-                    eval_reward_model=cfg.experiment.eval_reward_model,
+                    eval_reward_source=exp_e.eval_reward_source,
+                    eval_reward_model=exp_e.eval_reward_model,
                     total_prompt_len=dataset.total_prompt_len,
                     max_prompt_trajectory_length=dataset.max_prompt_trajectory_length,
                     context_subsample_strategy=dataset.context_subsample_strategy,
@@ -1124,6 +1140,9 @@ def main():
                         cfg, "experiment.eval_target_return", default=None
                     ),
                     query_window=eval_query_window,
+                    minari_halfcheetah_dataset_id=minari_halfcheetah_id,
+                    num_eval_rollout_videos=exp_e.num_eval_rollout_videos,
+                    d4rl_score_ref=d4rl_score_ref,
                 )
                 if cfg.experiment.run_action_compare_eval and dataset.trajectories:
                     action_metrics = run_action_compare_eval(

@@ -1,7 +1,7 @@
 max_steps: 500000
 eval_every_steps: 1000
-num_eval_episodes: 1
-num_eval_rollouts: 1  # number of env rollouts per evaluation
+# zero_shot: num_eval_rollouts = independent sessions; eval_num_trials = trials per session
+num_eval_rollouts: 1
 eval_context_mode: zero_shot_adaptation  # prompt | zero_shot_adaptation
 eval_num_trials: 5
 eval_context_k: null
@@ -10,6 +10,8 @@ eval_reward_model: null
 # Target future cumulative return G (env units) for eval RTG init; null -> initial token 1.0
 eval_target_return: null
 save_eval_video: true  # set true to save eval rollout videos to viz/samples/step_XXX/videos/
+# null = record every rollout/trial; int = only first N (still run all rollouts for metrics)
+num_eval_rollout_videos: null
 # LIBERO only: stitch primary|wrist in eval video. Gymnasium envs (HalfCheetah, etc.) use a single camera; train.py ignores this flag for non-LIBERO.
 eval_render_both_views: true
 run_action_compare_eval: false  # set true to save pred vs GT action plots to viz/action_compare/step_XXX/

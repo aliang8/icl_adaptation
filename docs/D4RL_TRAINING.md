@@ -169,7 +169,7 @@ Useful flags:
 - `--step 20000` — label for output folder `viz/samples/step_020000/`
 - `--output-dir /tmp/my_eval_run` — where to write viz (default: inferred parent of `ckpts/` from the checkpoint path)
 - `--strict` — `load_state_dict(strict=True)` if the architecture must match exactly
-- `--no-weights-only` — if `torch.load` fails on an older checkpoint format
+- `--weights-only` — use `torch.load(..., weights_only=True)` only for tensor-only artifacts; full training checkpoints load with the default (`weights_only=False`) so NumPy stats and config unpickle correctly on PyTorch 2.6+.
 
 Align **`data.data_quality`**, **`data.rtg_scale`**, **`experiment.eval_*`**, and **`model.*`** with the training run (they are restored from the checkpoint config; overrides can change them intentionally).
 

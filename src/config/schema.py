@@ -88,6 +88,7 @@ class DataConfig:
     context_dim: int = 16
     context_hidden_dim: int = 128
     num_context_trajectories: int = 1
+    # N<=0: no ICL prompts; model also uses proprio-only state embedding (ignores per-timestep batch.contexts).
     # If true, each sample uses m ~ Uniform{0..N} prior demos (N=num_context_trajectories); query window unchanged.
     randomize_num_context_trajectories: bool = True
     context_sort_ascending: bool = True
@@ -155,7 +156,7 @@ def resolved_max_total_prompt_length(data_cfg: DataConfig) -> int:
 class OptimConfig:
     """Optimizer and scheduler."""
 
-    lr: float = 5e-5
+    lr: float = 1e-4
     weight_decay: float = 1e-4
     warmup_steps: int = 10000
     grad_clip_norm: float = 0.25
@@ -200,13 +201,10 @@ class ExperimentConfig:
 
     max_steps: int = 500_000
     eval_every_steps: int = 5000
-    num_eval_episodes: int = 5
-    num_eval_rollouts: int = 5  # number of env rollouts per eval (for real eval)
-    # Eval context: "prompt" = use fixed prompt trajectories (like training); "zero_shot_adaptation" = N trials, context = last K trials sorted by return (env or reward model).
-    eval_context_mode: str = "prompt"  # "prompt" | "zero_shot_adaptation"
-    eval_num_trials: int = (
-        5  # for zero_shot_adaptation: number of trials (rollouts) to run, context grows each trial
-    )
+    # prompt / no-prompt: one env episode per rollout. zero_shot_adaptation: one adaptation *session* per rollout; trials are inside the session (eval_num_trials).
+    num_eval_rollouts: int = 5
+    eval_context_mode: str = "prompt"  # prompt | zero_shot_adaptation
+    eval_num_trials: int = 5  # zero_shot only: sequential in-session trials per rollout (ignored for prompt mode for this count)
     eval_context_k: Optional[int] = None
     # If set: prompt mode = this many context trajectories; zero_shot_adaptation = last-K env steps
     # in the live-trial prompt. If null: prompt defaults to data.num_context_trajectories; zero_shot to model.max_length.
@@ -221,6 +219,8 @@ class ExperimentConfig:
     save_eval_video: bool = (
         False  # if True, wrap eval env with RecordVideo and save to viz/samples/step_XXX/videos/
     )
+    # Cap how many rollouts/trials get frame capture + MP4 (None = all). Saves disk and W&B payload.
+    num_eval_rollout_videos: Optional[int] = None
     eval_render_both_views: bool = (
         True  # if True, LIBERO eval video shows [primary | wrist] horizontally
     )

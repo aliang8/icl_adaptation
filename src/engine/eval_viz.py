@@ -22,6 +22,32 @@ _GYMNASIUM_EVAL_ENV_ALIASES = {
 _EVAL_ENV_ALIAS_LOGGED: set[str] = set()
 
 
+def _action_prediction_stats_from_rollouts(
+    rollouts_actions: List[np.ndarray],
+) -> Dict[str, float]:
+    """Mean / min / max over all predicted actions (env steps × rollouts)."""
+    if not rollouts_actions:
+        return {}
+    parts: List[np.ndarray] = []
+    for a in rollouts_actions:
+        if a is None or a.size == 0:
+            continue
+        x = np.asarray(a, dtype=np.float64)
+        if x.ndim == 1:
+            x = x.reshape(-1, 1)
+        parts.append(x.reshape(-1, x.shape[-1]))
+    if not parts:
+        return {}
+    A = np.concatenate(parts, axis=0)
+    if A.size == 0:
+        return {}
+    return {
+        "eval/action_pred_mean": float(np.mean(A)),
+        "eval/action_pred_min": float(np.min(A)),
+        "eval/action_pred_max": float(np.max(A)),
+    }
+
+
 def _log_eval_transformer_seq(
     model: Any,
     prompt: Optional[Tuple[Any, ...]],
@@ -86,6 +112,7 @@ def _try_make_env(
     vd4rl_eval_pixel_hw: Optional[int] = None,
     vd4rl_eval_obs_downsample: Optional[int] = None,
     vd4rl_eval_seed: int = 0,
+    minari_halfcheetah_dataset_id: Optional[str] = None,
 ):
     """Create env: LIBERO suite (libero_10, ...) via make_libero_env, else Gymnasium/gym. Returns None if env or deps missing.
     render_both_views is only used for LIBERO (primary + wrist); Gymnasium envs have a single camera.
@@ -124,6 +151,13 @@ def _try_make_env(
         print(
             f"Eval env alias: {env_name!r} -> {gym_id!r} "
             f"(core Gymnasium MuJoCo; same obs/act dims as D4RL/Minari HalfCheetah)"
+        )
+
+    if minari_halfcheetah_dataset_id and gym_id == "HalfCheetah-v5":
+        from src.envs.minari_halfcheetah_eval import make_halfcheetah_env_via_minari
+
+        return make_halfcheetah_env_via_minari(
+            minari_halfcheetah_dataset_id, render_mode=render_mode
         )
 
     try:
@@ -173,15 +207,15 @@ def _wrap_record_video(env: Any, video_folder: Path) -> Tuple[Any, bool]:
     )
 
 
-def _write_trial_video(
-    video_folder: Path, trial: int, frames: List[np.ndarray], fps: int = 20
+def _write_rollout_video(
+    video_folder: Path, rollout_idx: int, frames: List[np.ndarray], fps: int = 20
 ) -> None:
-    """Write frames to video_folder/trial_{trial}.mp4."""
+    """Write frames to video_folder/rollout_{rollout_idx}.mp4 (one clip per eval rollout index)."""
     if not frames:
         return
     import imageio
 
-    path = video_folder / f"trial_{trial}.mp4"
+    path = video_folder / f"rollout_{rollout_idx}.mp4"
     writer = imageio.get_writer(str(path), fps=fps)
     for f in frames:
         writer.append_data(np.asarray(f))
@@ -201,6 +235,130 @@ def _write_frames_video(
     for f in frames:
         writer.append_data(np.asarray(f))
     writer.close()
+
+
+def _pad_ragged_1d(arrays: List[np.ndarray], fill: float = float("nan")) -> np.ndarray:
+    """Stack 1d arrays of different lengths into (N, T_max) with ``fill`` padding."""
+    if not arrays:
+        return np.zeros((0, 0), dtype=np.float64)
+    T = max(int(np.asarray(a).shape[0]) for a in arrays)
+    out = np.full((len(arrays), T), fill, dtype=np.float64)
+    for i, a in enumerate(arrays):
+        v = np.asarray(a, dtype=np.float64).reshape(-1)
+        n = int(v.shape[0])
+        out[i, :n] = v
+    return out
+
+
+def _save_eval_rtg_reward_figure(
+    reward_rows: List[np.ndarray],
+    rtg_rows: List[np.ndarray],
+    *,
+    rtg_scale: float,
+    step: int,
+    out_path: Path,
+    condition_rtg: bool,
+) -> bool:
+    """Mean ± std over rollouts (ragged steps padded with NaN). Palatino styling. Returns False if nothing to plot."""
+    if not reward_rows or all(np.asarray(r).size == 0 for r in reward_rows):
+        return False
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    R = _pad_ragged_1d(reward_rows)
+    n_roll = int(R.shape[0])
+    T = int(R.shape[1])
+    x = np.arange(T, dtype=int)
+
+    _serif = ["Palatino", "Palatino Linotype", "DejaVu Serif"]
+    bg = "#FAFAF8"
+    c_r = "#2E86AB"
+    c_rtg = "#8B3A62"
+
+    def _plot_reward(ax_r: Any, subtitle: str) -> None:
+        if n_roll <= 1:
+            ax_r.plot(x, R[0], color=c_r, linewidth=2.0, label="rollout")
+            ax_r.set_title(subtitle)
+        else:
+            r_mean = np.nanmean(R, axis=0)
+            r_std = np.nanstd(R, axis=0)
+            r_std = np.nan_to_num(r_std, nan=0.0, posinf=0.0, neginf=0.0)
+            ax_r.fill_between(x, r_mean - r_std, r_mean + r_std, color=c_r, alpha=0.28, linewidth=0)
+            ax_r.plot(x, r_mean, color=c_r, linewidth=2.0, label="mean ± std")
+            ax_r.set_title(subtitle)
+        ax_r.set_ylabel("env reward")
+        ax_r.grid(True, axis="y", alpha=0.4)
+        ax_r.legend(loc="upper right", fontsize=8, framealpha=0.92)
+
+    with plt.rc_context(
+        {
+            "font.family": "serif",
+            "font.serif": _serif,
+            "axes.facecolor": "#FFFFFF",
+            "figure.facecolor": bg,
+            "axes.edgecolor": "#333333",
+            "axes.labelcolor": "#222222",
+            "xtick.color": "#222222",
+            "ytick.color": "#222222",
+            "grid.alpha": 0.35,
+            "grid.linestyle": "-",
+        }
+    ):
+        if condition_rtg and rtg_rows and not all(np.asarray(t).size == 0 for t in rtg_rows):
+            G = _pad_ragged_1d(rtg_rows)
+            share_x = int(G.shape[1]) == int(R.shape[1])
+            fig, (ax_r, ax_g) = plt.subplots(
+                2,
+                1,
+                figsize=(9, 5.4),
+                sharex=share_x,
+                constrained_layout=True,
+                gridspec_kw={"height_ratios": [1, 1], "hspace": 0.08},
+            )
+            r_sub = (
+                "Reward per env step (single eval episode)"
+                if n_roll <= 1
+                else f"Reward per env step (mean ± std over {n_roll} eval episodes)"
+            )
+            _plot_reward(ax_r, r_sub)
+
+            n_rtg = int(G.shape[0])
+            if n_rtg <= 1:
+                ax_g.plot(np.arange(G.shape[1]), G[0], color=c_rtg, linewidth=2.0, label="rollout")
+                ax_g.set_title("RTG token (tail before each action)")
+            else:
+                g_mean = np.nanmean(G, axis=0)
+                g_std = np.nanstd(G, axis=0)
+                g_std = np.nan_to_num(g_std, nan=0.0, posinf=0.0, neginf=0.0)
+                xg = np.arange(G.shape[1], dtype=int)
+                ax_g.fill_between(
+                    xg, g_mean - g_std, g_mean + g_std, color=c_rtg, alpha=0.28, linewidth=0
+                )
+                ax_g.plot(xg, g_mean, color=c_rtg, linewidth=2.0, label="mean ± std")
+                ax_g.set_title(
+                    f"RTG token (mean ± std, n={n_rtg}); update −r / rtg_scale (rtg_scale={rtg_scale:g})"
+                )
+            ax_g.set_ylabel("RTG token")
+            ax_g.set_xlabel("environment step")
+            ax_g.grid(True, axis="y", alpha=0.4)
+            ax_g.legend(loc="upper right", fontsize=8, framealpha=0.92)
+        else:
+            fig, ax_r = plt.subplots(1, 1, figsize=(9, 3.4), constrained_layout=True)
+            r_sub = (
+                "Reward per env step (single eval episode); RTG conditioning off"
+                if n_roll <= 1
+                else f"Reward per env step (mean ± std over {n_roll} eval episodes); RTG conditioning off"
+            )
+            _plot_reward(ax_r, r_sub)
+            ax_r.set_xlabel("environment step")
+
+        fig.suptitle(f"Eval step {step} · rollout dynamics", fontsize=12, y=1.02, color="#1a1a1a")
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(str(out_path), dpi=120, bbox_inches="tight", facecolor=bg)
+        plt.close(fig)
+    return True
 
 
 def _annotate_eval_frame(frame: np.ndarray, lines: List[str]) -> np.ndarray:
@@ -334,8 +492,16 @@ def _run_one_rollout(
     eval_target_return: Optional[float] = None,
     query_trial_index: int = 0,
     query_window: Optional[int] = None,
+    reset_seed: Optional[int] = None,
 ) -> Tuple[
-    float, int, np.ndarray, np.ndarray, Dict[str, np.ndarray], List[np.ndarray], List[float]
+    float,
+    int,
+    np.ndarray,
+    np.ndarray,
+    Dict[str, np.ndarray],
+    List[np.ndarray],
+    List[float],
+    np.ndarray,
 ]:
     """Run one episode. Returns frames and rtg_for_frames: RTG **token** at query tail before each
     ``get_action`` — same as training: ``discount_cumsum(r_env)/rtg_scale`` (~O(1)).
@@ -350,7 +516,8 @@ def _run_one_rollout(
         raise TypeError(f"eval expects MetaDecisionTransformer, got {type(model)}")
 
     rtg_for_frames: List[float] = []
-    obs, _ = env.reset(seed=step + ep)
+    rs = int(reset_seed) if reset_seed is not None else int(step + ep)
+    obs, _ = env.reset(seed=rs)
     if isinstance(obs, tuple):
         obs = obs[0]
     frames: List[np.ndarray] = []
@@ -379,9 +546,11 @@ def _run_one_rollout(
     ep_rewards: List[float] = []
     ep_return = 0.0
     ml_q = model.max_length
+    rtg_tokens_trace: List[float] = []
 
     for t in range(max_episode_steps):
         rtg_snap = float(returns_to_go[0, -1].detach().cpu())
+        rtg_tokens_trace.append(rtg_snap)
         prompt_now = prompt
         prompt_meta: Dict[str, Any] = {"mode": "static", "prev_trials": 0, "current_trial_steps": 0}
         if prompt_builder is not None:
@@ -484,6 +653,7 @@ def _run_one_rollout(
         "actions": np.array(ep_actions, dtype=np.float32),
         "rewards": np.array(ep_rewards, dtype=np.float32),
     }
+    rtg_arr = np.asarray(rtg_tokens_trace, dtype=np.float64)
     return (
         ep_return,
         len(ep_states) - 1,
@@ -492,6 +662,7 @@ def _run_one_rollout(
         traj_dict,
         frames,
         rtg_for_frames,
+        rtg_arr,
     )
 
 
@@ -525,10 +696,14 @@ def run_rollouts_and_save_viz(
     vd4rl_eval_seed: int = 0,
     eval_target_return: Optional[float] = None,
     query_window: Optional[int] = None,
+    minari_halfcheetah_dataset_id: Optional[str] = None,
+    num_eval_rollout_videos: Optional[int] = None,
+    d4rl_score_ref: Optional[Tuple[float, float]] = None,
 ) -> Dict[str, float]:
     """
-    Run one eval rollout (N trials). Each trial can be saved as trial_0.mp4, trial_1.mp4, ...
-    For wandb: log one continuous video with "Trial 1", "Trial 2", ... overlaid.
+    Run eval rollouts (and, in zero-shot, ``eval_num_trials`` in-session episodes per session).
+    Each recorded rollout index can be saved as rollout_0.mp4, rollout_1.mp4, ...
+    For wandb: log one continuous video with per-clip overlays (session/trial labels in zero-shot).
     When wandb_defer_step_commit=True (training eval), media uses commit=False so the trainer
     can log scalars at the same step with commit=True without W&B dropping out-of-order steps.
 
@@ -542,6 +717,24 @@ def run_rollouts_and_save_viz(
     **``query_window``** (optional): query history cap K passed to ``get_action`` (training
     ``query_history_length`` or ``horizon``). When set, overrides ``model.max_length`` for
     trim/left-pad so no-prompt / query-only eval matches the data window.
+
+    **``minari_halfcheetah_dataset_id``** (optional): e.g. ``mujoco/halfcheetah/medium-v0`` —
+    build the eval env with Minari ``recover_environment()`` (falls back to ``HalfCheetah-v5``).
+
+    **``num_eval_rollout_videos``** (optional): max number of rollouts (or zero-shot trials) to
+    record frames for. ``None`` = record all when ``save_video`` or W&B video is on. Metrics still
+    use every rollout. W&B: one **combined** clip (``eval/rollout_video``) from recorded frames plus
+    **per-rollout** clips (``eval/rollout_video_i``) when saved — combined for a quick scan,
+    separate files for one rollout’s recording.
+
+    **Zero-shot** (``eval_context_mode=zero_shot_adaptation``): ``num_rollouts`` is the number of
+    independent adaptation **sessions** (context reset each session); ``eval_num_trials`` is still
+    the sequential trials **within** each session.
+
+    **``d4rl_score_ref``** (optional): ``(ref_min, ref_max)`` for D4RL-style normalized return
+    (100 * (R - ref_min) / (ref_max - ref_min)) per rollout; logs ``eval/return_mean_normalized`` and
+    ``eval/return_std_normalized``. Use for MuJoCo HalfCheetah (D4RL / Minari); not for VD4RL
+    dm_control tasks (different reward scale).
     """
     from src.envs.libero_env import LIBERO_SUITES
 
@@ -555,9 +748,24 @@ def run_rollouts_and_save_viz(
     wb_commit_video = False
     wb_commit_charts = not wandb_defer_step_commit
     collect_frames = save_video or use_wandb_video
+    cap_raw = num_eval_rollout_videos
+    video_cap: Optional[int]
+    if cap_raw is None:
+        video_cap = None
+    else:
+        video_cap = max(0, int(cap_raw))
+
+    def _collect_frames_for_index(idx: int) -> bool:
+        if not collect_frames:
+            return False
+        if video_cap is None:
+            return True
+        return idx < video_cap
+
+    need_pixel_env = collect_frames and (video_cap is None or video_cap > 0)
     # Gymnasium needs render_mode="rgb_array" at construction for env.render() to return pixels.
     gym_render_mode: Optional[str] = None
-    if collect_frames and env_name not in LIBERO_SUITES:
+    if need_pixel_env and env_name not in LIBERO_SUITES:
         gym_render_mode = "rgb_array"
 
     env = _try_make_env(
@@ -567,6 +775,7 @@ def run_rollouts_and_save_viz(
         vd4rl_eval_pixel_hw=vd4rl_eval_pixel_hw,
         vd4rl_eval_obs_downsample=vd4rl_eval_obs_downsample,
         vd4rl_eval_seed=vd4rl_eval_seed,
+        minari_halfcheetah_dataset_id=minari_halfcheetah_dataset_id,
     )
     if env is None:
         if env_name in LIBERO_SUITES:
@@ -578,12 +787,30 @@ def run_rollouts_and_save_viz(
             print(f"Eval rollouts skipped: no env registered for '{env_name}'.")
         return {"eval/return_mean": 0.0}
 
+    if eval_context_mode == "zero_shot_adaptation":
+        print(
+            f"Eval rollouts: zero_shot_adaptation, num_eval_rollouts={num_rollouts} (sessions), "
+            f"eval_num_trials={eval_num_trials} (trials per session)",
+            flush=True,
+        )
+    else:
+        print(
+            f"Eval rollouts: mode={eval_context_mode!r}, num_rollouts={num_rollouts}",
+            flush=True,
+        )
+
     viz_dir = run_dir / "viz" / "samples" / f"step_{step:06d}"
     viz_dir.mkdir(parents=True, exist_ok=True)
     video_folder = viz_dir / "videos"
-    if collect_frames:
+    if collect_frames and need_pixel_env:
         video_folder.mkdir(parents=True, exist_ok=True)
-        print(f"Eval rollout: saving per-trial videos to {video_folder.resolve()}")
+        cap_msg = (
+            "all rollouts/trials" if video_cap is None else f"first {video_cap} rollout(s)/trial(s)"
+        )
+        print(
+            f"Eval rollout: saving videos for {cap_msg} under {video_folder.resolve()}",
+            flush=True,
+        )
     elif save_video:
         video_folder.mkdir(parents=True, exist_ok=True)
         env, _ = _wrap_record_video(env, video_folder)
@@ -631,6 +858,8 @@ def run_rollouts_and_save_viz(
     all_lengths: List[int] = []
     all_states_list: List[np.ndarray] = []
     all_actions_list: List[np.ndarray] = []
+    all_reward_traces: List[np.ndarray] = []
+    all_rtg_traces: List[np.ndarray] = []
 
     state_dim = model.state_dim
     act_dim = model.act_dim
@@ -640,7 +869,6 @@ def run_rollouts_and_save_viz(
 
     if eval_context_mode == "zero_shot_adaptation":
         n_trials = eval_num_trials
-        context_list: List[Tuple[Dict[str, np.ndarray], float]] = []
         ml_fallback = model.max_length if model.max_length is not None else 20
         current_trial_k = int(K) if K is not None else int(ml_fallback)
         ml_model = model.max_length
@@ -655,131 +883,147 @@ def run_rollouts_and_save_viz(
             f"Prompt tensor: left-pad, valid prompt timesteps right-aligned with query (matches train).",
             flush=True,
         )
-        for trial in range(n_trials):
-            sorted_context = sorted(context_list, key=lambda x: x[1])
-            prev_trajs = [t for t, _ in sorted_context]
-            prev_returns = [r for _, r in sorted_context]
+        for rep in range(num_rollouts):
+            context_list: List[Tuple[Dict[str, np.ndarray], float]] = []
+            for trial in range(n_trials):
+                global_idx = rep * n_trials + trial
+                sorted_context = sorted(context_list, key=lambda x: x[1])
+                prev_trajs = [t for t, _ in sorted_context]
+                prev_returns = [r for _, r in sorted_context]
 
-            def _capped_traj_steps(traj: Dict[str, np.ndarray]) -> int:
-                tlen = int(len(traj["rewards"]))
-                if max_traj_len is not None and tlen > max_traj_len:
-                    return int(max_traj_len)
-                return tlen
+                def _capped_traj_steps(traj: Dict[str, np.ndarray]) -> int:
+                    tlen = int(len(traj["rewards"]))
+                    if max_traj_len is not None and tlen > max_traj_len:
+                        return int(max_traj_len)
+                    return tlen
 
-            prior_per_trial_steps = [_capped_traj_steps(t) for t in prev_trajs]
-            prior_ctx_steps = sum(prior_per_trial_steps)
-            prior_steps_str = (
-                "+".join(str(x) for x in prior_per_trial_steps) if prior_per_trial_steps else "0"
-            )
+                prior_per_trial_steps = [_capped_traj_steps(t) for t in prev_trajs]
+                prior_ctx_steps = sum(prior_per_trial_steps)
+                prior_steps_str = (
+                    "+".join(str(x) for x in prior_per_trial_steps)
+                    if prior_per_trial_steps
+                    else "0"
+                )
 
-            def _build_prompt_with_current(
-                ep_states_now: List[np.ndarray],
-                ep_actions_now: List[np.ndarray],
-                ep_rewards_now: List[float],
-            ) -> Tuple[Optional[Tuple[Any, ...]], Dict[str, Any]]:
-                curr_steps = len(ep_actions_now)
-                use_steps = min(current_trial_k, curr_steps)
-                trajs = list(prev_trajs)
-                rets = list(prev_returns)
-                raw_concat = prior_ctx_steps + use_steps
-                meta: Dict[str, Any] = {
-                    "mode": "zero_shot_dynamic",
-                    "prev_trials": len(prev_trajs),
-                    "prior_context_steps": prior_ctx_steps,
-                    "prior_per_trial_steps": list(prior_per_trial_steps),
-                    "current_trial_window_steps": use_steps,
-                    "current_trial_steps": use_steps,
-                    "raw_concat_steps": raw_concat,
-                    "total_prompt_cap": total_len,
-                    "query_trial_index": len(prev_trajs),
-                }
-                if use_steps > 0:
-                    start = curr_steps - use_steps
-                    curr_obs = np.asarray(
-                        ep_states_now[start : start + use_steps], dtype=np.float32
-                    )
-                    curr_act = np.asarray(ep_actions_now[start:curr_steps], dtype=np.float32)
-                    curr_rew = np.asarray(ep_rewards_now[start:curr_steps], dtype=np.float32)
-                    curr_traj = {
-                        "observations": curr_obs,
-                        "actions": curr_act,
-                        "rewards": curr_rew,
+                def _build_prompt_with_current(
+                    ep_states_now: List[np.ndarray],
+                    ep_actions_now: List[np.ndarray],
+                    ep_rewards_now: List[float],
+                ) -> Tuple[Optional[Tuple[Any, ...]], Dict[str, Any]]:
+                    curr_steps = len(ep_actions_now)
+                    use_steps = min(current_trial_k, curr_steps)
+                    trajs = list(prev_trajs)
+                    rets = list(prev_returns)
+                    raw_concat = prior_ctx_steps + use_steps
+                    meta: Dict[str, Any] = {
+                        "mode": "zero_shot_dynamic",
+                        "prev_trials": len(prev_trajs),
+                        "prior_context_steps": prior_ctx_steps,
+                        "prior_per_trial_steps": list(prior_per_trial_steps),
+                        "current_trial_window_steps": use_steps,
+                        "current_trial_steps": use_steps,
+                        "raw_concat_steps": raw_concat,
+                        "total_prompt_cap": total_len,
+                        "query_trial_index": len(prev_trajs),
                     }
-                    trajs.append(curr_traj)
-                    # Keep current-trial window as the final prompt chunk by assigning max sorting score.
-                    base = max(rets) if rets else 0.0
-                    rets.append(base + 1e-6)
-                if not trajs or not total_len:
-                    return None, meta
-                prompt_dyn = build_prompt_tuple(
-                    trajs,
+                    if use_steps > 0:
+                        start = curr_steps - use_steps
+                        curr_obs = np.asarray(
+                            ep_states_now[start : start + use_steps], dtype=np.float32
+                        )
+                        curr_act = np.asarray(ep_actions_now[start:curr_steps], dtype=np.float32)
+                        curr_rew = np.asarray(ep_rewards_now[start:curr_steps], dtype=np.float32)
+                        curr_traj = {
+                            "observations": curr_obs,
+                            "actions": curr_act,
+                            "rewards": curr_rew,
+                        }
+                        trajs.append(curr_traj)
+                        # Keep current-trial window as the final prompt chunk by assigning max sorting score.
+                        base = max(rets) if rets else 0.0
+                        rets.append(base + 1e-6)
+                    if not trajs or not total_len:
+                        return None, meta
+                    prompt_dyn = build_prompt_tuple(
+                        trajs,
+                        state_mean_t,
+                        state_std_t,
+                        total_len,
+                        max_traj_len,
+                        state_dim,
+                        act_dim,
+                        rtg_scale,
+                        device,
+                        sort_ascending=True,
+                        trajectory_returns=rets or None,
+                        context_subsample_strategy=context_subsample_strategy,
+                    )
+                    pt = int(prompt_dyn[0].shape[1])
+                    meta["prompt_timesteps_in_model"] = pt
+                    ml = int(ml_model) if ml_model is not None else 0
+                    meta["approx_transformer_positions"] = tps * (pt + ml)
+                    return prompt_dyn, meta
+
+                print(
+                    f"[zero_shot eval] --- session {rep + 1}/{num_rollouts} trial {trial + 1}/{n_trials} --- "
+                    f"prior_completed_trials={len(prev_trajs)} "
+                    f"prior_steps_by_trial(capped)=[{prior_steps_str}] "
+                    f"prior_context_steps(sum)={prior_ctx_steps} "
+                    f"current_window_K={current_trial_k}",
+                    flush=True,
+                )
+                _log_eval_transformer_seq(
+                    model,
+                    None,
+                    env_name=env_name,
+                    max_episode_steps=max_episode_steps,
+                    tag=(
+                        f"zero_shot session {rep} trial {trial} / step {step} "
+                        "(prompt length varies during rollout)"
+                    ),
+                    query_window=query_window,
+                )
+                ep_return, length, S, A, traj_dict, frames, rtg_ff, rtg_trace = _run_one_rollout(
+                    model,
+                    env,
                     state_mean_t,
                     state_std_t,
-                    total_len,
-                    max_traj_len,
-                    state_dim,
-                    act_dim,
-                    rtg_scale,
                     device,
-                    sort_ascending=True,
-                    trajectory_returns=rets or None,
-                    context_subsample_strategy=context_subsample_strategy,
+                    rtg_scale,
+                    max_episode_steps,
+                    step,
+                    trial,
+                    None,
+                    collect_frames=_collect_frames_for_index(global_idx),
+                    env_name=env_name,
+                    prompt_builder=_build_prompt_with_current,
+                    eval_target_return=eval_target_return,
+                    query_trial_index=trial,
+                    query_window=query_window,
+                    reset_seed=step + rep * 100_000 + trial,
                 )
-                pt = int(prompt_dyn[0].shape[1])
-                meta["prompt_timesteps_in_model"] = pt
-                ml = int(ml_model) if ml_model is not None else 0
-                meta["approx_transformer_positions"] = tps * (pt + ml)
-                return prompt_dyn, meta
-
-            print(
-                f"[zero_shot eval] --- trial {trial + 1}/{n_trials} --- "
-                f"prior_completed_trials={len(prev_trajs)} "
-                f"prior_steps_by_trial(capped)=[{prior_steps_str}] "
-                f"prior_context_steps(sum)={prior_ctx_steps} "
-                f"current_window_K={current_trial_k}",
-                flush=True,
-            )
-            _log_eval_transformer_seq(
-                model,
-                None,
-                env_name=env_name,
-                max_episode_steps=max_episode_steps,
-                tag=f"zero_shot trial {trial} / step {step} (prompt length varies during rollout)",
-                query_window=query_window,
-            )
-            ep_return, length, S, A, traj_dict, frames, rtg_ff = _run_one_rollout(
-                model,
-                env,
-                state_mean_t,
-                state_std_t,
-                device,
-                rtg_scale,
-                max_episode_steps,
-                step,
-                trial,
-                None,
-                collect_frames=collect_frames,
-                env_name=env_name,
-                prompt_builder=_build_prompt_with_current,
-                eval_target_return=eval_target_return,
-                query_trial_index=trial,
-                query_window=query_window,
-            )
-            ret = _return_for_traj(traj_dict, ep_return)
-            context_list.append((traj_dict, ret))
-            print(
-                f"[zero_shot eval] finished trial={trial}: added full trial to prior context. "
-                f"prior_trials_now={len(context_list)}",
-                flush=True,
-            )
-            all_returns.append(ep_return)
-            all_lengths.append(length)
-            all_states_list.append(S)
-            all_actions_list.append(A)
-            if collect_frames and frames:
-                ann = _annotated_rollout_frames(model, frames, rtg_ff, f"Trial {trial + 1}")
-                _write_trial_video(video_folder, trial, ann)
-                all_frames_for_wandb.extend(ann)
+                ret = _return_for_traj(traj_dict, ep_return)
+                context_list.append((traj_dict, ret))
+                print(
+                    f"[zero_shot eval] finished session={rep} trial={trial}: "
+                    f"added full trial to prior context. prior_trials_now={len(context_list)}",
+                    flush=True,
+                )
+                all_returns.append(ep_return)
+                all_lengths.append(length)
+                all_states_list.append(S)
+                all_actions_list.append(A)
+                all_reward_traces.append(np.asarray(traj_dict["rewards"], dtype=np.float64))
+                all_rtg_traces.append(np.asarray(rtg_trace, dtype=np.float64))
+                if _collect_frames_for_index(global_idx) and frames:
+                    ann = _annotated_rollout_frames(
+                        model,
+                        frames,
+                        rtg_ff,
+                        f"S{rep + 1} T{trial + 1}",
+                    )
+                    _write_rollout_video(video_folder, global_idx, ann)
+                    all_frames_for_wandb.extend(ann)
     elif eval_context_mode == "prompt" and prompt_trajectories:
         prompt = build_prompt_tuple(
             prompt_trajectories,
@@ -803,7 +1047,7 @@ def run_rollouts_and_save_viz(
             query_window=query_window,
         )
         for ep in range(num_rollouts):
-            ep_return, length, S, A, _, frames, rtg_ff = _run_one_rollout(
+            ep_return, length, S, A, traj_dict, frames, rtg_ff, rtg_trace = _run_one_rollout(
                 model,
                 env,
                 state_mean_t,
@@ -814,7 +1058,7 @@ def run_rollouts_and_save_viz(
                 step,
                 ep,
                 prompt,
-                collect_frames=collect_frames,
+                collect_frames=_collect_frames_for_index(ep),
                 env_name=env_name,
                 eval_target_return=eval_target_return,
                 query_trial_index=len(prompt_trajectories),
@@ -824,9 +1068,11 @@ def run_rollouts_and_save_viz(
             all_lengths.append(length)
             all_states_list.append(S)
             all_actions_list.append(A)
-            if collect_frames and frames:
-                ann = _annotated_rollout_frames(model, frames, rtg_ff, f"Trial {ep + 1}")
-                _write_trial_video(video_folder, ep, ann)
+            all_reward_traces.append(np.asarray(traj_dict["rewards"], dtype=np.float64))
+            all_rtg_traces.append(np.asarray(rtg_trace, dtype=np.float64))
+            if _collect_frames_for_index(ep) and frames:
+                ann = _annotated_rollout_frames(model, frames, rtg_ff, f"Rollout {ep + 1}")
+                _write_rollout_video(video_folder, ep, ann)
                 all_frames_for_wandb.extend(ann)
     else:
         if num_rollouts > 0:
@@ -839,7 +1085,7 @@ def run_rollouts_and_save_viz(
                 query_window=query_window,
             )
         for ep in range(num_rollouts):
-            ep_return, length, S, A, _, frames, rtg_ff = _run_one_rollout(
+            ep_return, length, S, A, traj_dict, frames, rtg_ff, rtg_trace = _run_one_rollout(
                 model,
                 env,
                 state_mean_t,
@@ -850,7 +1096,7 @@ def run_rollouts_and_save_viz(
                 step,
                 ep,
                 None,
-                collect_frames=collect_frames,
+                collect_frames=_collect_frames_for_index(ep),
                 env_name=env_name,
                 eval_target_return=eval_target_return,
                 query_window=query_window,
@@ -859,16 +1105,17 @@ def run_rollouts_and_save_viz(
             all_lengths.append(length)
             all_states_list.append(S)
             all_actions_list.append(A)
-            if collect_frames and frames:
-                ann = _annotated_rollout_frames(model, frames, rtg_ff, f"Trial {ep + 1}")
-                _write_trial_video(video_folder, ep, ann)
+            all_reward_traces.append(np.asarray(traj_dict["rewards"], dtype=np.float64))
+            all_rtg_traces.append(np.asarray(rtg_trace, dtype=np.float64))
+            if _collect_frames_for_index(ep) and frames:
+                ann = _annotated_rollout_frames(model, frames, rtg_ff, f"Rollout {ep + 1}")
+                _write_rollout_video(video_folder, ep, ann)
                 all_frames_for_wandb.extend(ann)
 
     env.close()
     # Save combined video (all trials with labels) and each trial separately; then log to wandb
-    if collect_frames and all_frames_for_wandb:
-        all_trials_path = video_folder / "all_trials.mp4"
-        _write_frames_video(video_folder, "all_trials.mp4", all_frames_for_wandb, fps=20)
+    if all_frames_for_wandb:
+        _write_frames_video(video_folder, "all_rollouts.mp4", all_frames_for_wandb, fps=20)
         if logger is not None and logger._wandb is not None:
             # Log main video from array so W&B respects fps (path-based logging ignores fps and warns)
             logger.log_video(
@@ -879,11 +1126,11 @@ def run_rollouts_and_save_viz(
                 wandb_commit=wb_commit_video,
             )
             for i in range(len(all_returns)):
-                trial_path = video_folder / f"trial_{i}.mp4"
-                if trial_path.exists():
+                rollout_path = video_folder / f"rollout_{i}.mp4"
+                if rollout_path.exists():
                     logger.log_video_from_path(
-                        f"eval/rollout_video_trial_{i}",
-                        trial_path,
+                        f"eval/rollout_video_{i}",
+                        rollout_path,
                         step=step,
                         wandb_commit=wb_commit_video,
                     )
@@ -909,7 +1156,8 @@ def run_rollouts_and_save_viz(
             axes[0].plot(S[:, j], label=f"s{j}")
         axes[0].set_ylabel("state (sample dims)")
         axes[0].legend(loc="right", fontsize=6)
-        axes[0].set_title(f"Rollout {i} (return={all_returns[i]:.1f})")
+        _ep_lab = "Episode" if eval_context_mode == "zero_shot_adaptation" else "Rollout"
+        axes[0].set_title(f"{_ep_lab} {i} (return={all_returns[i]:.1f})")
         for j in range(min(3, A.shape[1])):
             axes[1].plot(A[:, j], label=f"a{j}")
         axes[1].set_ylabel("action")
@@ -921,38 +1169,190 @@ def run_rollouts_and_save_viz(
     from matplotlib.ticker import MaxNLocator
 
     _font = {"family": "serif", "serif": ["Palatino", "Palatino Linotype", "DejaVu Serif"]}
-    if len(all_returns) > 0:
-        cum_returns = np.cumsum(all_returns)
-        x = np.arange(len(all_returns), dtype=int)
+    # Per-trial / grouped return plots only when K>1; for K==1 scalars (eval/return_mean, std) suffice.
+    if len(all_returns) > 0 and int(eval_num_trials) > 1:
+        arr = np.asarray(all_returns, dtype=np.float64)
+        n_pts = int(arr.shape[0])
+        is_zs = eval_context_mode == "zero_shot_adaptation"
+        K = max(1, int(eval_num_trials))
+        N = int(num_rollouts)
+        grouped_zs = bool(is_zs and K >= 1 and N >= 1 and n_pts == N * K)
+
         with plt.rc_context({"font.family": "serif", "font.serif": _font["serif"]}):
             fig_sum, (ax_bar, ax_cum) = plt.subplots(
-                1, 2, figsize=(9, 3.5), constrained_layout=True
+                1, 2, figsize=(9, 4.2), constrained_layout=True
             )
-            ax_bar.bar(x, all_returns, color="steelblue")
-            ax_bar.axhline(
-                np.mean(all_returns),
-                color="red",
-                linestyle="--",
-                label=f"mean={np.mean(all_returns):.1f}",
-            )
-            ax_bar.set_xlabel("trial")
-            ax_bar.set_ylabel("return")
+
+            if grouped_zs:
+                R = arr.reshape(N, K)
+                bar_mean = np.mean(R, axis=1)
+                bar_std = np.std(R, axis=1, ddof=0)
+                bar_x = np.arange(N, dtype=int)
+                ax_bar.bar(
+                    bar_x,
+                    bar_mean,
+                    yerr=bar_std,
+                    capsize=4,
+                    color="steelblue",
+                    ecolor="#333333",
+                    edgecolor="#1a5276",
+                    linewidth=0.6,
+                    error_kw={"linewidth": 1.2, "capthick": 1.2},
+                )
+                ax_bar.axhline(
+                    float(np.mean(arr)),
+                    color="coral",
+                    linestyle="--",
+                    linewidth=1.2,
+                    label=f"global mean={float(np.mean(arr)):.1f}",
+                )
+                ax_bar.set_xlabel("rollout index")
+                ax_bar.set_ylabel("return (env sum per episode)")
+                ax_bar.set_title(f"Mean return ± std over K={K} in-session trials per rollout")
+                suptitle_sub = (
+                    f"{N} rollouts × {K} trials/rollout; bars aggregate within each rollout"
+                )
+
+                cum_mat = np.cumsum(R, axis=1)
+                cum_x = np.arange(K, dtype=int)
+                cum_mean = np.mean(cum_mat, axis=0)
+                cum_std = np.std(cum_mat, axis=0, ddof=0)
+                if K > 1:
+                    ax_cum.fill_between(
+                        cum_x,
+                        cum_mean - cum_std,
+                        cum_mean + cum_std,
+                        color="steelblue",
+                        alpha=0.28,
+                        linewidth=0,
+                    )
+                ax_cum.plot(
+                    cum_x,
+                    cum_mean,
+                    color="#1a5276",
+                    linewidth=2.0,
+                    marker="o",
+                    markersize=5,
+                    label="mean ± std across rollouts",
+                )
+                ax_cum.errorbar(
+                    cum_x,
+                    cum_mean,
+                    yerr=cum_std,
+                    fmt="none",
+                    ecolor="#333333",
+                    capsize=3,
+                    elinewidth=1.0,
+                    zorder=5,
+                )
+                ax_cum.set_xlabel(
+                    "in-session trial index j (cumulative = trials 0…j within a rollout)"
+                )
+                ax_cum.set_ylabel("cumulative return")
+                ax_cum.set_title("Within-rollout cumulative return: mean ± std across rollouts")
+            else:
+                if not is_zs and n_pts > 1:
+                    m = float(np.mean(arr))
+                    s = float(np.std(arr, ddof=0))
+                    ax_bar.bar(
+                        [0],
+                        [m],
+                        width=0.45,
+                        yerr=[s],
+                        capsize=5,
+                        color="steelblue",
+                        ecolor="#333333",
+                        edgecolor="#1a5276",
+                        linewidth=0.8,
+                        error_kw={"linewidth": 1.2, "capthick": 1.2},
+                    )
+                    ax_bar.set_xticks([0])
+                    ax_bar.set_xticklabels([f"{n_pts} rollouts"])
+                    ax_bar.set_title(
+                        "Mean return ± std across independent rollouts (1 episode each)"
+                    )
+                    ax_bar.set_xlabel("aggregate")
+                    suptitle_sub = f"{n_pts} independent rollout(s), one bar = mean ± std"
+                else:
+                    bar_x = np.arange(n_pts, dtype=int)
+                    ax_bar.bar(
+                        bar_x,
+                        arr,
+                        color="steelblue",
+                        edgecolor="#1a5276",
+                        linewidth=0.6,
+                    )
+                    ax_bar.axhline(
+                        float(np.mean(arr)),
+                        color="coral",
+                        linestyle="--",
+                        linewidth=1.2,
+                        label=f"mean={float(np.mean(arr)):.1f}",
+                    )
+                    if is_zs and n_pts != N * K:
+                        ax_bar.set_title(
+                            f"Return per episode (expected {N}×{K}={N * K} points, got {n_pts}; no grouped stats)"
+                        )
+                        suptitle_sub = (
+                            f"{n_pts} episode(s); check num_eval_rollouts × eval_num_trials"
+                        )
+                    else:
+                        ax_bar.set_title("Return per rollout (single episode per bar)")
+                        suptitle_sub = f"{n_pts} rollout(s)" + (
+                            f", K={K} trial(s)/rollout configured" if is_zs else ""
+                        )
+                    ax_bar.set_xlabel(
+                        "rollout index (one episode per rollout)" if not is_zs else "episode index"
+                    )
+                ax_bar.set_ylabel("return (env sum per episode)")
+
+                cum_x = np.arange(n_pts, dtype=int)
+                cum_y = np.cumsum(arr)
+                ax_cum.plot(
+                    cum_x,
+                    cum_y,
+                    color="#1a5276",
+                    linewidth=2.0,
+                    marker="o",
+                    markersize=4,
+                    label="observed cumsum",
+                )
+                if not is_zs and n_pts > 1:
+                    cum_mu = (np.arange(1, n_pts + 1, dtype=np.float64)) * m
+                    ax_cum.plot(
+                        cum_x,
+                        cum_mu,
+                        color="coral",
+                        linestyle="--",
+                        linewidth=1.2,
+                        label="i × mean(return) (reference)",
+                    )
+                    ax_cum.set_title(
+                        "Cumulative return over rollouts (one path; dashed = i × mean per rollout)"
+                    )
+                else:
+                    ax_cum.set_title("Cumulative return (sequential sum in eval order)")
+                ax_cum.set_xlabel(
+                    "flattened episode index"
+                    if is_zs
+                    else "rollout index (running sum over rollouts)"
+                )
+                ax_cum.set_ylabel("cumulative return")
+
             ax_bar.xaxis.set_major_locator(MaxNLocator(integer=True))
-            ax_bar.legend(loc="upper right", fontsize=8)
-            ax_bar.set_title("Return per trial")
+            _handles, _labels = ax_bar.get_legend_handles_labels()
+            if _labels:
+                ax_bar.legend(loc="upper right", fontsize=8)
             ax_bar.grid(True, axis="y", alpha=0.3)
 
-            ax_cum.plot(x, cum_returns, color="steelblue", linewidth=2, marker="o", markersize=4)
-            for i in range(1, len(all_returns)):
-                ax_cum.axvline(x=i - 0.5, color="gray", linestyle="--", linewidth=0.8, alpha=0.7)
-            ax_cum.set_xlabel("trial")
-            ax_cum.set_ylabel("cumulative return")
             ax_cum.xaxis.set_major_locator(MaxNLocator(integer=True))
-            ax_cum.set_title("Cumulative return (all trials)")
+            _h2, _l2 = ax_cum.get_legend_handles_labels()
+            if _l2:
+                ax_cum.legend(loc="lower right", fontsize=8, framealpha=0.92)
             ax_cum.grid(True, alpha=0.3)
-            fig_sum.suptitle(f"Eval step {step}", fontsize=11, y=1.02)
+            fig_sum.suptitle(f"Eval step {step}\n{suptitle_sub}", fontsize=10, y=1.05)
 
-        summary_path = viz_dir / "eval_trials_returns.png"
+        summary_path = viz_dir / "eval_returns_summary.png"
         fig_sum.savefig(summary_path, dpi=100, bbox_inches="tight")
         plt.close(fig_sum)
         if logger is not None and logger._wandb is not None:
@@ -960,16 +1360,54 @@ def run_rollouts_and_save_viz(
 
             p = str(summary_path)
             logger.log_wandb_dict(
-                {
-                    "eval/trials_returns": wandb.Image(p),
-                    "eval/cumulative_return": wandb.Image(p),
-                },
+                {"eval/returns_summary": wandb.Image(p)},
                 step=step,
                 wandb_commit=wb_commit_charts,
             )
 
-    return {
-        "eval/return_mean": float(np.mean(all_returns)),
-        "eval/return_std": float(np.std(all_returns)),
-        "eval/len_mean": float(np.mean(all_lengths)),
-    }
+    rtg_dyn_path = viz_dir / "eval_rtg_reward_dynamics.png"
+    if _save_eval_rtg_reward_figure(
+        all_reward_traces,
+        all_rtg_traces,
+        rtg_scale=rtg_scale,
+        step=step,
+        out_path=rtg_dyn_path,
+        condition_rtg=bool(model._condition_rtg),
+    ):
+        if logger is not None and logger._wandb is not None:
+            import wandb
+
+            logger.log_wandb_dict(
+                {"eval/rtg_reward_dynamics": wandb.Image(str(rtg_dyn_path))},
+                step=step,
+                wandb_commit=wb_commit_charts,
+            )
+
+    if len(all_returns) == 0:
+        metrics = {
+            "eval/return_mean": 0.0,
+            "eval/return_std": 0.0,
+            "eval/len_mean": 0.0,
+        }
+    else:
+        metrics = {
+            "eval/return_mean": float(np.mean(all_returns)),
+            "eval/return_std": float(np.std(all_returns)),
+            "eval/len_mean": float(np.mean(all_lengths)),
+        }
+        if d4rl_score_ref is not None:
+            from src.envs.d4rl_normalized_score import d4rl_normalize_returns
+
+            rmin, rmax = float(d4rl_score_ref[0]), float(d4rl_score_ref[1])
+            norm = d4rl_normalize_returns(all_returns, rmin, rmax)
+            metrics["eval/return_mean_normalized"] = float(np.mean(norm))
+            metrics["eval/return_std_normalized"] = float(np.std(norm))
+    ap_stats = _action_prediction_stats_from_rollouts(all_actions_list)
+    metrics.update(ap_stats)
+    if ap_stats:
+        print(
+            f"[eval action_pred] step={step} mean={ap_stats['eval/action_pred_mean']:.4f} "
+            f"min={ap_stats['eval/action_pred_min']:.4f} max={ap_stats['eval/action_pred_max']:.4f}",
+            flush=True,
+        )
+    return metrics

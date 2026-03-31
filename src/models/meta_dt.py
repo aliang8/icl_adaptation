@@ -20,7 +20,8 @@ from src.models.types import DTBatch, DTOutput
 class MetaDecisionTransformer(nn.Module):
     """
     Models (Return_t, state_t, action_t, ...) with optional prompt (context) sequences.
-    State is encoded with context then fed as state_dim*2 -> hidden.
+    State path: when ``num_context_trajectories > 0`` and ``context_dim > 0``, concat encoded proprio
+    with ``batch.contexts``; otherwise ``Linear(state_dim -> hidden)`` only (typical no-ICL / zeros context).
     """
 
     def __init__(
@@ -29,6 +30,7 @@ class MetaDecisionTransformer(nn.Module):
         act_dim: int,
         hidden_size: int,
         context_dim: int = 16,
+        num_context_trajectories: int = 1,
         max_length: int = 20,
         max_ep_len: int = 200,
         action_tanh: bool = True,
@@ -60,6 +62,9 @@ class MetaDecisionTransformer(nn.Module):
         self.max_trial_embeddings = max(1, int(max_trial_embeddings))
         self.act_dim = act_dim
         self.context_dim = context_dim
+        self.num_context_trajectories = int(num_context_trajectories)
+        # Per-timestep batch.contexts are only fused when ICL is enabled (N>0); for N<=0 data uses zeros.
+        self._fuse_context_in_state = context_dim > 0 and self.num_context_trajectories > 0
         self.max_length = max_length
         self.hidden_size = hidden_size
 
@@ -81,8 +86,12 @@ class MetaDecisionTransformer(nn.Module):
         self.embed_timestep = nn.Embedding(max_ep_len, hidden_size)
         self.embed_return = nn.Linear(1, hidden_size)
         self.embed_action = nn.Linear(act_dim, hidden_size)
-        self.state_encoder = nn.Linear(state_dim, context_dim)
-        self.embed_state = nn.Linear(context_dim * 2, hidden_size)
+        if self._fuse_context_in_state:
+            self.state_encoder = nn.Linear(state_dim, context_dim)
+            self.embed_state = nn.Linear(context_dim * 2, hidden_size)
+        else:
+            self.state_encoder = None
+            self.embed_state = nn.Linear(state_dim, hidden_size)
         self.prompt_embed_timestep = nn.Embedding(max_ep_len, hidden_size)
         self.prompt_embed_return = nn.Linear(1, hidden_size)
         self.prompt_embed_state = nn.Linear(state_dim, hidden_size)
@@ -133,6 +142,7 @@ class MetaDecisionTransformer(nn.Module):
                 ti = torch.zeros((B, T), dtype=torch.long, device=batch.states.device)
             trial_e = self._embed_trial_idx(ti)
         return_emb = None
+
         if self._condition_rtg:
             return_emb = self.embed_return(batch.returns_to_go) + self.embed_timestep(
                 batch.timesteps.long()
@@ -147,7 +157,11 @@ class MetaDecisionTransformer(nn.Module):
             return_emb, state_emb, action_emb, mask, batch.prompt, T
         )
         hidden = self._run_backbone(stacked, stacked_mask, tokens_per_step)
-        action_index = tokens_per_step - 1  # 2 when (r,s,a), 1 when (s,a)
+        # Match kzl Decision Transformer head indexing after
+        # x.reshape(B, T, tokens_per_step, H).permute(0, 2, 1, 3):
+        # https://github.com/kzl/decision-transformer/blob/master/gym/decision_transformer/models/decision_transformer.py
+        # return/state preds: hidden at action token (index 2 for r,s,a); action pred: state token (index 1).
+        action_hidden_idx = tokens_per_step - 2  # 1 for (r,s,a), 0 for (s,a) only
         pred_returns = None
         pred_states = None
         if tokens_per_step == 3:
@@ -157,7 +171,7 @@ class MetaDecisionTransformer(nn.Module):
             pred_states = (
                 self.predict_state(hidden[:, 2])[:, -T:, :] if self._predict_state else None
             )
-        pred_actions_full = self.predict_action(hidden[:, action_index])
+        pred_actions_full = self.predict_action(hidden[:, action_hidden_idx])
         pred_actions = pred_actions_full[:, -T:, :]
 
         # Action MSE uses attention_mask / prompt_attention_mask: 0 = padded (no loss), 1 = valid.
@@ -184,10 +198,14 @@ class MetaDecisionTransformer(nn.Module):
         )
 
     def encode_state(self, batch: DTBatch) -> Tensor:
-        """Fuse state + context and add timestep embedding. [B, T, D] -> [B, T, H]."""
+        """Proprio -> hidden (fused with batch.contexts iff ``_fuse_context_in_state``); + timestep (+ trial)."""
         ts = batch.timesteps.long()
-        enc = self.state_encoder(batch.states)
-        state_emb = self.embed_state(torch.cat((enc, batch.contexts), dim=-1))
+        if self._fuse_context_in_state:
+            enc = self.state_encoder(batch.states)  # type: ignore[union-attr]
+            state_emb = self.embed_state(torch.cat((enc, batch.contexts), dim=-1))
+        else:
+            state_emb = self.embed_state(batch.states)
+
         out = state_emb + self.embed_timestep(ts)
         if self.embed_trial_idx is not None:
             ti = batch.trial_indices

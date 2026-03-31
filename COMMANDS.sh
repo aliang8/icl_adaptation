@@ -20,16 +20,24 @@ uv run python -m src.train \
 
 CUDA_VISIBLE_DEVICES=7 uv run python -m src.train \
   --override data=[base,halfcheetah] \
-  experiment.max_steps=20000 \
-  data.batch_size=32 \
+  experiment.max_steps=100000 \
+  data.batch_size=64 \
   data.num_context_trajectories=0 \
-  experiment.eval_every_steps=1000 \
+  experiment.eval_every_steps=2000 \
   experiment.eval_num_trials=1 \
   experiment.eval_target_return=6000 \
-  data.rtg_scale=1 \
-  data.data_quality=expert \
-  data.horizon=100 \
-  model.max_length=100 \
+  experiment.num_eval_rollouts=3 \
+  data.rtg_scale=1000 \
+  data.data_quality=medium_expert \
+  data.horizon=20 \
+  model.max_length=20 \
   model.query_loss_only=false \
+  optim.lr=1e-4 \
   paths.data_root=/scr2/shared/icl_adaptation/datasets \
   --wandb
+
+# Offline rollouts + viz → <experiment_root>/offline_eval/ (paths.data_root from checkpoint + Hydra merge)
+uv run python -m src.eval \
+  --checkpoint outputs/icl_adaptation/2026-03-31/train__seed_412/ckpts/step_000000/checkpoint.pt \
+  --step 0 \
+  --num-episodes 3

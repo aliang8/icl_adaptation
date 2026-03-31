@@ -16,13 +16,22 @@ Standard layout:
 
 from __future__ import annotations
 
-import os
 import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from omegaconf import OmegaConf
+
+
+def infer_experiment_root_from_checkpoint(checkpoint_path: str | Path) -> Path:
+    """Parent of ``ckpts/`` if the path contains that segment; else the checkpoint file's parent."""
+    p = Path(checkpoint_path).resolve()
+    parts = p.parts
+    if "ckpts" in parts:
+        i = parts.index("ckpts")
+        return Path(*parts[:i])
+    return p.parent
 
 
 def get_git_short_hash(length: int = 7) -> Optional[str]:

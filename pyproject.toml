@@ -65,5 +65,9 @@ src = ["src", "scripts"]
 [tool.ruff.lint]
 select = ["E", "F", "I"]
 
+[tool.ruff.lint.per-file-ignores]
+# sys.path bootstrap before third-party / src imports
+"src/eval.py" = ["E402"]
+
 [tool.ruff.format]
 quote-style = "double"
