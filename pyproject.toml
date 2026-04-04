@@ -19,6 +19,7 @@ dependencies = [
     "ipdb",
     "imageio[ffmpeg]>=2.9.0",
     "opencv-python-headless>=4.5.0",
+    "opencv-python>=4.5.0",
     "matplotlib>=3.5.0",
     "datasets>=4.5.0",
     "einops"
@@ -50,6 +51,8 @@ reward-relabel = [
     "unsloth",
     "qwen-vl-utils"
 ]
+# ManiSkill: not an optional extra here — mani-skill pins gymnasium==0.29.1, which breaks HalfCheetah-v5.
+# Use scripts/maniskill/requirements.txt in a dedicated venv (see docs/MANISKILL.md).
 # DINOv2, SigLIP/PaliGemma, ViT (CrossMAE-style) use transformers. LLaMA 2 needs HuggingFace token for gated models.
 dev = ["pytest", "ruff"]
 
@@ -68,6 +71,8 @@ select = ["E", "F", "I"]
 [tool.ruff.lint.per-file-ignores]
 # sys.path bootstrap before third-party / src imports
 "src/eval.py" = ["E402"]
+# Upstream-style PPO (long lines, imports after sys.path)
+"scripts/maniskill/ppo_train_icldata.py" = ["E501", "E402", "I001", "E731"]
 
 [tool.ruff.format]
 quote-style = "double"

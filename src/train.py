@@ -259,6 +259,20 @@ def validate_dataset_paths(env_name: str, paths, data_cfg) -> None:
         log.info("ICRT-MT dataset config found: {}", config_path)
     elif env_name in LIBERO_SUITES:
         log.info("LIBERO: dataset at data_dir/LIBERO-Cosmos-Policy/data/ (episode_index)")
+    elif env_name.startswith("ManiSkill/"):
+        from src.data.maniskill_io import resolve_maniskill_trajectory_path
+
+        ms_task = env_name.split("/", 1)[1]
+        p = resolve_maniskill_trajectory_path(paths.data_root, ms_task)
+        if not p.is_file():
+            d = p.parent
+            raise FileNotFoundError(
+                f"ManiSkill trajectories not found under {d} "
+                "(expected trajectories.h5 or legacy trajectories.pkl).\n"
+                "Generate with: python scripts/maniskill/ppo_train_icldata.py --env-id "
+                f"{ms_task} ... (dedicated ManiSkill venv; see docs/MANISKILL.md)"
+            )
+        log.info("ManiSkill dataset found: {}", p)
     elif env_name == "VD4RL":
         for split in _vd4rl_split_list(data_cfg):
             p = (
@@ -689,7 +703,10 @@ def main():
 
     env_name = data_cfg.env_name
     state_dim, action_dim = ENV_DIMS.get(env_name, (cfg.model.state_dim, cfg.model.act_dim))
-    log.info("Env {} -> state_dim={}, action_dim={}", env_name, state_dim, action_dim)
+    if env_name.startswith("ManiSkill/"):
+        log.info("Env {} (ManiSkill: state/action dims set from trajectory file)", env_name)
+    else:
+        log.info("Env {} -> state_dim={}, action_dim={}", env_name, state_dim, action_dim)
 
     paths = resolve_paths(cfg)
     log.debug("Resolved paths: data_root={}, output_root={}", paths.data_root, paths.output_root)
@@ -776,6 +793,23 @@ def main():
                 len(trajectories),
                 data_root,
             )
+
+    if env_name.startswith("ManiSkill/"):
+        from src.data.maniskill_io import resolve_maniskill_trajectory_path
+        from src.data.maniskill_loader import load_maniskill_trajectories
+
+        ms_task = env_name.split("/", 1)[1]
+        traj_path = resolve_maniskill_trajectory_path(paths.data_root, ms_task)
+        trajectories, prompt_per_task = load_maniskill_trajectories(str(traj_path))
+        state_dim = int(trajectories[0]["observations"].shape[1])
+        action_dim = int(trajectories[0]["actions"].shape[1])
+        log.info(
+            "Loaded {} ManiSkill trajectories from {} (state_dim={}, action_dim={})",
+            len(trajectories),
+            traj_path,
+            state_dim,
+            action_dim,
+        )
 
     if env_name == "ICRT-MT":
         config_path = data_root / "ICRT-MT" / "dataset_config.json"

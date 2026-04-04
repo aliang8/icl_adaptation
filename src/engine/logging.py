@@ -186,6 +186,8 @@ def log_metrics(
     eval_metrics: Optional[Dict[str, float]] = None,
     batch_metrics: Optional[Dict[str, float]] = None,
     checkpoint_path: Optional[str] = None,
+    data_fetch_s: Optional[float] = None,
+    batch_update_s: Optional[float] = None,
     *,
     wandb_commit: bool = True,
 ) -> None:
@@ -197,6 +199,14 @@ def log_metrics(
         metrics["train/grad_norm"] = grad_norm
     if throughput is not None:
         metrics["train/throughput"] = throughput
+    if data_fetch_s is not None:
+        metrics["train/data_fetch_s"] = data_fetch_s
+    if batch_update_s is not None:
+        metrics["train/batch_update_s"] = batch_update_s
+    if data_fetch_s is not None and batch_update_s is not None:
+        wall = data_fetch_s + batch_update_s
+        if wall > 1e-9:
+            metrics["train/steps_per_sec"] = 1.0 / wall
     if gpu_mem_mb is not None:
         metrics["system/gpu_mem_mb"] = gpu_mem_mb
     if eval_metrics:

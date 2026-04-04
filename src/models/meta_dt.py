@@ -189,6 +189,7 @@ class MetaDecisionTransformer(nn.Module):
                 loss = self.compute_loss(pred_actions_full, full_actions, full_mask)
             else:
                 loss = self.compute_loss(pred_actions, batch.actions, mask)
+
         return DTOutput(
             loss=loss,
             pred_actions=pred_actions,

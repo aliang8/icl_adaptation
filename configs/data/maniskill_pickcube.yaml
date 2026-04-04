@@ -1,0 +1,17 @@
+# Example: ICL training on ManiSkill data produced by scripts/maniskill/ppo_train_icldata.py
+# Expects: paths.data_root/maniskill/PickCube-v1/trajectories.h5 (or legacy trajectories.pkl)
+# Run PPO in a ManiSkill-only venv (scripts/maniskill/requirements.txt); train ICL in the main uv env.
+#
+# python scripts/maniskill/ppo_train_icldata.py --env-id PickCube-v1 ... --icl-data-root datasets
+# python src/train.py data=maniskill_pickcube model.use_vision=true data.use_vision=true ...
+
+defaults:
+  - base
+  - _self_
+
+env_name: ManiSkill/PickCube-v1
+rtg_scale: 1.0
+horizon: 20
+max_episode_steps: 200
+use_vision: false
+use_precomputed_embeddings: false

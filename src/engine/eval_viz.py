@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import math
 import os
+import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -170,6 +171,11 @@ def _try_make_env(
             action_dim=7,
             render_both_views=render_both_views,
         )
+
+    if env_name.startswith("ManiSkill/"):
+        from src.envs.maniskill_eval_env import make_maniskill_eval_env
+
+        return make_maniskill_eval_env(env_name, render_mode=render_mode)
 
     import gymnasium as gym
 
@@ -396,10 +402,10 @@ def _save_eval_rtg_reward_figure(
 ) -> List[Path]:
     """Save RTG/reward dynamics. Returns paths of written PNGs.
 
-    Zero-shot with ``eval_num_trials > 1``: one PNG, **N rows × 2 columns** (reward | RTG), row
-    ``s`` = session ``S{s+1}`` with trials stitched on the x-axis; **sharex / sharey per column**
-    so reward axes align and RTG axes align across sessions.
-    Otherwise one aggregate figure (mean ± std over episodes).
+    Zero-shot with ``eval_num_trials > 1``: (1) **N rows × 2 columns** per-session grid (reward | RTG),
+    row ``s`` = session ``S{s+1}`` with trials stitched on the x-axis; **sharex / sharey per column**;
+    (2) a second PNG, **one row × 2 columns**, mean ± std (shaded) across sessions on the same stitched
+    axis. Otherwise one aggregate figure (mean ± std over episodes).
     """
     out_paths: List[Path] = []
     if not reward_rows or all(np.asarray(r).size == 0 for r in reward_rows):
@@ -517,13 +523,13 @@ def _save_eval_rtg_reward_figure(
                     ax_gt.grid(True, axis="y", alpha=0.4)
 
             if use_rtg:
-                axes[0, 0].set_title("Reward / step (trials stitched)")
+                axes[0, 0].set_title("Reward / step")
                 axes[0, 1].set_title("RTG token (before action)")
-                axes[-1, 0].set_xlabel("cumulative environment step (across trials)")
-                axes[-1, 1].set_xlabel("cumulative environment step (across trials)")
+                axes[-1, 0].set_xlabel("env steps")
+                axes[-1, 1].set_xlabel("env steps")
             else:
-                axes[0, 0].set_title("Reward / step (trials stitched)")
-                axes[-1, 0].set_xlabel("cumulative environment step (across trials)")
+                axes[0, 0].set_title("Reward / step")
+                axes[-1, 0].set_xlabel("env steps")
 
             fig.suptitle(
                 f"Eval step {step} · {K} trials × {N} session(s) · rtg_scale={rtg_scale:g}",
@@ -534,6 +540,99 @@ def _save_eval_rtg_reward_figure(
             fig.savefig(str(out_path), dpi=120, bbox_inches="tight", facecolor=bg)
             plt.close(fig)
             out_paths.append(out_path)
+
+            # Second figure: one row, mean ± std across sessions (stitched env-step axis).
+            mean_path = out_path.with_name(out_path.stem + "_mean_std" + out_path.suffix)
+            r_stitched_list = [_stitch_session(s)[0] for s in range(N)]
+            R_pad = _pad_ragged_1d(r_stitched_list)
+            T_r = int(R_pad.shape[1])
+            if T_r > 0:
+                r_mean = np.nanmean(R_pad, axis=0)
+                r_std = np.nanstd(R_pad, axis=0, ddof=0)
+                r_std = np.nan_to_num(r_std, nan=0.0, posinf=0.0, neginf=0.0)
+                x_r = np.arange(T_r, dtype=np.float64)
+
+                agg_two_col = False
+                T_plot = T_r
+                if use_rtg:
+                    g_stitched_list = [_stitch_session(s)[1] for s in range(N)]
+                    G_pad = _pad_ragged_1d(g_stitched_list)
+                    T_g = int(G_pad.shape[1])
+                    T_plot = min(T_r, T_g)
+                    agg_two_col = T_plot >= 1
+
+                if agg_two_col:
+                    x_r = x_r[:T_plot]
+                    r_mean = r_mean[:T_plot]
+                    r_std = r_std[:T_plot]
+                    g_mean = np.nanmean(G_pad[:, :T_plot], axis=0)
+                    g_std = np.nanstd(G_pad[:, :T_plot], axis=0, ddof=0)
+                    g_std = np.nan_to_num(g_std, nan=0.0, posinf=0.0, neginf=0.0)
+                    x_g = np.arange(T_plot, dtype=np.float64)
+
+                    fig_m, (ax_mr, ax_mg) = plt.subplots(
+                        1,
+                        2,
+                        figsize=(10.5, 4.0),
+                        sharex=True,
+                        constrained_layout=True,
+                    )
+                    ax_mr.fill_between(
+                        x_r, r_mean - r_std, r_mean + r_std, color=c_r, alpha=0.28, linewidth=0
+                    )
+                    ax_mr.plot(x_r, r_mean, color=c_r, linewidth=2.0, label="mean ± std")
+                    for xb in trial_bounds:
+                        if xb < T_plot:
+                            ax_mr.axvline(xb, color="#bbbbbb", linestyle="--", linewidth=0.9, alpha=0.9)
+                    ax_mr.set_title("Reward / step (mean ± std across sessions)")
+                    ax_mr.set_ylabel("env reward")
+                    ax_mr.set_xlabel("env steps")
+                    ax_mr.grid(True, axis="y", alpha=0.4)
+                    ax_mr.legend(loc="upper right", fontsize=8, framealpha=0.92)
+
+                    ax_mg.fill_between(
+                        x_g, g_mean - g_std, g_mean + g_std, color=c_rtg, alpha=0.28, linewidth=0
+                    )
+                    ax_mg.plot(x_g, g_mean, color=c_rtg, linewidth=2.0, label="mean ± std")
+                    for xb in trial_bounds:
+                        if xb < T_plot:
+                            ax_mg.axvline(xb, color="#bbbbbb", linestyle="--", linewidth=0.9, alpha=0.9)
+                    ax_mg.set_title("RTG token (before action), mean ± std across sessions")
+                    ax_mg.set_ylabel("RTG token")
+                    ax_mg.set_xlabel("env steps")
+                    ax_mg.grid(True, axis="y", alpha=0.4)
+                    ax_mg.legend(loc="upper right", fontsize=8, framealpha=0.92)
+                    fig_m.suptitle(
+                        f"Eval step {step} · mean ± std over N={N} session(s) · {K} trials stitched · "
+                        f"rtg_scale={rtg_scale:g}",
+                        fontsize=11,
+                        y=1.03,
+                        color="#1a1a1a",
+                    )
+                else:
+                    fig_m, ax_mr = plt.subplots(1, 1, figsize=(9.0, 3.6), constrained_layout=True)
+                    ax_mr.fill_between(
+                        x_r, r_mean - r_std, r_mean + r_std, color=c_r, alpha=0.28, linewidth=0
+                    )
+                    ax_mr.plot(x_r, r_mean, color=c_r, linewidth=2.0, label="mean ± std")
+                    for xb in trial_bounds:
+                        if xb < T_r:
+                            ax_mr.axvline(xb, color="#bbbbbb", linestyle="--", linewidth=0.9, alpha=0.9)
+                    ax_mr.set_title("Reward / step (mean ± std across sessions)")
+                    ax_mr.set_ylabel("env reward")
+                    ax_mr.set_xlabel("env steps")
+                    ax_mr.grid(True, axis="y", alpha=0.4)
+                    ax_mr.legend(loc="upper right", fontsize=8, framealpha=0.92)
+                    fig_m.suptitle(
+                        f"Eval step {step} · mean ± std over N={N} session(s) · {K} trials stitched",
+                        fontsize=11,
+                        y=1.03,
+                        color="#1a1a1a",
+                    )
+
+                fig_m.savefig(str(mean_path), dpi=120, bbox_inches="tight", facecolor=bg)
+                plt.close(fig_m)
+                out_paths.append(mean_path)
         return out_paths
 
     R = _pad_ragged_1d(reward_rows)
@@ -698,11 +797,11 @@ def _annotated_rollout_frames(
         lines = [f"{trial_tag}  t={t}"]
         if cond_rtg and t < len(rtg_per_frame):
             # Same units as training: RTG token = future_return / rtg_scale (~O(1)).
-            lines.append(f"RTG token: {rtg_per_frame[t]:.4f}")
+            lines.append(f"RTG target: {rtg_per_frame[t]:.4f}")
         elif not cond_rtg:
             lines.append("RTG: off")
         if cum_return_per_frame is not None and t < len(cum_return_per_frame):
-            lines.append(f"return cum: {cum_return_per_frame[t]:.2f}")
+            lines.append(f"return: {cum_return_per_frame[t]:.2f}")
         out.append(_annotate_eval_frame(f, lines))
     return out
 
@@ -892,8 +991,6 @@ def _run_one_rollout(
                     flush=True,
                 )
 
-        # if prompt_now is not None:
-        #     import ipdb; ipdb.set_trace()
         image_embeddings = None
         if use_vision and image_list:
             image_embeddings = _encode_rollout_images(image_list, model, device)
@@ -1061,6 +1158,8 @@ def run_rollouts_and_save_viz(
             f"run_rollouts_and_save_viz expects MetaDecisionTransformer, got {type(model)}"
         )
 
+    _t_rollout_start = time.perf_counter()
+
     use_wandb_video = logger is not None and logger._wandb is not None
     # Several media logs share one W&B step; never commit=True on each video or the step advances N times.
     wb_commit_video = False
@@ -1103,7 +1202,15 @@ def run_rollouts_and_save_viz(
             )
         else:
             print(f"Eval rollouts skipped: no env registered for '{env_name}'.")
-        return {"eval/return_mean": 0.0}
+        _wall = time.perf_counter() - _t_rollout_start
+        print(
+            f"[eval rollout] timing: wall={_wall:.3f}s (no env; skipped)",
+            flush=True,
+        )
+        return {
+            "eval/return_mean": 0.0,
+            "eval/rollout_wall_s": float(_wall),
+        }
 
     if eval_context_mode == "zero_shot_adaptation":
         print(
@@ -1586,50 +1693,47 @@ def run_rollouts_and_save_viz(
         grouped_zs = bool(is_zs and K >= 1 and N >= 1 and n_pts == N * K)
 
         with plt.rc_context({"font.family": "serif", "font.serif": _font["serif"]}):
-            fig_sum, (ax_bar, ax_cum) = plt.subplots(
-                1, 2, figsize=(9, 4.2), constrained_layout=True
+            fig_sum, (ax_per, ax_cum) = plt.subplots(
+                1,
+                2,
+                figsize=(10, 4.2),
+                sharex=True,
+                constrained_layout=True,
             )
 
             if grouped_zs:
                 R = arr.reshape(N, K)
-                bar_mean = np.mean(R, axis=1)
-                bar_std = np.std(R, axis=1, ddof=0)
-                bar_x = np.arange(N, dtype=int)
-                ax_bar.bar(
-                    bar_x,
-                    bar_mean,
-                    yerr=bar_std,
-                    capsize=4,
-                    color="steelblue",
+                suptitle_sub = (
+                    f"{N} rollouts × {K} trials/rollout · mean return & cum. return ± std across rollouts"
+                )
+
+                cum_x = np.arange(K, dtype=int)
+                per_mean = np.mean(R, axis=0)
+                per_std = np.std(R, axis=0, ddof=0)
+                ax_per.plot(
+                    cum_x,
+                    per_mean,
+                    color="#2874a6",
+                    linewidth=2.0,
+                    marker="s",
+                    markersize=5,
+                )
+                ax_per.errorbar(
+                    cum_x,
+                    per_mean,
+                    yerr=per_std,
+                    fmt="none",
                     ecolor="#333333",
-                    edgecolor="#1a5276",
-                    linewidth=0.6,
-                    error_kw={"linewidth": 1.2, "capthick": 1.2},
+                    capsize=3,
+                    elinewidth=1.0,
+                    zorder=5,
                 )
-                ax_bar.axhline(
-                    float(np.mean(arr)),
-                    color="coral",
-                    linestyle="--",
-                    linewidth=1.2,
-                    label=f"mean={float(np.mean(arr)):.1f}",
-                )
-                ax_bar.set_xlabel("rollout index")
-                ax_bar.set_ylabel("return")
-                suptitle_sub = f"{N} rollouts × {K} trials/rollout"
+                ax_per.set_ylabel("return (per trial)")
+                ax_per.grid(True, alpha=0.3)
 
                 cum_mat = np.cumsum(R, axis=1)
-                cum_x = np.arange(K, dtype=int)
                 cum_mean = np.mean(cum_mat, axis=0)
                 cum_std = np.std(cum_mat, axis=0, ddof=0)
-                if K > 1:
-                    ax_cum.fill_between(
-                        cum_x,
-                        cum_mean - cum_std,
-                        cum_mean + cum_std,
-                        color="steelblue",
-                        alpha=0.28,
-                        linewidth=0,
-                    )
                 ax_cum.plot(
                     cum_x,
                     cum_mean,
@@ -1648,62 +1752,41 @@ def run_rollouts_and_save_viz(
                     elinewidth=1.0,
                     zorder=5,
                 )
+                ax_per.set_xlabel("trial index")
                 ax_cum.set_xlabel("trial index")
                 ax_cum.set_ylabel("cumulative return")
             else:
                 if not is_zs and n_pts > 1:
                     m = float(np.mean(arr))
-                    s = float(np.std(arr, ddof=0))
-                    ax_bar.bar(
-                        [0],
-                        [m],
-                        width=0.45,
-                        yerr=[s],
-                        capsize=5,
-                        color="steelblue",
-                        ecolor="#333333",
-                        edgecolor="#1a5276",
-                        linewidth=0.8,
-                        error_kw={"linewidth": 1.2, "capthick": 1.2},
+                    suptitle_sub = (
+                        f"{n_pts} independent rollout(s) · per-rollout return & running cumulative"
                     )
-                    ax_bar.set_xticks([0])
-                    ax_bar.set_xticklabels([f"{n_pts} rollouts"])
-                    ax_bar.set_xlabel("aggregate")
-                    suptitle_sub = f"{n_pts} independent rollout(s), one bar = mean ± std"
                 else:
-                    bar_x = np.arange(n_pts, dtype=int)
-                    ax_bar.bar(
-                        bar_x,
-                        arr,
-                        color="steelblue",
-                        edgecolor="#1a5276",
-                        linewidth=0.6,
-                    )
-                    ax_bar.axhline(
-                        float(np.mean(arr)),
-                        color="coral",
-                        linestyle="--",
-                        linewidth=1.2,
-                        label=f"mean={float(np.mean(arr)):.1f}",
-                    )
                     if is_zs and n_pts != N * K:
-                        ax_bar.set_title(
-                            f"Return per episode (expected {N}×{K}={N * K} points, got {n_pts}; no grouped stats)"
+                        ax_cum.set_title(
+                            f"Expected {N}×{K}={N * K} points, got {n_pts}; no grouped stats"
                         )
                         suptitle_sub = (
                             f"{n_pts} episode(s); check num_eval_rollouts × eval_num_trials"
                         )
                     else:
-                        ax_bar.set_title("Return per rollout (single episode per bar)")
                         suptitle_sub = f"{n_pts} rollout(s)" + (
                             f", K={K} trial(s)/rollout configured" if is_zs else ""
                         )
-                    ax_bar.set_xlabel(
-                        "rollout index (one episode per rollout)" if not is_zs else "episode index"
-                    )
-                ax_bar.set_ylabel("return (env sum per episode)")
 
                 cum_x = np.arange(n_pts, dtype=int)
+                ax_per.plot(
+                    cum_x,
+                    arr,
+                    color="#2874a6",
+                    linewidth=2.0,
+                    marker="s",
+                    markersize=4,
+                    label="return",
+                )
+                ax_per.set_ylabel("return (per episode)")
+                ax_per.grid(True, alpha=0.3)
+
                 cum_y = np.cumsum(arr)
                 ax_cum.plot(
                     cum_x,
@@ -1723,23 +1806,23 @@ def run_rollouts_and_save_viz(
                         linestyle="--",
                         linewidth=1.2,
                     )
-                ax_cum.set_xlabel(
+                _xlab = (
                     "flattened episode index"
                     if is_zs
                     else "rollout index (running sum over rollouts)"
                 )
+                ax_per.set_xlabel(_xlab)
+                ax_cum.set_xlabel(_xlab)
                 ax_cum.set_ylabel("cumulative return")
 
-            ax_bar.xaxis.set_major_locator(MaxNLocator(integer=True))
-            _handles, _labels = ax_bar.get_legend_handles_labels()
-            if _labels:
-                ax_bar.legend(loc="upper right", fontsize=8)
-            ax_bar.grid(True, axis="y", alpha=0.3)
-
-            ax_cum.xaxis.set_major_locator(MaxNLocator(integer=True))
+            for ax in (ax_per, ax_cum):
+                ax.xaxis.set_major_locator(MaxNLocator(integer=True))
             _h2, _l2 = ax_cum.get_legend_handles_labels()
             if _l2:
                 ax_cum.legend(loc="lower right", fontsize=8, framealpha=0.92)
+            _h3, _l3 = ax_per.get_legend_handles_labels()
+            if _l3:
+                ax_per.legend(loc="lower right", fontsize=8, framealpha=0.92)
             ax_cum.grid(True, alpha=0.3)
             fig_sum.suptitle(f"Eval step {step}\n{suptitle_sub}", fontsize=10, y=1.05)
 
@@ -1772,11 +1855,14 @@ def run_rollouts_and_save_viz(
         import wandb
 
         for ti, p in enumerate(rtg_dyn_paths):
-            key = (
-                "eval/rtg_reward_dynamics"
-                if len(rtg_dyn_paths) == 1
-                else f"eval/rtg_reward_dynamics_trial_{ti + 1}"
-            )
+            if len(rtg_dyn_paths) == 1:
+                key = "eval/rtg_reward_dynamics"
+            elif len(rtg_dyn_paths) == 2 and ti == 0:
+                key = "eval/rtg_reward_dynamics"
+            elif len(rtg_dyn_paths) == 2 and ti == 1:
+                key = "eval/rtg_reward_dynamics_mean_std"
+            else:
+                key = f"eval/rtg_reward_dynamics_trial_{ti + 1}"
             logger.log_wandb_dict(
                 {key: wandb.Image(str(p))},
                 step=step,
@@ -1810,4 +1896,17 @@ def run_rollouts_and_save_viz(
             f"min={ap_stats['eval/action_pred_min']:.4f} max={ap_stats['eval/action_pred_max']:.4f}",
             flush=True,
         )
+
+    _wall = time.perf_counter() - _t_rollout_start
+    metrics["eval/rollout_wall_s"] = float(_wall)
+    _total_env_steps = int(sum(all_lengths)) if all_lengths else 0
+    if _wall > 1e-9:
+        metrics["eval/rollout_env_steps_per_s"] = float(_total_env_steps) / float(_wall)
+    else:
+        metrics["eval/rollout_env_steps_per_s"] = 0.0
+    print(
+        f"[eval rollout] timing: wall={_wall:.3f}s env_steps={_total_env_steps} "
+        f"({metrics['eval/rollout_env_steps_per_s']:.1f} env steps/s)",
+        flush=True,
+    )
     return metrics

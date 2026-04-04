@@ -38,6 +38,8 @@ uv sync
 uv sync --extra d4rl        # Minari + native mujoco (Gymnasium HalfCheetah-v5 eval); no mujoco_py
 ```
 
+**Gymnasium vs ManiSkill:** do not install **`mani-skill`** into this D4RL training environment. It pins **`gymnasium==0.29.1`**, which lacks MuJoCo **v5** env modules and breaks **`HalfCheetah-v5`** / Minari `recover_environment()` (`ModuleNotFoundError: ... half_cheetah_v5`). Use a **separate venv** and `scripts/maniskill/requirements.txt` for ManiSkill PPO only (`docs/MANISKILL.md`).
+
 `d4rl` here is the **project extra** in `pyproject.toml` (Minari-based), not necessarily the PyPI `d4rl` package.
 
 ---

@@ -29,6 +29,7 @@ outputs/
 # Logs and experiment tracking
 wandb/
 *.log
+slurm-logs/
 
 # IDE / editor
 .idea/
@@ -52,3 +53,7 @@ unsloth_compiled_cache/*
 
 *.png
 *.mp4
+
+.venv-maniskill/
+.venv-maniskill-icldata/
+runs/*

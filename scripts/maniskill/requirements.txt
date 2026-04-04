@@ -1,0 +1,12 @@
+# ManiSkill PPO + ICL export (scripts/maniskill/*).
+# Install in a SEPARATE venv from the main project: mani-skill pins gymnasium==0.29.1, which
+# breaks HalfCheetah-v5 / Minari eval (needs gymnasium>=1.2). See docs/MANISKILL.md.
+#
+#   python -m venv .venv-maniskill && source .venv-maniskill/bin/activate
+#   pip install torch  # match your CUDA
+#   pip install -r scripts/maniskill/requirements.txt
+# For ``python -m src.train`` from this venv, also: pip install -r requirements_icl_train.txt
+#
+mani-skill
+tyro
+h5py>=3.8.0

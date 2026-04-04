@@ -4,6 +4,7 @@ log metrics, checkpoint (latest/best/periodic), eval hook. Uses tqdm progress ba
 """
 
 import os
+import time
 from typing import Any, Callable, Dict, Optional, Tuple
 
 import torch
@@ -156,6 +157,7 @@ class Trainer:
 
         first_step_done = False
         while global_step <= max_steps:
+            t_fetch0 = time.perf_counter()
             try:
                 batch = next(iter_loader)
             except StopIteration:
@@ -169,7 +171,11 @@ class Trainer:
                     max_steps,
                 )
             batch = tuple(x.to(self.device) if isinstance(x, torch.Tensor) else x for x in batch)
+            data_fetch_s = time.perf_counter() - t_fetch0
+
+            t_upd0 = time.perf_counter()
             loss_val, grad_norm_val, batch_metrics = self.train_step(batch, step_fn)
+            batch_update_s = time.perf_counter() - t_upd0
             if not first_step_done:
                 log_gpu_vram(self.device, "GPU VRAM (after first train step)")
                 first_step_done = True
@@ -180,7 +186,12 @@ class Trainer:
                 else None
             )
 
-            pbar.set_postfix(loss=f"{loss_val:.4f}", lr=f"{lr:.2e}", gn=f"{grad_norm_val:.3f}")
+            pbar.set_postfix(
+                loss=f"{loss_val:.4f}",
+                lr=f"{lr:.2e}",
+                gn=f"{grad_norm_val:.3f}",
+                upd=f"{batch_update_s * 1000:.0f}ms",
+            )
 
             # Eval before W&B scalar commit for this step: eval logs media with commit=False so
             # wandb's internal step does not advance past global_step before eval/return_mean logs.
@@ -199,6 +210,8 @@ class Trainer:
                 gpu_mem_mb=gpu_mem,
                 batch_metrics=batch_metrics,
                 eval_metrics=eval_metrics,
+                data_fetch_s=data_fetch_s,
+                batch_update_s=batch_update_s,
             )
 
             if eval_metrics is not None:
@@ -207,7 +220,12 @@ class Trainer:
                     pbar.write(
                         f"Step {global_step} | loss={loss_val:.4f} | lr={lr:.2e} | {self.best_metric_name}={current:.4f}"
                     )
-                    pbar.set_postfix(loss=f"{loss_val:.4f}", lr=f"{lr:.2e}", eval=f"{current:.4f}")
+                    pbar.set_postfix(
+                        loss=f"{loss_val:.4f}",
+                        lr=f"{lr:.2e}",
+                        eval=f"{current:.4f}",
+                        upd=f"{batch_update_s * 1000:.0f}ms",
+                    )
                     if self._is_better(current, best_metric):
                         best_metric = current
                         if save_best and self.rank == 0:
