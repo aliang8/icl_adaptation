@@ -296,6 +296,7 @@ def main() -> None:
             total_prompt_len=dataset.total_prompt_len,
             max_prompt_trajectory_length=dataset.max_prompt_trajectory_length,
             context_subsample_strategy=dataset.context_subsample_strategy,
+            context_style=str(data_cfg.context_style),
             task_description=task_desc,
             logger=None,
             eval_render_both_views=eval_render_both_views,

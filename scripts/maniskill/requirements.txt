@@ -10,3 +10,8 @@
 mani-skill
 tyro
 h5py>=3.8.0
+# Logging / tracking: PPO (--track) uses W&B + TensorBoard; src.train uses loguru + the same.
+# wandb[media] pulls deps for wandb.Video / image logging (eval rollout videos, etc.).
+loguru>=0.7.0
+tensorboard>=2.13
+wandb[media]>=0.15.0

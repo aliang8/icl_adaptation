@@ -126,11 +126,44 @@ def _log_eval_transformer_seq(
 
 
 def _render_rgb_frame(env: Any) -> Optional[np.ndarray]:
-    """RGB frame from Gymnasium env (create with render_mode='rgb_array')."""
+    """RGB frame from Gymnasium env (create with render_mode='rgb_array').
+
+    ManiSkill vector envs return a batched ``torch.Tensor`` (B, H, W, 3) uint8, not a NumPy array;
+    without converting here, eval collects no frames and W&B / disk videos stay empty.
+    """
     frame = env.render()
-    if frame is None or not isinstance(frame, np.ndarray):
+    if frame is None:
         return None
-    return np.asarray(frame)
+
+    try:
+        import torch
+
+        if isinstance(frame, torch.Tensor):
+            frame = frame.detach().cpu().numpy()
+    except ImportError:
+        pass
+
+    if not isinstance(frame, np.ndarray):
+        return None
+
+    arr = np.asarray(frame)
+    # Drop leading singleton batch dims from vectorized render (B, H, W, C) -> (H, W, C).
+    while arr.ndim == 4 and arr.shape[0] == 1:
+        arr = arr[0]
+
+    if arr.ndim == 3 and arr.shape[0] == 3 and arr.shape[-1] != 3:
+        arr = np.transpose(arr, (1, 2, 0))
+
+    if arr.ndim != 3 or arr.shape[-1] != 3:
+        return None
+
+    if arr.dtype != np.uint8:
+        mx = float(np.max(arr)) if arr.size else 0.0
+        if mx <= 1.0 + 1e-6:
+            arr = np.clip(arr * 255.0, 0, 255)
+        arr = np.clip(arr, 0, 255).astype(np.uint8)
+
+    return arr
 
 
 def _try_make_env(
@@ -142,6 +175,9 @@ def _try_make_env(
     vd4rl_eval_obs_downsample: Optional[int] = None,
     vd4rl_eval_seed: int = 0,
     minari_halfcheetah_dataset_id: Optional[str] = None,
+    maniskill_sim_backend: Optional[str] = None,
+    maniskill_reward_mode: Optional[str] = None,
+    maniskill_control_mode: Optional[str] = None,
 ):
     """Create env: LIBERO suite (libero_10, ...) via make_libero_env, else Gymnasium/gym. Returns None if env or deps missing.
     render_both_views is only used for LIBERO (primary + wrist); Gymnasium envs have a single camera.
@@ -175,7 +211,14 @@ def _try_make_env(
     if env_name.startswith("ManiSkill/"):
         from src.envs.maniskill_eval_env import make_maniskill_eval_env
 
-        return make_maniskill_eval_env(env_name, render_mode=render_mode)
+        return make_maniskill_eval_env(
+            env_name,
+            render_mode=render_mode,
+            sim_backend=maniskill_sim_backend,
+            reward_mode=maniskill_reward_mode,
+            control_mode=maniskill_control_mode,
+            reconfiguration_freq=1,
+        )
 
     import gymnasium as gym
 
@@ -583,7 +626,9 @@ def _save_eval_rtg_reward_figure(
                     ax_mr.plot(x_r, r_mean, color=c_r, linewidth=2.0, label="mean ± std")
                     for xb in trial_bounds:
                         if xb < T_plot:
-                            ax_mr.axvline(xb, color="#bbbbbb", linestyle="--", linewidth=0.9, alpha=0.9)
+                            ax_mr.axvline(
+                                xb, color="#bbbbbb", linestyle="--", linewidth=0.9, alpha=0.9
+                            )
                     ax_mr.set_title("Reward / step (mean ± std across sessions)")
                     ax_mr.set_ylabel("env reward")
                     ax_mr.set_xlabel("env steps")
@@ -596,7 +641,9 @@ def _save_eval_rtg_reward_figure(
                     ax_mg.plot(x_g, g_mean, color=c_rtg, linewidth=2.0, label="mean ± std")
                     for xb in trial_bounds:
                         if xb < T_plot:
-                            ax_mg.axvline(xb, color="#bbbbbb", linestyle="--", linewidth=0.9, alpha=0.9)
+                            ax_mg.axvline(
+                                xb, color="#bbbbbb", linestyle="--", linewidth=0.9, alpha=0.9
+                            )
                     ax_mg.set_title("RTG token (before action), mean ± std across sessions")
                     ax_mg.set_ylabel("RTG token")
                     ax_mg.set_xlabel("env steps")
@@ -617,7 +664,9 @@ def _save_eval_rtg_reward_figure(
                     ax_mr.plot(x_r, r_mean, color=c_r, linewidth=2.0, label="mean ± std")
                     for xb in trial_bounds:
                         if xb < T_r:
-                            ax_mr.axvline(xb, color="#bbbbbb", linestyle="--", linewidth=0.9, alpha=0.9)
+                            ax_mr.axvline(
+                                xb, color="#bbbbbb", linestyle="--", linewidth=0.9, alpha=0.9
+                            )
                     ax_mr.set_title("Reward / step (mean ± std across sessions)")
                     ax_mr.set_ylabel("env reward")
                     ax_mr.set_xlabel("env steps")
@@ -1091,6 +1140,7 @@ def run_rollouts_and_save_viz(
     total_prompt_len: Optional[int] = None,
     max_prompt_trajectory_length: Optional[int] = None,
     context_subsample_strategy: str = "none",
+    context_style: str = "subsampled",
     task_description: Optional[str] = None,
     logger: Optional[Any] = None,
     eval_render_both_views: bool = True,
@@ -1105,6 +1155,9 @@ def run_rollouts_and_save_viz(
     minari_halfcheetah_dataset_id: Optional[str] = None,
     num_eval_rollout_videos: Optional[int] = None,
     d4rl_score_ref: Optional[Tuple[float, float]] = None,
+    maniskill_sim_backend: Optional[str] = None,
+    maniskill_reward_mode: Optional[str] = None,
+    maniskill_control_mode: Optional[str] = None,
 ) -> Dict[str, float]:
     """
     Run eval rollouts (and, in zero-shot, ``eval_num_trials`` in-session episodes per session).
@@ -1139,6 +1192,10 @@ def run_rollouts_and_save_viz(
     record frames for. ``None`` = record all when ``save_video`` or W&B video is on. Metrics still
     use every rollout. W&B + disk: one composite ``eval/rollout_video_grid`` / ``all_rollouts.mp4``
     (sessions × trials, or a square grid when ``eval_num_trials==1``); no separate per-rollout videos.
+
+    **``context_style``** must match training (``data.context_style``): ``full_trajectory`` uses
+    per-demo padding to ``max_episode_steps`` then the same global prompt cap as the dataset;
+    ``subsampled`` uses the legacy eval segment shape with training-aligned ``_pad_or_trim_prompt``.
 
     **Zero-shot** (``eval_context_mode=zero_shot_adaptation``): ``num_rollouts`` is the number of
     independent adaptation **sessions** (context reset each session); ``eval_num_trials`` is still
@@ -1193,6 +1250,9 @@ def run_rollouts_and_save_viz(
         vd4rl_eval_obs_downsample=vd4rl_eval_obs_downsample,
         vd4rl_eval_seed=vd4rl_eval_seed,
         minari_halfcheetah_dataset_id=minari_halfcheetah_dataset_id,
+        maniskill_sim_backend=maniskill_sim_backend,
+        maniskill_reward_mode=maniskill_reward_mode,
+        maniskill_control_mode=maniskill_control_mode,
     )
     if env is None:
         if env_name in LIBERO_SUITES:
@@ -1322,9 +1382,10 @@ def run_rollouts_and_save_viz(
             f"[zero_shot eval] Policy: trial 1 = query-only; trials 2+ = ICL prompt from [{ctx_desc}] "
             f"only (fixed during the episode). Query segment: last {current_trial_k} env steps via get_action. "
             f"total_prompt_cap={total_len} max_prompt_traj_len={max_traj_len} "
+            f"context_style={context_style} max_episode_steps={max_episode_steps} "
             f"context_subsample_strategy={context_subsample_strategy} "
             f"query_pad_max_length={ml_model} tokens_per_dt_step={tps}. "
-            f"Eval prompt: variable length (trim only if > total_prompt_cap); train collate left-pads.",
+            f"ICL prompt layout matches training (dataset padding for this context_style).",
             flush=True,
         )
         zs_clip_grid: List[List[Optional[List[np.ndarray]]]] = [
@@ -1414,6 +1475,8 @@ def run_rollouts_and_save_viz(
                         sort_ascending=True,
                         trajectory_returns=rets or None,
                         context_subsample_strategy=context_subsample_strategy,
+                        context_style=context_style,
+                        max_episode_steps=max_episode_steps,
                     )
                     pt = int(prompt_dyn[0].shape[1])
                     meta["prompt_timesteps_in_model"] = pt
@@ -1530,6 +1593,8 @@ def run_rollouts_and_save_viz(
             device,
             sort_ascending=True,
             context_subsample_strategy=context_subsample_strategy,
+            context_style=context_style,
+            max_episode_steps=max_episode_steps,
         )
         _log_eval_transformer_seq(
             model,
@@ -1703,9 +1768,7 @@ def run_rollouts_and_save_viz(
 
             if grouped_zs:
                 R = arr.reshape(N, K)
-                suptitle_sub = (
-                    f"{N} rollouts × {K} trials/rollout · mean return & cum. return ± std across rollouts"
-                )
+                suptitle_sub = f"{N} rollouts × {K} trials/rollout · mean return & cum. return ± std across rollouts"
 
                 cum_x = np.arange(K, dtype=int)
                 per_mean = np.mean(R, axis=0)

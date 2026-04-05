@@ -33,6 +33,7 @@ uv run python scripts/maniskill/run_ppo_wandb_repro.py \
   --config scripts/maniskill/ppo_wandb_repro/configs/PickCube-v1.json
 ```
 
+
 Submit Slurm jobs from the login node (after editing account/partition in `carc_ppo_wandb_repro_single_env.sbatch` or passing them in `SBATCH_EXTRA`). `REPO_ROOT` in the job environment must be this path:
 
 ```bash
@@ -105,19 +106,35 @@ Pass extra flags to `ppo_train_icldata.py` after `--`:
 ENVS_OVERRIDE="PickCube-v1" ./scripts/maniskill/run_ppo_wandb_repro.sh -- --icl-data-root datasets
 ```
 
+### RGB / image observations in `trajectories.h5`
+
+The **full stitched PPO rollout buffer** (`--icl-save-rollout-buffer`, on by default) is **state, actions, and rewards only** — it does not record pixels from training rollouts.
+
+To **append RGB episodes at the end** (final policy, `render_mode=rgb_array`) into the same `<icl_data_root>/maniskill/<env_id>/trajectories.h5`, pass **`--icl-collect-episodes N`** (and optionally **`--icl-max-steps-per-episode`**). Those runs are **extra** on-policy rollouts after training, not a pixel dump of the entire historical buffer.
+
+Example (W&B repro + final-policy RGB episodes):
+
+```bash
+uv run python scripts/maniskill/run_ppo_wandb_repro.py \
+  --config scripts/maniskill/ppo_wandb_repro/configs/PickCube-v1.json \
+  -- --icl-collect-episodes 64 --icl-max-steps-per-episode 512
+```
+
+For **periodic** RGB snapshots during training (separate files under `.../image_snapshots/`), use **`--icl-image-snapshot-every-steps`** and **`--icl-image-snapshot-episodes`** (see `ppo_train_icldata.py` module docstring).
+
 ## Related scripts
 
 | Script | Role |
 |--------|------|
 | `scripts/maniskill/fetch_ppo_wandb_configs.py` | Download W&B hyperparameters → JSON |
-| `scripts/maniskill/run_ppo_wandb_repro.py` | Load JSON, invoke `ppo_train_icldata.py` |
-| `scripts/maniskill/run_ppo_wandb_repro.sh` | Batch default env list or `ENVS_OVERRIDE` |
+| `scripts/maniskill/run_ppo_wandb_repro.py` | Load JSON(s), invoke `ppo_train_icldata.py`; no `--config` → default table-top list; `--all-configs` → every JSON |
+| `scripts/maniskill/run_ppo_wandb_repro.sh` | Reads `default_tabletop_repro_envs.txt` or `ENVS_OVERRIDE` |
 
 ## Slurm: launch all repro jobs at once
 
 Two patterns:
 
-1. **W&B JSON hyperparameters** (this doc): one job per `configs/*.json`.
+1. **W&B JSON hyperparameters** (this doc): by default one job per env in `ppo_wandb_repro/default_tabletop_repro_envs.txt` (10 table-top tasks with bundled JSON). Set `REPRO_ALL_CONFIGS=1` to submit every `configs/*.json` except `manifest.json`.
 
    ```bash
    cd /scr/aliang80/icl_adaptation

@@ -268,7 +268,7 @@ def validate_dataset_paths(env_name: str, paths, data_cfg) -> None:
             d = p.parent
             raise FileNotFoundError(
                 f"ManiSkill trajectories not found under {d} "
-                "(expected trajectories.h5 or legacy trajectories.pkl).\n"
+                "(expected trajectories.h5).\n"
                 "Generate with: python scripts/maniskill/ppo_train_icldata.py --env-id "
                 f"{ms_task} ... (dedicated ManiSkill venv; see docs/MANISKILL.md)"
             )
@@ -957,6 +957,22 @@ def main():
                 "(max_episode_steps * num_context_trajectories)",
                 total_plen,
             )
+        total_epi_per_task = max(1, len(trajectories) // max(1, data_cfg.num_train_tasks))
+        # One shared pool (ManiSkill, single-split VD4RL, etc.) but many task_id buckets: replicate
+        # so prompt_trajectories_per_task[task_id] exists for every traj_idx (see dataset._get_one_sample).
+        if trajectories and prompt_per_task:
+            max_task_id = (len(trajectories) - 1) // total_epi_per_task
+            need_slots = max_task_id + 1
+            if len(prompt_per_task) == 1 and need_slots > 1:
+                pool0 = prompt_per_task[0]
+                prompt_per_task = [pool0 for _ in range(need_slots)]
+                log.info(
+                    "Replicated single prompt pool -> {} task slots (task_id 0..{}; "
+                    "total_epi_per_task={})",
+                    need_slots,
+                    max_task_id,
+                    total_epi_per_task,
+                )
         dataset = get_icl_trajectory_dataset(
             trajectories=trajectories,
             horizon=data_cfg.horizon,
@@ -968,7 +984,7 @@ def main():
             state_dim=state_dim,
             act_dim=action_dim,
             prompt_length=data_cfg.prompt_length,
-            total_epi_per_task=max(1, len(trajectories) // max(1, data_cfg.num_train_tasks)),
+            total_epi_per_task=total_epi_per_task,
             num_context_trajectories=data_cfg.num_context_trajectories,
             randomize_num_context_trajectories=data_cfg.randomize_num_context_trajectories,
             context_sort_ascending=data_cfg.context_sort_ascending,
@@ -1162,6 +1178,15 @@ def main():
         eval_render_both_views = bool(cfg.experiment.eval_render_both_views) and (
             env_name in LIBERO_SUITES
         )
+        ms_sim = OmegaConf.select(data_cfg, "maniskill_sim_backend", default=None)
+        ms_rm = OmegaConf.select(data_cfg, "maniskill_reward_mode", default=None)
+        ms_cm = OmegaConf.select(data_cfg, "maniskill_control_mode", default=None)
+        if isinstance(ms_sim, str) and not ms_sim.strip():
+            ms_sim = None
+        if isinstance(ms_rm, str) and not ms_rm.strip():
+            ms_rm = None
+        if isinstance(ms_cm, str) and not ms_cm.strip():
+            ms_cm = None
         # inference_mode: no autograd graph. Without this, rollout chains ~max_episode_steps forwards
         # via actions_t = cat(..., action) and retains the full graph -> CUDA OOM.
         was_training = model.training
@@ -1189,6 +1214,7 @@ def main():
                     total_prompt_len=dataset.total_prompt_len,
                     max_prompt_trajectory_length=dataset.max_prompt_trajectory_length,
                     context_subsample_strategy=dataset.context_subsample_strategy,
+                    context_style=str(data_cfg.context_style),
                     task_description=task_desc,
                     logger=logger,
                     eval_render_both_views=eval_render_both_views,
@@ -1205,6 +1231,15 @@ def main():
                     minari_halfcheetah_dataset_id=minari_halfcheetah_id,
                     num_eval_rollout_videos=exp_e.num_eval_rollout_videos,
                     d4rl_score_ref=d4rl_score_ref,
+                    maniskill_sim_backend=ms_sim
+                    if str(eval_rollout_env).startswith("ManiSkill/")
+                    else None,
+                    maniskill_reward_mode=ms_rm
+                    if str(eval_rollout_env).startswith("ManiSkill/")
+                    else None,
+                    maniskill_control_mode=ms_cm
+                    if str(eval_rollout_env).startswith("ManiSkill/")
+                    else None,
                 )
                 if cfg.experiment.run_action_compare_eval and dataset.trajectories:
                     action_metrics = run_action_compare_eval(

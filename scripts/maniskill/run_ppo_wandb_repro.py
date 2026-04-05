@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Run ``ppo_train_icldata.py`` using hyperparameters saved from W&B (see ``fetch_ppo_wandb_configs.py``).
 
-Uses the JSON files under ``scripts/maniskill/ppo_wandb_repro/configs/*.json``.
+With ``--config``: one JSON file. With no ``--config``: runs the default table-top list in
+``default_tabletop_repro_envs.txt`` (next to ``configs/``). Use ``--all-configs`` to run every
+JSON except ``manifest.json``.
 
 Example (ManiSkill venv, from repo root)::
 
@@ -11,6 +13,7 @@ Or directly::
 
   python scripts/maniskill/run_ppo_wandb_repro.py --config scripts/maniskill/ppo_wandb_repro/configs/PickCube-v1.json --seed 1788
 """
+
 from __future__ import annotations
 
 import argparse
@@ -19,6 +22,18 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+
+
+def _load_default_repro_env_ids(list_path: Path) -> list[str]:
+    """First column of each non-empty, non-comment line in ``default_tabletop_repro_envs.txt``."""
+    text = list_path.read_text(encoding="utf-8")
+    ids: list[str] = []
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        ids.append(line.split()[0])
+    return ids
 
 
 def _ppo_args_to_argv(ppo: dict) -> list[str]:
@@ -63,7 +78,13 @@ def main() -> None:
         "--config-dir",
         type=Path,
         default=default_config_dir,
-        help="Run every *.json in this directory except manifest.json (default: bundled configs)",
+        help="Directory of JSON exports (used when --config is omitted)",
+    )
+    parser.add_argument(
+        "--all-configs",
+        action="store_true",
+        help="With --config-dir (default), run every *.json except manifest.json; "
+        "default is only envs in default_tabletop_repro_envs.txt next to configs/",
     )
     parser.add_argument(
         "--only-env",
@@ -71,7 +92,9 @@ def main() -> None:
         default=None,
         help="When using --config-dir, restrict to this env_id (e.g. PickCube-v1)",
     )
-    parser.add_argument("--seed", type=int, default=None, help="Single seed; default = all seeds in JSON")
+    parser.add_argument(
+        "--seed", type=int, default=None, help="Single seed; default = all seeds in JSON"
+    )
     parser.add_argument(
         "--python",
         type=Path,
@@ -104,16 +127,34 @@ def main() -> None:
         extra_from_flag = ex
     args.extra = extra_from_flag + passthrough
 
-    py = args.python or Path(os.environ.get("MANISKILL_PYTHON", _default_maniskill_python(repo_root)))
+    py = args.python or Path(
+        os.environ.get("MANISKILL_PYTHON", _default_maniskill_python(repo_root))
+    )
 
     config_files: list[Path] = []
     if args.config:
         config_files = [args.config]
     else:
-        for p in sorted(args.config_dir.glob("*.json")):
-            if p.name == "manifest.json":
-                continue
-            config_files.append(p)
+        all_json = sorted(p for p in args.config_dir.glob("*.json") if p.name != "manifest.json")
+        if args.all_configs:
+            config_files = all_json
+        else:
+            list_path = args.config_dir.parent / "default_tabletop_repro_envs.txt"
+            if not list_path.is_file():
+                parser.error(
+                    f"No --config given and missing {list_path}; pass --config, "
+                    f"--all-configs, or add default_tabletop_repro_envs.txt."
+                )
+            allow = _load_default_repro_env_ids(list_path)
+            if not allow:
+                parser.error(f"No env ids parsed from {list_path}.")
+            by_stem = {p.stem: p for p in all_json}
+            for e in allow:
+                if e not in by_stem:
+                    print(
+                        f"[skip] no JSON for default env {e} in {args.config_dir}", file=sys.stderr
+                    )
+            config_files = [by_stem[e] for e in allow if e in by_stem]
 
     if not config_files:
         parser.error("No config files found (pass --config or use --config-dir with JSON exports).")

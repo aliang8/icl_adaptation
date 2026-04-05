@@ -16,11 +16,10 @@ if [ -x "${MANISKILL_VENV}/bin/python" ]; then
   export MANISKILL_PYTHON="${MANISKILL_PYTHON:-${MANISKILL_VENV}/bin/python}"
 fi
 
-# Space-separated env ids from train_ppo_many_envs.sh that also exist in the W&B export.
-# Missing from that report (no PPO state walltime_efficient runs): PickCubeSO100-v1,
-# PickCubeWidowXAI-v1, PlaceSphere-v1, PlugCharger-v1, PullCubeTool-v1.
-DEFAULT_WANDB_ENVS="LiftPegUpright-v1 PegInsertionSide-v1 PickCube-v1 PickSingleYCB-v1 PokeCube-v1 PullCube-v1 PushCube-v1 PushT-v1 RollBall-v1 StackCube-v1"
+# Default batch list: scripts/maniskill/ppo_wandb_repro/default_tabletop_repro_envs.txt
+# ENVS_OVERRIDE still accepts any env that has configs/<id>.json.
 ENVS_OVERRIDE="${ENVS_OVERRIDE:-}"
+DEFAULT_ENV_FILE="${ROOT}/scripts/maniskill/ppo_wandb_repro/default_tabletop_repro_envs.txt"
 
 DRY=""
 if [ "${DRY_RUN:-0}" != "0" ]; then
@@ -44,7 +43,11 @@ if [ -n "${ENVS_OVERRIDE}" ]; then
       ${DRY} --config "${CFG}" "${SEED_ARG[@]}" "$@"
   done
 else
-  for e in ${DEFAULT_WANDB_ENVS}; do
+  if [ ! -f "${DEFAULT_ENV_FILE}" ]; then
+    echo "Missing default env list: ${DEFAULT_ENV_FILE}" >&2
+    exit 1
+  fi
+  while IFS= read -r e; do
     CFG="${ROOT}/scripts/maniskill/ppo_wandb_repro/configs/${e}.json"
     if [ ! -f "${CFG}" ]; then
       echo "skip missing config: ${e}" >&2
@@ -52,5 +55,5 @@ else
     fi
     uv run python "${ROOT}/scripts/maniskill/run_ppo_wandb_repro.py" \
       ${DRY} --config "${CFG}" "${SEED_ARG[@]}" "$@"
-  done
+  done < <(awk '!/^[[:space:]]*#/ && NF { print $1 }' "${DEFAULT_ENV_FILE}")
 fi

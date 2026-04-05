@@ -1,6 +1,6 @@
 # ManiSkill integration
 
-This repo can train **in-context (ICL) models** on trajectories generated in [ManiSkill](https://github.com/haosulab/ManiSkill) using the upstream **PPO** recipe, extended to export **`trajectories.h5`** (HDF5, gzip-compressed episodes) compatible with `get_icl_trajectory_dataset` / `train.py`. Legacy **`trajectories.pkl`** files are still loaded if no `.h5` is present.
+This repo can train **in-context (ICL) models** on trajectories generated in [ManiSkill](https://github.com/haosulab/ManiSkill) using the upstream **PPO** recipe, extended to export **`trajectories.h5`** (HDF5, gzip-compressed episodes) compatible with `get_icl_trajectory_dataset` / `train.py`.
 
 ## Install
 
@@ -104,15 +104,15 @@ Re-run `python scripts/maniskill/test_maniskill.py` (or `MANISKILL_SMOKE_SIM=cud
 
 Script: `scripts/maniskill/ppo_train_icldata.py` (upstream [`examples/baselines/ppo/ppo.py`](https://github.com/haosulab/ManiSkill/tree/main/examples/baselines/ppo) plus ICL export).
 
-Output: `datasets/maniskill/<env_id>/trajectories.h5` (override with `--icl-data-root`).
+Output: `datasets/maniskill/<env_id>/trajectories.h5` (override with `--icl-data-root`). The file uses **flat HDF5 v2**: a single time axis for `observations`, `actions`, `rewards`, `terminals`, plus `episode_starts` and `episode_lengths` (one entry per episode) and optional `episode_meta_json` per episode.
 
 - **`--icl-save-rollout-buffer` (default: True)** — stitches **every** on-policy PPO rollout (all training steps) into episode dicts: **state**, **actions**, **rewards** (env units; PPO `reward_scale` undone). **No RGB** (rendering each env step during training would be far too slow). Disable with `--no-icl-save-rollout-buffer`. When ManiSkill reports `final_info` / `episode` metrics, each finished episode also gets an **`episode_meta`** dict (e.g. `success_once`, `success_at_end`, `fail_once`, `fail_at_end`, env `return`, `episode_len`).
 - **`--icl-collect-episodes` (default: 0)** — optional **extra** rollouts with the **final** policy using `env.render()`, so those trajectories can include **`images`**. Appended into the main `trajectories.h5` when > 0.
-- **RGB during training** — `--icl-image-snapshot-every-steps N` (with `--icl-image-snapshot-episodes X`, default 8) saves separate pickles whenever total **env steps** first cross each multiple of `N` (after that iteration’s PPO update):
+- **RGB during training** — `--icl-image-snapshot-every-steps N` (with `--icl-image-snapshot-episodes X`, default 8) writes separate snapshot `.h5` files whenever total **env steps** first cross each multiple of `N` (after that iteration’s PPO update):
 
   `datasets/maniskill/<env_id>/image_snapshots/trajectories_step_XXXXXXXX.h5`
 
-  The `XXXXXXXX` is the **step boundary** (e.g. `00050000` for the first snapshot at ≥50k steps). Each file contains `X` episodes with **state + RGB** (same schema as other ICL trajectories). At most **one** snapshot per training iteration (largest `N`-aligned boundary ≤ `global_step`). `train.py` looks for **`maniskill/<env_id>/trajectories.h5`** first, then legacy **`trajectories.pkl`**; to ICL-train on one snapshot file, copy or symlink it to that path (or merge files offline).
+  The `XXXXXXXX` is the **step boundary** (e.g. `00050000` for the first snapshot at ≥50k steps). Each file contains `X` episodes with **state + RGB** (same schema as other ICL trajectories). At most **one** snapshot per training iteration (largest `N`-aligned boundary ≤ `global_step`). `train.py` resolves **`maniskill/<env_id>/trajectories.h5`**; to ICL-train on one snapshot file, copy or symlink it to that path (or merge files offline).
 
 Very long runs produce **many** episodes in the main rollout buffer; the list is held in RAM until the end of training.
 
@@ -160,14 +160,15 @@ python scripts/maniskill/ppo_train_icldata.py \
 
 **Where to run `src/train.py`**
 
-- **Main project env** (`uv run python -m src.train`): loads `trajectories.h5` / `.pkl` fine, but **`mani-skill` is not installed** in that lockfile. **Periodic sim eval** (`experiment.eval_every_steps` > 0) needs ManiSkill — either set **`experiment.eval_every_steps=0`** for offline-only training, or use the ManiSkill venv below.
-- **ManiSkill venv** + **`pip install -r scripts/maniskill/requirements_icl_train.txt`** + **`PYTHONPATH=<repo>`**: run `python -m src.train` **without** `uv run`; eval rollouts use the real simulator (see install subsection above).
+- **Main project env** (`uv run python -m src.train`): loads `trajectories.h5` fine, but **`mani-skill` is not installed** in that lockfile. **Periodic sim eval** (`experiment.eval_every_steps` > 0) needs `mani_skill` importable in **that same interpreter** — either set **`experiment.eval_every_steps=0`** for offline-only training, install ManiSkill into the uv env, or run training with **`.venv-maniskill/bin/python -m src.train`** (not `uv run`), with **`PYTHONPATH=<repo>`** and **`pip install -r scripts/maniskill/requirements_icl_train.txt`** (note the **`-r`** flag).
+- **ManiSkill venv** + **`pip install -r scripts/maniskill/requirements_icl_train.txt`** + **`PYTHONPATH=<repo>`**: eval rollouts use the same `gym.make` kwargs as PPO where configured (`data.maniskill_sim_backend`, `maniskill_reward_mode`, `maniskill_control_mode` in `maniskill_pickcube.yaml`), plus **`FlattenActionSpaceWrapper`** when the task uses a `Dict` action space.
 
 **Config**
 
 1. Set **`data.env_name`** to `ManiSkill/<env_id>` (same `--env-id` as PPO, e.g. `ManiSkill/PushCube-v1`).
-2. Ensure **`paths.data_root`** contains `maniskill/<env_id>/trajectories.h5` (or legacy `.pkl`; default layout: PPO writes under `--icl-data-root`, e.g. `datasets/maniskill/<env_id>/trajectories.h5`).
+2. Ensure **`paths.data_root`** contains `maniskill/<env_id>/trajectories.h5` (PPO writes under `--icl-data-root`, e.g. `datasets/maniskill/<env_id>/trajectories.h5`).
 3. If trajectories include **`images`**, enable vision in config: **`data.use_vision: true`** and **`model.use_vision: true`** (and set `model` image / encoder fields as for other vision datasets).
+4. **Full-trajectory ICL** (`data.context_style: full_trajectory`): each context trajectory is padded or truncated to **`data.max_episode_steps`** before concatenation into the prompt (masked padding), so variable-length demos align before `max_total_prompt_length` trimming.
 
 **Run training** (example; use your experiment/model config as usual):
 

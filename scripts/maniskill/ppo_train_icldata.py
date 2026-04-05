@@ -1,8 +1,9 @@
 """
 PPO training for ManiSkill (from upstream ``examples/baselines/ppo/ppo.py``) with ICL export.
 
-Writes ``<icl_data_root>/maniskill/<env_id>/trajectories.h5`` (HDF5, gzip) for
-``get_icl_trajectory_dataset`` / ``train.py`` (``data.env_name=ManiSkill/<env_id>``).
+Writes ``<icl_data_root>/maniskill/<env_id>/trajectories.h5`` — flat HDF5 (concatenated timesteps,
+``episode_starts`` / ``episode_lengths``, gzip chunks) for ``get_icl_trajectory_dataset`` / ``train.py``
+(``data.env_name=ManiSkill/<env_id>``).
 
 By default **stitches the full on-policy PPO rollout stream** (all training iterations) into
 episode dicts: **state**, **actions**, **rewards** (env units; unscaled from PPO ``reward_scale``),
@@ -10,12 +11,17 @@ plus optional **episode_meta** (ManiSkill success/length metrics from ``final_in
 **RGB:** use ``--icl-image-snapshot-every-steps N`` and ``--icl-image-snapshot-episodes X`` to write
 ``image_snapshots/trajectories_step_XXXXXXXX.h5`` when training crosses each ``N`` env-step boundary
 (policy after that iteration's update). Optional ``--icl-collect-episodes`` appends final-policy RGB
-episodes into the main ``trajectories.h5``.
+episodes into the main ``trajectories.h5``. Use ``--icl-rgb-resize-hw 256`` (default) to store frames at
+256×256 (human render camera is set to that size in ManiSkill so ``env.render()`` is not full-res then resized).
+Set ``0`` for native task camera resolution. Snapshot HDF5 image compression defaults to
+``lzf`` (``--icl-snapshot-hdf5-image-compression``); use ``none`` for fastest writes or ``gzip`` for smaller files.
+RGB rollouts use ``--icl-rgb-collect-num-envs`` parallel ManiSkill envs (GPU ``physx_cuda``; ``physx_cpu`` forces 1).
 
 Requires: ``pip install mani-skill tyro`` (see ``docs/MANISKILL.md``). Weights & Biases is **on** by default
 (``--track``); use ``--no-track`` for offline runs. Eval runs every ``eval_freq`` policy iterations and is logged
 as ``eval/*`` (and ``train/*`` episode metrics when episodes complete during rollouts).
 """
+
 import os
 import random
 import sys
@@ -23,7 +29,7 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path as _Path
-from typing import Optional
+from typing import Any, Optional
 
 import gymnasium as gym
 
@@ -154,11 +160,17 @@ class Args:
     icl_export_only: bool = False
     """If True, skip PPO; load ``--checkpoint`` and only write ICL ``trajectories.h5``."""
     icl_image_snapshot_every_steps: int = 0
-    """If >0, save RGB trajectory pickles when training crosses each ``N`` env-step boundary (after update)."""
+    """If >0, save RGB trajectory snapshot ``.h5`` when training crosses each ``N`` env-step boundary (after update)."""
     icl_image_snapshot_episodes: int = 8
     """Episodes per RGB snapshot (``icl_image_snapshot_every_steps`` > 0)."""
     icl_image_snapshot_max_steps: int = 512
     """Max env steps per episode in RGB snapshots."""
+    icl_rgb_resize_hw: int = 256
+    """If >0, set ManiSkill ``human_render_camera_configs`` to H=W and store RGB at that size (resize is a no-op if render matches). 0=native."""
+    icl_snapshot_hdf5_image_compression: str = "lzf"
+    """Periodic image snapshots only: ``gzip`` (smaller), ``lzf`` (faster), or ``none`` (fastest, largest)."""
+    icl_rgb_collect_num_envs: int = 8
+    """Parallel envs for RGB rollouts (snapshots + ``icl_collect_episodes``). 1=serial. >1 needs ``physx_cuda``."""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -169,13 +181,42 @@ class Args:
     """the number of iterations (computed in runtime)"""
 
 
+def _icl_rgb_resize_hw(args: Args) -> Optional[int]:
+    h = int(args.icl_rgb_resize_hw)
+    return h if h > 0 else None
+
+
 def _mani_skill_env_kwargs(args: Args) -> dict:
     kw = dict(obs_mode="state", render_mode="rgb_array", sim_backend=args.sim_backend)
     if args.reward_mode is not None:
         kw["reward_mode"] = args.reward_mode
     if args.control_mode is not None:
         kw["control_mode"] = args.control_mode
+    rh = int(args.icl_rgb_resize_hw)
+    if rh > 0:
+        # Avoid full-res GPU render + CPU/GPU downscale: match rgb_array camera to HDF5 target (e.g. 256).
+        kw["human_render_camera_configs"] = dict(width=rh, height=rh)
     return kw
+
+
+def _make_rgb_collect_vector_env(args: Args, num_episodes_cap: int, *, tag: str = "") -> Any:
+    """Vector env for ``collect_episodes_vector_env`` (batched RGB). ``num_envs>1`` requires GPU sim."""
+    want = max(1, min(int(args.icl_rgb_collect_num_envs), int(num_episodes_cap)))
+    kw = _mani_skill_env_kwargs(args)
+    n = want
+    sim = str(args.sim_backend).strip().lower()
+    if sim == "physx_cpu":
+        if n > 1:
+            print(
+                f"[ICL RGB{tag}] physx_cpu: using num_envs=1 (parallel RGB needs physx_cuda).",
+                flush=True,
+            )
+        n = 1
+    kw["reconfiguration_freq"] = 0 if n > 1 else 1
+    env = gym.make(args.env_id, num_envs=n, **kw)
+    if isinstance(env.action_space, gym.spaces.Dict):
+        env = FlattenActionSpaceWrapper(env)
+    return ManiSkillVectorEnv(env, n, ignore_terminations=False, record_metrics=True)
 
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
@@ -203,12 +244,17 @@ class Agent(nn.Module):
             nn.Tanh(),
             layer_init(nn.Linear(256, 256)),
             nn.Tanh(),
-            layer_init(nn.Linear(256, np.prod(envs.single_action_space.shape)), std=0.01*np.sqrt(2)),
+            layer_init(
+                nn.Linear(256, np.prod(envs.single_action_space.shape)), std=0.01 * np.sqrt(2)
+            ),
         )
-        self.actor_logstd = nn.Parameter(torch.ones(1, np.prod(envs.single_action_space.shape)) * -0.5)
+        self.actor_logstd = nn.Parameter(
+            torch.ones(1, np.prod(envs.single_action_space.shape)) * -0.5
+        )
 
     def get_value(self, x):
         return self.critic(x)
+
     def get_action(self, x, deterministic=False):
         action_mean = self.actor_mean(x)
         if deterministic:
@@ -217,6 +263,7 @@ class Agent(nn.Module):
         action_std = torch.exp(action_logstd)
         probs = Normal(action_mean, action_std)
         return probs.sample()
+
     def get_action_and_value(self, x, action=None):
         action_mean = self.actor_mean(x)
         action_logstd = self.actor_logstd.expand_as(action_mean)
@@ -226,22 +273,26 @@ class Agent(nn.Module):
             action = probs.sample()
         return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), self.critic(x)
 
+
 class Logger:
     def __init__(self, log_wandb=False, tensorboard: SummaryWriter = None) -> None:
         self.writer = tensorboard
         self.log_wandb = log_wandb
+
     def add_scalar(self, tag, scalar_value, step):
         if self.log_wandb:
             import wandb as _wandb
 
             _wandb.log({tag: scalar_value}, step=step)
         self.writer.add_scalar(tag, scalar_value, step)
+
     def close(self):
         self.writer.close()
         if self.log_wandb:
             import wandb as _wandb
 
             _wandb.finish()
+
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
@@ -253,7 +304,6 @@ if __name__ == "__main__":
         run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     else:
         run_name = args.exp_name
-
 
     # TRY NOT TO MODIFY: seeding
     random.seed(args.seed)
@@ -271,15 +321,13 @@ if __name__ == "__main__":
                 "icl_export_only requires --icl-collect-episodes >= 1 "
                 "(no training rollouts to stitch in export-only mode)."
             )
-        env_kwargs = _mani_skill_env_kwargs(args)
-        env_one = gym.make(args.env_id, num_envs=1, reconfiguration_freq=1, **env_kwargs)
-        if isinstance(env_one.action_space, gym.spaces.Dict):
-            env_one = FlattenActionSpaceWrapper(env_one)
-        env_one = ManiSkillVectorEnv(env_one, 1, ignore_terminations=False, record_metrics=True)
+        env_one = _make_rgb_collect_vector_env(args, args.icl_collect_episodes, tag=" export_only")
         agent = Agent(env_one).to(device)
         agent.load_state_dict(torch.load(args.checkpoint, map_location=device))
         al = torch.from_numpy(env_one.single_action_space.low).to(device)
         ah = torch.from_numpy(env_one.single_action_space.high).to(device)
+        _rsz = _icl_rgb_resize_hw(args)
+        t0 = time.perf_counter()
         trajs = collect_episodes_vector_env(
             env_one,
             agent,
@@ -288,17 +336,38 @@ if __name__ == "__main__":
             args.icl_max_steps_per_episode,
             al,
             ah,
+            rgb_resize_hw=_rsz,
+        )
+        t1 = time.perf_counter()
+        print(
+            f"[ICL export_only] collection finished: episodes={len(trajs)} "
+            f"collect_s={t1 - t0:.2f} -> writing HDF5...",
+            flush=True,
         )
         out_path = default_icl_export_path(args.icl_data_root, args.env_id)
         save_trajectories_hdf5(trajs, out_path)
-        print(f"[ICL export_only] Saved {len(trajs)} trajectories to {out_path.resolve()}")
+        t2 = time.perf_counter()
+        print(
+            f"[ICL export_only] Saved {len(trajs)} trajectories to {out_path.resolve()} "
+            f"(rgb_hw={_rsz or 'native'} collect_s={t1 - t0:.2f} hdf5_s={t2 - t1:.2f} total_s={t2 - t0:.2f})"
+        )
         env_one.close()
         sys.exit(0)
 
     # env setup
     env_kwargs = _mani_skill_env_kwargs(args)
-    envs = gym.make(args.env_id, num_envs=args.num_envs if not args.evaluate else 1, reconfiguration_freq=args.reconfiguration_freq, **env_kwargs)
-    eval_envs = gym.make(args.env_id, num_envs=args.num_eval_envs, reconfiguration_freq=args.eval_reconfiguration_freq, **env_kwargs)
+    envs = gym.make(
+        args.env_id,
+        num_envs=args.num_envs if not args.evaluate else 1,
+        reconfiguration_freq=args.reconfiguration_freq,
+        **env_kwargs,
+    )
+    eval_envs = gym.make(
+        args.env_id,
+        num_envs=args.num_eval_envs,
+        reconfiguration_freq=args.eval_reconfiguration_freq,
+        **env_kwargs,
+    )
     if isinstance(envs.action_space, gym.spaces.Dict):
         envs = FlattenActionSpaceWrapper(envs)
         eval_envs = FlattenActionSpaceWrapper(eval_envs)
@@ -308,12 +377,35 @@ if __name__ == "__main__":
             eval_output_dir = f"{os.path.dirname(args.checkpoint)}/test_videos"
         print(f"Saving eval videos to {eval_output_dir}")
         if args.save_train_video_freq is not None:
-            save_video_trigger = lambda x : (x // args.num_steps) % args.save_train_video_freq == 0
-            envs = RecordEpisode(envs, output_dir=f"runs/{run_name}/train_videos", save_trajectory=False, save_video_trigger=save_video_trigger, max_steps_per_video=args.num_steps, video_fps=30)
-        eval_envs = RecordEpisode(eval_envs, output_dir=eval_output_dir, save_trajectory=args.evaluate, trajectory_name="trajectory", max_steps_per_video=args.num_eval_steps, video_fps=30)
-    envs = ManiSkillVectorEnv(envs, args.num_envs, ignore_terminations=not args.partial_reset, record_metrics=True)
-    eval_envs = ManiSkillVectorEnv(eval_envs, args.num_eval_envs, ignore_terminations=not args.eval_partial_reset, record_metrics=True)
-    assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
+            save_video_trigger = lambda x: (x // args.num_steps) % args.save_train_video_freq == 0
+            envs = RecordEpisode(
+                envs,
+                output_dir=f"runs/{run_name}/train_videos",
+                save_trajectory=False,
+                save_video_trigger=save_video_trigger,
+                max_steps_per_video=args.num_steps,
+                video_fps=30,
+            )
+        eval_envs = RecordEpisode(
+            eval_envs,
+            output_dir=eval_output_dir,
+            save_trajectory=args.evaluate,
+            trajectory_name="trajectory",
+            max_steps_per_video=args.num_eval_steps,
+            video_fps=30,
+        )
+    envs = ManiSkillVectorEnv(
+        envs, args.num_envs, ignore_terminations=not args.partial_reset, record_metrics=True
+    )
+    eval_envs = ManiSkillVectorEnv(
+        eval_envs,
+        args.num_eval_envs,
+        ignore_terminations=not args.eval_partial_reset,
+        record_metrics=True,
+    )
+    assert isinstance(envs.single_action_space, gym.spaces.Box), (
+        "only continuous action space is supported"
+    )
 
     max_episode_steps = gym_utils.find_max_episode_steps_value(envs._env)
     logger = None
@@ -321,6 +413,7 @@ if __name__ == "__main__":
         print("Running training")
         if args.track:
             import wandb
+
             config = vars(args)
             _rm = args.reward_mode if args.reward_mode is not None else "normalized_dense"
             # Merge without duplicate keys: env_kwargs may already contain reward_mode (W&B repro JSON).
@@ -357,7 +450,8 @@ if __name__ == "__main__":
         writer = SummaryWriter(f"runs/{run_name}")
         writer.add_text(
             "hyperparameters",
-            "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
+            "|param|value|\n|-|-|\n%s"
+            % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
         )
         logger = Logger(log_wandb=args.track, tensorboard=writer)
     else:
@@ -367,8 +461,12 @@ if __name__ == "__main__":
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
     # ALGO Logic: Storage setup
-    obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
-    actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
+    obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(
+        device
+    )
+    actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(
+        device
+    )
     logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
     rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
     dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
@@ -381,10 +479,18 @@ if __name__ == "__main__":
     eval_obs, _ = eval_envs.reset(seed=args.seed)
     next_done = torch.zeros(args.num_envs, device=device)
     print("####")
-    print(f"args.num_iterations={args.num_iterations} args.num_envs={args.num_envs} args.num_eval_envs={args.num_eval_envs}")
-    print(f"args.minibatch_size={args.minibatch_size} args.batch_size={args.batch_size} args.update_epochs={args.update_epochs}")
+    print(
+        f"args.num_iterations={args.num_iterations} args.num_envs={args.num_envs} args.num_eval_envs={args.num_eval_envs}"
+    )
+    print(
+        f"args.minibatch_size={args.minibatch_size} args.batch_size={args.batch_size} args.update_epochs={args.update_epochs}"
+    )
     print("####")
-    action_space_low, action_space_high = torch.from_numpy(envs.single_action_space.low).to(device), torch.from_numpy(envs.single_action_space.high).to(device)
+    action_space_low, action_space_high = (
+        torch.from_numpy(envs.single_action_space.low).to(device),
+        torch.from_numpy(envs.single_action_space.high).to(device),
+    )
+
     def clip_action(action: torch.Tensor):
         return torch.clamp(action.detach(), action_space_low, action_space_high)
 
@@ -400,14 +506,8 @@ if __name__ == "__main__":
         and args.icl_image_snapshot_every_steps > 0
         and args.icl_image_snapshot_episodes > 0
     ):
-        skw = _mani_skill_env_kwargs(args)
-        snapshot_cenv = gym.make(
-            args.env_id, num_envs=1, reconfiguration_freq=1, **skw
-        )
-        if isinstance(snapshot_cenv.action_space, gym.spaces.Dict):
-            snapshot_cenv = FlattenActionSpaceWrapper(snapshot_cenv)
-        snapshot_cenv = ManiSkillVectorEnv(
-            snapshot_cenv, 1, ignore_terminations=False, record_metrics=True
+        snapshot_cenv = _make_rgb_collect_vector_env(
+            args, args.icl_image_snapshot_episodes, tag=" snapshot"
         )
         snapshot_al = torch.from_numpy(snapshot_cenv.single_action_space.low).to(device)
         snapshot_ah = torch.from_numpy(snapshot_cenv.single_action_space.high).to(device)
@@ -428,13 +528,17 @@ if __name__ == "__main__":
             num_episodes = 0
             for _ in range(args.num_eval_steps):
                 with torch.no_grad():
-                    eval_obs, eval_rew, eval_terminations, eval_truncations, eval_infos = eval_envs.step(agent.get_action(eval_obs, deterministic=True))
+                    eval_obs, eval_rew, eval_terminations, eval_truncations, eval_infos = (
+                        eval_envs.step(agent.get_action(eval_obs, deterministic=True))
+                    )
                     if "final_info" in eval_infos:
                         mask = eval_infos["_final_info"]
                         num_episodes += int(mask.sum().item())
                         for k, v in eval_infos["final_info"]["episode"].items():
                             eval_metrics[k].append(v)
-            print(f"Evaluated {args.num_eval_steps * args.num_eval_envs} steps resulting in {num_episodes} episodes")
+            print(
+                f"Evaluated {args.num_eval_steps * args.num_eval_envs} steps resulting in {num_episodes} episodes"
+            )
             if logger is not None:
                 logger.add_scalar("eval/iteration", float(iteration), global_step)
                 logger.add_scalar("eval/num_completed_episodes", float(num_episodes), global_step)
@@ -487,10 +591,14 @@ if __name__ == "__main__":
                 if icl_meta_grid is not None and isinstance(final_info.get("episode"), dict):
                     ep = final_info["episode"]
                     for e in range(args.num_envs):
-                        if bool(done_mask[e].item() if torch.is_tensor(done_mask) else done_mask[e]):
+                        if bool(
+                            done_mask[e].item() if torch.is_tensor(done_mask) else done_mask[e]
+                        ):
                             icl_meta_grid[step, e] = episode_meta_from_final_info(ep, e)
                 with torch.no_grad():
-                    final_values[step, torch.arange(args.num_envs, device=device)[done_mask]] = agent.get_value(infos["final_observation"][done_mask]).view(-1)
+                    final_values[step, torch.arange(args.num_envs, device=device)[done_mask]] = (
+                        agent.get_value(infos["final_observation"][done_mask]).view(-1)
+                    )
         rollout_time = time.time() - rollout_time
         if args.icl_save_rollout_buffer and not args.evaluate:
             append_ppo_rollout_to_episode_buffers(
@@ -515,7 +623,7 @@ if __name__ == "__main__":
                 else:
                     next_not_done = 1.0 - dones[t + 1]
                     nextvalues = values[t + 1]
-                real_next_values = next_not_done * nextvalues + final_values[t] # t instead of t+1
+                real_next_values = next_not_done * nextvalues + final_values[t]  # t instead of t+1
                 # next_not_done means nextvalues is computed from the correct next_obs
                 # if next_not_done is 1, final_values is always 0
                 # if next_not_done is 0, then use final_values, which is computed according to bootstrap_at_done
@@ -528,22 +636,29 @@ if __name__ == "__main__":
                     lambda^3      *(  -V(s_t)  + r_t + gamma * r_{t+1} + gamma^2 * r_{t+2} + gamma^3 * r_{t+3}
                     We then normalize it by the sum of the lambda^i (instead of 1-lambda)
                     """
-                    if t == args.num_steps - 1: # initialize
-                        lam_coef_sum = 0.
-                        reward_term_sum = 0. # the sum of the second term
-                        value_term_sum = 0. # the sum of the third term
+                    if t == args.num_steps - 1:  # initialize
+                        lam_coef_sum = 0.0
+                        reward_term_sum = 0.0  # the sum of the second term
+                        value_term_sum = 0.0  # the sum of the third term
                     lam_coef_sum = lam_coef_sum * next_not_done
                     reward_term_sum = reward_term_sum * next_not_done
                     value_term_sum = value_term_sum * next_not_done
 
                     lam_coef_sum = 1 + args.gae_lambda * lam_coef_sum
-                    reward_term_sum = args.gae_lambda * args.gamma * reward_term_sum + lam_coef_sum * rewards[t]
-                    value_term_sum = args.gae_lambda * args.gamma * value_term_sum + args.gamma * real_next_values
+                    reward_term_sum = (
+                        args.gae_lambda * args.gamma * reward_term_sum + lam_coef_sum * rewards[t]
+                    )
+                    value_term_sum = (
+                        args.gae_lambda * args.gamma * value_term_sum
+                        + args.gamma * real_next_values
+                    )
 
                     advantages[t] = (reward_term_sum + value_term_sum) / lam_coef_sum - values[t]
                 else:
                     delta = rewards[t] + args.gamma * real_next_values - values[t]
-                    advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * next_not_done * lastgaelam # Here actually we should use next_not_terminated, but we don't have lastgamlam if terminated
+                    advantages[t] = lastgaelam = (
+                        delta + args.gamma * args.gae_lambda * next_not_done * lastgaelam
+                    )  # Here actually we should use next_not_terminated, but we don't have lastgamlam if terminated
             returns = advantages + values
 
         # flatten the batch
@@ -565,7 +680,9 @@ if __name__ == "__main__":
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
 
-                _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions[mb_inds])
+                _, newlogprob, entropy, newvalue = agent.get_action_and_value(
+                    b_obs[mb_inds], b_actions[mb_inds]
+                )
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
 
@@ -580,11 +697,15 @@ if __name__ == "__main__":
 
                 mb_advantages = b_advantages[mb_inds]
                 if args.norm_adv:
-                    mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
+                    mb_advantages = (mb_advantages - mb_advantages.mean()) / (
+                        mb_advantages.std() + 1e-8
+                    )
 
                 # Policy loss
                 pg_loss1 = -mb_advantages * ratio
-                pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
+                pg_loss2 = -mb_advantages * torch.clamp(
+                    ratio, 1 - args.clip_coef, 1 + args.clip_coef
+                )
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
                 # Value loss
@@ -632,13 +753,25 @@ if __name__ == "__main__":
         logger.add_scalar("time/step", global_step, global_step)
         logger.add_scalar("time/update_time", update_time, global_step)
         logger.add_scalar("time/rollout_time", rollout_time, global_step)
-        logger.add_scalar("time/rollout_fps", args.num_envs * args.num_steps / rollout_time, global_step)
+        logger.add_scalar(
+            "time/rollout_fps", args.num_envs * args.num_steps / rollout_time, global_step
+        )
 
         if snapshot_cenv is not None:
             Nsnap = int(args.icl_image_snapshot_every_steps)
             boundary = (global_step // Nsnap) * Nsnap
             if boundary > 0 and boundary > last_icl_image_snap_boundary:
+                snap_path = icl_image_snapshot_path(args.icl_data_root, args.env_id, boundary)
+                _rsz_snap = _icl_rgb_resize_hw(args)
+                print(
+                    f"[ICL image snapshot] start: step_boundary={boundary} global_step={global_step} "
+                    f"episodes={args.icl_image_snapshot_episodes} max_steps={args.icl_image_snapshot_max_steps} "
+                    f"num_envs={snapshot_cenv.num_envs} rgb_hw={_rsz_snap or 'native'} "
+                    f"out={snap_path.resolve()}",
+                    flush=True,
+                )
                 agent.eval()
+                t_snap0 = time.perf_counter()
                 snap_trajs = collect_episodes_vector_env(
                     snapshot_cenv,
                     agent,
@@ -647,14 +780,28 @@ if __name__ == "__main__":
                     args.icl_image_snapshot_max_steps,
                     snapshot_al,
                     snapshot_ah,
+                    rgb_resize_hw=_rsz_snap,
                 )
-                snap_path = icl_image_snapshot_path(
-                    args.icl_data_root, args.env_id, boundary
-                )
-                save_trajectories_hdf5(snap_trajs, snap_path, sort_by_return=True)
+                t_snap1 = time.perf_counter()
                 print(
-                    f"[ICL image snapshot] step_boundary={boundary} global_step={global_step} "
-                    f"episodes={len(snap_trajs)} -> {snap_path.resolve()}"
+                    f"[ICL image snapshot] collection finished: episodes={len(snap_trajs)} "
+                    f"collect_s={t_snap1 - t_snap0:.2f} -> writing HDF5 "
+                    f"(image_compression={args.icl_snapshot_hdf5_image_compression})...",
+                    flush=True,
+                )
+                save_trajectories_hdf5(
+                    snap_trajs,
+                    snap_path,
+                    sort_by_return=True,
+                    image_hdf5_compression=str(args.icl_snapshot_hdf5_image_compression),
+                )
+                t_snap2 = time.perf_counter()
+                print(
+                    f"[ICL image snapshot] done: recorded_episodes={len(snap_trajs)} "
+                    f"step_boundary={boundary} global_step={global_step} "
+                    f"collect_s={t_snap1 - t_snap0:.2f} hdf5_s={t_snap2 - t_snap1:.2f} "
+                    f"total_s={t_snap2 - t_snap0:.2f}",
+                    flush=True,
                 )
                 last_icl_image_snap_boundary = boundary
 
@@ -665,17 +812,16 @@ if __name__ == "__main__":
             print(f"model saved to {model_path}")
         out_path = default_icl_export_path(args.icl_data_root, args.env_id)
         to_save: list = []
+        _rsz = _icl_rgb_resize_hw(args)
+        icl_extra_notes: list[str] = []
         if args.icl_save_rollout_buffer:
             flush_episode_buffers(icl_buffers, icl_trajs)
             to_save = list(icl_trajs)
         if args.icl_collect_episodes > 0:
-            env_kwargs = _mani_skill_env_kwargs(args)
-            cenv = gym.make(args.env_id, num_envs=1, reconfiguration_freq=1, **env_kwargs)
-            if isinstance(cenv.action_space, gym.spaces.Dict):
-                cenv = FlattenActionSpaceWrapper(cenv)
-            cenv = ManiSkillVectorEnv(cenv, 1, ignore_terminations=False, record_metrics=True)
+            cenv = _make_rgb_collect_vector_env(args, args.icl_collect_episodes, tag=" collect")
             al = torch.from_numpy(cenv.single_action_space.low).to(device)
             ah = torch.from_numpy(cenv.single_action_space.high).to(device)
+            t_rgb0 = time.perf_counter()
             extra = collect_episodes_vector_env(
                 cenv,
                 agent,
@@ -684,14 +830,24 @@ if __name__ == "__main__":
                 args.icl_max_steps_per_episode,
                 al,
                 ah,
+                rgb_resize_hw=_rsz,
             )
+            t_rgb1 = time.perf_counter()
             to_save.extend(extra)
             cenv.close()
+            icl_extra_notes.append(
+                f"rgb_episodes={len(extra)} rgb_hw={_rsz or 'native'} rgb_collect_s={t_rgb1 - t_rgb0:.2f}"
+            )
         if to_save:
+            t_h5_0 = time.perf_counter()
             save_trajectories_hdf5(to_save, out_path)
-            print(f"[ICL] Saved {len(to_save)} trajectories to {out_path.resolve()}")
+            t_h5_1 = time.perf_counter()
+            tail = " ".join(icl_extra_notes + [f"hdf5_s={t_h5_1 - t_h5_0:.2f}"])
+            print(f"[ICL] Saved {len(to_save)} trajectories to {out_path.resolve()} {tail}")
         elif args.icl_save_rollout_buffer or args.icl_collect_episodes > 0:
-            print("[ICL] No trajectories to save (enable --icl-save-rollout-buffer or --icl-collect-episodes).")
+            print(
+                "[ICL] No trajectories to save (enable --icl-save-rollout-buffer or --icl-collect-episodes)."
+            )
         logger.close()
     if snapshot_cenv is not None:
         snapshot_cenv.close()

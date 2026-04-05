@@ -49,6 +49,49 @@ def _subsample_indices(length: int, cap: Optional[int], strategy: str) -> np.nda
     )
 
 
+def _pad_prompt_arrays_to_max_episode_steps(
+    ps: np.ndarray,
+    pa: np.ndarray,
+    pr: np.ndarray,
+    prtg: np.ndarray,
+    pts: np.ndarray,
+    pm: np.ndarray,
+    ptrial: np.ndarray,
+    max_episode_steps: int,
+    act_dim: int,
+) -> PromptArrays:
+    """Truncate to the last ``max_episode_steps`` or pad at the end to that length (mask 0 on pad)."""
+    if max_episode_steps <= 0:
+        return ps, pa, pr, prtg, pts, pm, ptrial
+    T = int(ps.shape[0])
+    if T > max_episode_steps:
+        sl = slice(T - max_episode_steps, T)
+        return (
+            ps[sl],
+            pa[sl],
+            pr[sl],
+            prtg[sl],
+            pts[sl],
+            pm[sl],
+            ptrial[sl],
+        )
+    if T < max_episode_steps:
+        pad_len = max_episode_steps - T
+        last_obs = ps[-1:]
+        ps = np.concatenate([ps, np.repeat(last_obs, pad_len, axis=0)], axis=0)
+        pa = np.concatenate([pa, np.full((pad_len, act_dim), -10.0, dtype=np.float32)], axis=0)
+        pr = np.concatenate([pr, np.zeros((pad_len, 1), dtype=np.float32)], axis=0)
+        prtg = np.concatenate([prtg, np.zeros((pad_len, 1), dtype=np.float32)], axis=0)
+        last_ts = float(pts[-1]) if T > 0 else -1.0
+        pts = np.concatenate(
+            [pts, last_ts + np.arange(1, pad_len + 1, dtype=np.float32)],
+            axis=0,
+        )
+        pm = np.concatenate([pm, np.zeros(pad_len, dtype=np.float32)], axis=0)
+        ptrial = np.concatenate([ptrial, np.zeros(pad_len, dtype=np.float32)], axis=0)
+    return ps, pa, pr, prtg, pts, pm, ptrial
+
+
 def _pad_or_trim_prompt(
     ps: np.ndarray,
     pa: np.ndarray,
@@ -94,6 +137,43 @@ def _pad_or_trim_prompt(
         pm = np.concatenate([np.zeros(pad_len), pm], axis=0)
         ptrial = np.concatenate([np.zeros(pad_len, dtype=np.float32), ptrial], axis=0)
     return ps, pa, pr, prtg, pts, pm, ptrial
+
+
+def icl_prompt_segment_full_trajectory(
+    traj: Dict[str, np.ndarray],
+    state_mean: np.ndarray,
+    state_std: np.ndarray,
+    rtg_scale: float,
+    trial_idx: int,
+    max_episode_steps: int,
+    act_dim: int,
+    max_prompt_trajectory_length: Optional[int],
+    context_subsample_strategy: str,
+) -> PromptArrays:
+    """One context trajectory as used in training (``FullTrajectoryICLTrajectoryDataset``).
+
+    Subsample along time (cap / strategy), then pad or truncate to ``max_episode_steps`` per demo.
+    Shared with eval so inference prompts match the training layout.
+    """
+    tlen = int(traj["rewards"].shape[0])
+    if tlen == 0:
+        raise ValueError("Empty trajectory in icl_prompt_segment_full_trajectory")
+    idx = _subsample_indices(tlen, max_prompt_trajectory_length, context_subsample_strategy)
+    obs = np.asarray(traj["observations"], dtype=np.float32)
+    act = np.asarray(traj["actions"], dtype=np.float32)
+    rew = np.asarray(traj["rewards"], dtype=np.float32)
+    full_rtg = discount_cumsum(rew, gamma=1.0).reshape(-1, 1)
+    ps = (obs[idx] - state_mean) / state_std
+    pa = act[idx]
+    pr = rew[idx].reshape(-1, 1)
+    prtg = full_rtg[idx] / rtg_scale
+    pts = idx.astype(np.float32)
+    n = int(idx.shape[0])
+    pm = np.ones(n, dtype=np.float32)
+    ptrial = np.full(n, float(trial_idx + 1), dtype=np.float32)
+    return _pad_prompt_arrays_to_max_episode_steps(
+        ps, pa, pr, prtg, pts, pm, ptrial, max_episode_steps, act_dim
+    )
 
 
 def _empty_prompt_segment(
@@ -752,9 +832,10 @@ class SubsampledICLTrajectoryDataset(ICLTrajectoryDatasetBase):
 
 class FullTrajectoryICLTrajectoryDataset(ICLTrajectoryDatasetBase):
     """
-    In-context prompt = full trajectory(ies). Each trajectory is capped to
-    max_prompt_trajectory_length steps (last N steps); concatenated sequence
-    is then capped to max_total_prompt_length. ICRT-style.
+    In-context prompt = full trajectory(ies). Each context trajectory is subsampled
+    (``max_prompt_trajectory_length`` / ``context_subsample_strategy``), then **padded or
+    truncated to ``max_episode_steps``** so every demo has the same length before concatenation;
+    the combined prompt is then capped to ``max_total_prompt_length``. ICRT-style.
     """
 
     def __init__(
@@ -822,25 +903,17 @@ class FullTrajectoryICLTrajectoryDataset(ICLTrajectoryDatasetBase):
         trial_idx: int,
     ) -> PromptArrays:
         """Full trajectory arrays with optional per-trajectory subsampling cap."""
-        T = traj["rewards"].shape[0]
-        if T == 0:
-            raise ValueError("Empty trajectory in _prompt_from_full_trajectory")
-        idx = _subsample_indices(
-            T, self.max_prompt_trajectory_length, self.context_subsample_strategy
+        return icl_prompt_segment_full_trajectory(
+            traj,
+            state_mean,
+            state_std,
+            self.rtg_scale,
+            trial_idx,
+            self.max_episode_steps,
+            self.act_dim,
+            self.max_prompt_trajectory_length,
+            self.context_subsample_strategy,
         )
-        obs = np.asarray(traj["observations"], dtype=np.float32)
-        act = np.asarray(traj["actions"], dtype=np.float32)
-        rew = np.asarray(traj["rewards"], dtype=np.float32)
-        full_rtg = discount_cumsum(rew, gamma=1.0).reshape(-1, 1)
-        ps = (obs[idx] - state_mean) / state_std
-        pa = act[idx]
-        pr = rew[idx].reshape(-1, 1)
-        prtg = full_rtg[idx] / self.rtg_scale
-        pts = idx.astype(np.float32)
-        T = idx.shape[0]
-        pm = np.ones(T, dtype=np.float32)
-        ptrial = np.full(T, float(trial_idx + 1), dtype=np.float32)
-        return ps, pa, pr, prtg, pts, pm, ptrial
 
     def _build_prompt(
         self,

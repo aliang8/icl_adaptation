@@ -65,17 +65,26 @@ uv run python -m src.train \
   paths.data_root=/scr2/shared/icl_adaptation/datasets \
   --wandb
 
-# ManiSkill ICL (PickCube-v1): expects paths.data_root/maniskill/PickCube-v1/trajectories.h5 (or .pkl)
-# Generate data: python scripts/maniskill/ppo_train_icldata.py --env-id PickCube-v1 --icl-data-root <same as paths.data_root>
-# State-only trajectories (no RGB): keep use_vision=false. If trajectories.h5 has images, set both to true.
-uv run python -m src.train \
+# ManiSkill ICL (PickCube-v1): reads paths.data_root/maniskill/PickCube-v1/trajectories.h5.
+# PickCube PPO (scripts/maniskill/ppo_train_icldata.py): by default stitches the full on-policy rollout
+# stream into that HDF5 (--icl-save-rollout-buffer, on by default). Set --icl-data-root to the same path as
+# paths.data_root below (not a separate "replay buffer" file). Optional: --icl-collect-episodes for final-policy
+# RGB episodes; --no-icl-save-rollout-buffer if you only want collect-episodes export.
+# State-only: keep model.use_vision/data.use_vision false unless trajectories include images.
+#
+# Use .venv-maniskill (not `uv run`): periodic eval imports mani_skill in the same interpreter as train.
+# Prereq from repo root: pip install -r scripts/maniskill/requirements.txt &&
+#   pip install -r scripts/maniskill/requirements_icl_train.txt
+#   (inside .venv-maniskill). Then:
+export PYTHONPATH="${PWD}${PYTHONPATH:+:$PYTHONPATH}"
+./.venv-maniskill/bin/python -m src.train \
   --override data=[base,maniskill_pickcube] \
   experiment.max_steps=100000 \
-  data.batch_size=4 \
-  data.num_context_trajectories=3 \
-  experiment.eval_every_steps=500 \
+  data.batch_size=16 \
+  data.num_context_trajectories=5 \
+  experiment.eval_every_steps=10 \
   experiment.eval_num_trials=3 \
-  experiment.eval_target_return=50 \
+  experiment.eval_target_return=20 \
   experiment.num_eval_rollouts=3 \
   data.rtg_scale=1.0 \
   data.horizon=20 \
@@ -84,6 +93,32 @@ uv run python -m src.train \
   data.use_vision=false \
   model.query_loss_only=false \
   optim.lr=1e-4 \
-  system.run_name=maniskill-pickcube_rtg1_ctx3_lr_1e-4 \
+  system.run_name=maniskill-pickcube_rtg1_ctx5_lr_1e-4 \
+  paths.data_root=/scr2/shared/icl_adaptation/datasets \
+  --wandb
+
+# ManiSkill PickCube: same data as above but **no in-context demos** — standard DT with RTG conditioning
+# (data.num_context_trajectories=0 -> max_total_prompt_length resolves to 0; query segment only).
+# data.context_style=subsampled matches fixed-horizon DT segments (ignored for prompt when N=0).
+export PYTHONPATH="${PWD}${PYTHONPATH:+:$PYTHONPATH}"
+CUDA_VISIBLE_DEVICES=3 ./.venv-maniskill/bin/python -m src.train \
+  --override data=[base,maniskill_pickcube] \
+  experiment.max_steps=100000 \
+  data.batch_size=256 \
+  data.num_context_trajectories=0 \
+  data.randomize_num_context_trajectories=false \
+  data.context_style=subsampled \
+  experiment.eval_every_steps=1000 \
+  experiment.eval_num_trials=1 \
+  experiment.eval_target_return=20 \
+  experiment.num_eval_rollouts=4 \
+  data.rtg_scale=1.0 \
+  data.horizon=20 \
+  model.max_length=20 \
+  model.use_vision=false \
+  data.use_vision=false \
+  model.query_loss_only=false \
+  optim.lr=1e-4 \
+  system.run_name=maniskill-pickcube_dt_rtg_only_lr_1e-4 \
   paths.data_root=/scr2/shared/icl_adaptation/datasets \
   --wandb

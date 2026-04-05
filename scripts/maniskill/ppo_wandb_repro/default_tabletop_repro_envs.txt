@@ -1,0 +1,17 @@
+# Default env ids for W&B PPO repro batch jobs (table-top tasks with a bundled JSON in configs/).
+# Keep in sync with comments in train_ppo_many_envs.sh.
+# No JSON in this repo for: PickCubeSO100-v1, PickCubeWidowXAI-v1, PlaceSphere-v1,
+# PlugCharger-v1, PullCubeTool-v1.
+# Other JSONs exist (AnymalC-Reach-v1, OpenCabinetDrawer-v1, TwoRobotPickCube-v1,
+# UnitreeG1PlaceAppleInBowl-v1, UnitreeG1TransportBox-v1): submit with REPRO_ALL_CONFIGS=1
+# or ENVS_OVERRIDE="...".
+LiftPegUpright-v1
+PegInsertionSide-v1
+PickCube-v1
+PickSingleYCB-v1
+PokeCube-v1
+PullCube-v1
+PushCube-v1
+PushT-v1
+RollBall-v1
+StackCube-v1

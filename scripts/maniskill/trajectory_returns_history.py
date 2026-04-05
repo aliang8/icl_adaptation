@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Load ``trajectories.h5`` or ``trajectories.pkl`` and save a histogram of episode returns (sum of rewards)."""
+"""Load ``trajectories.h5`` (flat v2) and save a histogram of episode returns (sum of rewards)."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ def _repo_root() -> Path:
 
 def main() -> int:
     p = argparse.ArgumentParser(description="Histogram of episode returns from trajectory file.")
-    p.add_argument("trajectory_path", type=Path, help="Path to trajectories.h5 or trajectories.pkl")
+    p.add_argument("trajectory_path", type=Path, help="Path to trajectories.h5")
     p.add_argument(
         "-o",
         "--output",
@@ -77,7 +77,13 @@ def main() -> int:
     ax.set_xlabel("episode return (sum of rewards)")
     ax.set_ylabel("count")
     ax.set_title(f"{traj_path.name}  (n={len(r)})")
-    ax.axvline(float(r.mean()), color="darkorange", linestyle="--", linewidth=1.5, label=f"mean={r.mean():.4g}")
+    ax.axvline(
+        float(r.mean()),
+        color="darkorange",
+        linestyle="--",
+        linewidth=1.5,
+        label=f"mean={r.mean():.4g}",
+    )
     ax.legend(loc="upper right")
     ax.grid(True, alpha=0.25)
     fig.tight_layout()

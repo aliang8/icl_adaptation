@@ -18,10 +18,13 @@ import numpy as np
 def ensure_maniskill_imported() -> None:
     if importlib.util.find_spec("mani_skill") is None:
         raise RuntimeError(
-            "ManiSkill eval needs `mani-skill` in the current Python env.\n"
+            "ManiSkill eval needs `mani_skill` importable in the **same** Python that runs "
+            "`src.train` (not only `.venv-maniskill` on your shell prompt).\n"
+            "  `uv run python -m src.train` uses the project uv env — install there, or run training as:\n"
+            "    .venv-maniskill/bin/python -m src.train ...   (with PYTHONPATH=repo and ICL deps)\n"
             "  pip install -r scripts/maniskill/requirements.txt\n"
-            "Or train from `.venv-maniskill` with ICL deps: "
-            "scripts/maniskill/requirements_icl_train.txt (see docs/MANISKILL.md)."
+            "  pip install -r scripts/maniskill/requirements_icl_train.txt\n"
+            "See docs/MANISKILL.md."
         )
     import mani_skill.envs  # noqa: F401 — register envs with Gymnasium
 
@@ -99,12 +102,23 @@ def make_maniskill_eval_env(
     env_name: str,
     *,
     render_mode: Optional[str] = None,
+    sim_backend: Optional[str] = None,
+    reward_mode: Optional[str] = None,
+    control_mode: Optional[str] = None,
+    reconfiguration_freq: int = 1,
 ) -> Any:
+    """Match ``ppo_train_icldata.py`` / ``_mani_skill_env_kwargs`` + ``FlattenActionSpaceWrapper``."""
     ensure_maniskill_imported()
     import gymnasium as gym
 
+    from mani_skill.utils.wrappers.flatten import FlattenActionSpaceWrapper
+
     task = maniskill_task_id(env_name)
-    sim = os.environ.get("MANISKILL_EVAL_SIM", os.environ.get("MANISKILL_SMOKE_SIM", "physx_cuda"))
+    sim = sim_backend
+    if sim is None or str(sim).strip() == "" or str(sim).strip() == "auto":
+        sim = os.environ.get(
+            "MANISKILL_EVAL_SIM", os.environ.get("MANISKILL_SMOKE_SIM", "physx_cuda")
+        )
     if sim in ("", "auto"):
         sim = "physx_cuda"
 
@@ -112,10 +126,14 @@ def make_maniskill_eval_env(
         "num_envs": 1,
         "obs_mode": "state",
         "sim_backend": sim,
-        "reconfiguration_freq": 1,
+        "reconfiguration_freq": int(reconfiguration_freq),
     }
     if render_mode is not None:
         kw["render_mode"] = render_mode
+    if reward_mode is not None and str(reward_mode).strip():
+        kw["reward_mode"] = reward_mode
+    if control_mode is not None and str(control_mode).strip():
+        kw["control_mode"] = control_mode
 
     last_err: Optional[BaseException] = None
     backends = [sim]
@@ -125,6 +143,8 @@ def make_maniskill_eval_env(
         try:
             kw_try = {**kw, "sim_backend": backend}
             vec = gym.make(task, **kw_try)
+            if isinstance(vec.action_space, gym.spaces.Dict):
+                vec = FlattenActionSpaceWrapper(vec)
             return ManiSkillEvalAdapter(vec)
         except BaseException as e:
             last_err = e

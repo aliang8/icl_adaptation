@@ -12,6 +12,7 @@ Example::
 
   uv run python scripts/maniskill/fetch_ppo_wandb_configs.py
 """
+
 from __future__ import annotations
 
 import argparse

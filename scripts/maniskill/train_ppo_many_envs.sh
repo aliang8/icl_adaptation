@@ -24,34 +24,25 @@ SUBMIT_SLURM="${SUBMIT_SLURM:-0}"
 # Extra sbatch CLI args, e.g. SBATCH_EXTRA=(--account=myproj --partition=gpu)
 SBATCH_EXTRA=(${SBATCH_EXTRA:-})
 
-# Default: table-top 2-finger gripper tasks with dense rewards (ManiSkill task table).
-# https://maniskill.readthedocs.io/en/latest/tasks/table_top_gripper/index.html
-# Excludes sparse-only rows there: AssemblingKits, PickClutterYCB, StackPyramid, TurnFaucet.
+# Default envs: same table-top + repro list as W&B repro (ppo_wandb_repro/default_tabletop_repro_envs.txt).
+# This script uses fixed CLI hparams; for JSON-matched hparams use run_ppo_wandb_repro.sh / submit_ppo_wandb_repro_slurm.sh.
+#
 # Override with ENVS_OVERRIDE="PushCube-v1" or any space-separated list.
 ENVS_OVERRIDE="${ENVS_OVERRIDE:-}"
+DEFAULT_ENV_FILE="${ROOT}/scripts/maniskill/ppo_wandb_repro/default_tabletop_repro_envs.txt"
 if [ -n "${ENVS_OVERRIDE}" ]; then
   # shellcheck disable=SC2206
   ENVS=( ${ENVS_OVERRIDE} )
 else
-  ENVS=(
-    "LiftPegUpright-v1"
-    "PegInsertionSide-v1"
-    "PickCube-v1"
-    "PickCubeSO100-v1"
-    "PickCubeWidowXAI-v1"
-    "PickSingleYCB-v1"
-    "PlaceSphere-v1"
-    "PlugCharger-v1"
-    "PokeCube-v1"
-    "PullCube-v1"
-    "PullCubeTool-v1"
-    "PushCube-v1"
-    "PushT-v1"
-    "RollBall-v1"
-    "StackCube-v1"
-    # "TwoRobotPickCube-v1"
-    # "TwoRobotStackCube-v1"
-  )
+  if [ ! -f "${DEFAULT_ENV_FILE}" ]; then
+    echo "Missing default env list: ${DEFAULT_ENV_FILE}" >&2
+    exit 1
+  fi
+  mapfile -t ENVS < <(awk '!/^[[:space:]]*#/ && NF { print $1 }' "${DEFAULT_ENV_FILE}")
+  if [ "${#ENVS[@]}" -eq 0 ]; then
+    echo "No env ids parsed from ${DEFAULT_ENV_FILE}" >&2
+    exit 1
+  fi
 fi
 
 NUM_ENVS="${NUM_ENVS:-1024}"
@@ -59,7 +50,7 @@ STEPS="${STEPS:-50_000_000}"
 # Set TRACK_WANDB=1 to log to W&B (default off so many-env loops do not spam runs).
 TRACK_WANDB="${TRACK_WANDB:-0}"
 COLLECT_EP="${COLLECT_EP:-0}"
-# Set SNAP_EVERY>0 for RGB snapshots: image_snapshots/trajectories_step_XXXXXXXX.pkl
+# Set SNAP_EVERY>0 for RGB snapshots under image_snapshots/ (trajectories_step_*.h5)
 SNAP_EVERY="${SNAP_EVERY:-0}"
 SNAP_EP="${SNAP_EP:-8}"
 ICL_ROOT="${ICL_ROOT:-datasets}"

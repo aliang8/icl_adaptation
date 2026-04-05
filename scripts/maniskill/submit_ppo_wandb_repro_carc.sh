@@ -9,7 +9,7 @@
 #   SBATCH_EXTRA=(--account=YOUR_ENDEAVOUR_ACCOUNT --partition=YOUR_CONDO_PARTITION) \\
 #     ./scripts/maniskill/submit_ppo_wandb_repro_carc.sh
 #
-# Same optional env vars as submit_ppo_wandb_repro_slurm.sh (ENVS_OVERRIDE, SEED, TRACK_WANDB, …).
+# Same optional env vars as submit_ppo_wandb_repro_slurm.sh (ENVS_OVERRIDE, REPRO_ALL_CONFIGS, SEED, …).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"

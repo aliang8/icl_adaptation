@@ -68,8 +68,10 @@ def main() -> int:
         except RuntimeError as e:
             last_err = e
             msg = str(e).lower()
-            if sim_backend == "physx_cuda" and "physx_cpu" in backends and (
-                "nvidia" in msg or "cuda" in msg or "driver" in msg
+            if (
+                sim_backend == "physx_cuda"
+                and "physx_cpu" in backends
+                and ("nvidia" in msg or "cuda" in msg or "driver" in msg)
             ):
                 print(f"[maniskill test] physx_cuda failed: {e}", file=sys.stderr)
                 continue

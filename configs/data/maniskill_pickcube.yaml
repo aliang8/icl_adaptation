@@ -1,8 +1,8 @@
-# Example: ICL training on ManiSkill data produced by scripts/maniskill/ppo_train_icldata.py
-# Expects: paths.data_root/maniskill/PickCube-v1/trajectories.h5 (or legacy trajectories.pkl)
-# Run PPO in a ManiSkill-only venv (scripts/maniskill/requirements.txt); train ICL in the main uv env.
+# Example: ICL training on ManiSkill data from scripts/maniskill/ppo_train_icldata.py
+# Expects: paths.data_root/maniskill/PickCube-v1/trajectories.h5.
+# PPO defaults to exporting the on-policy rollout stream into that file (--icl-save-rollout-buffer).
 #
-# python scripts/maniskill/ppo_train_icldata.py --env-id PickCube-v1 ... --icl-data-root datasets
+# python scripts/maniskill/ppo_train_icldata.py --env-id PickCube-v1 ... --icl-data-root <same as paths.data_root>
 # python src/train.py data=maniskill_pickcube model.use_vision=true data.use_vision=true ...
 
 defaults:
@@ -12,6 +12,10 @@ defaults:
 env_name: ManiSkill/PickCube-v1
 rtg_scale: 1.0
 horizon: 20
-max_episode_steps: 200
+max_episode_steps: 50
+# Match ``ppo_train_icldata.py`` / W&B repro eval env (periodic sim eval uses these).
+maniskill_sim_backend: physx_cuda
+maniskill_reward_mode: normalized_dense
+maniskill_control_mode: pd_joint_delta_pos
 use_vision: false
 use_precomputed_embeddings: false

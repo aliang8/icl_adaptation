@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Submit one Slurm job per JSON in scripts/maniskill/ppo_wandb_repro/configs/ (W&B-matched PPO hparams).
-# Each job runs run_ppo_wandb_repro.py for that file (three seeds by default, unless SEED is set).
+# Submit Slurm jobs for W&B-matched PPO repro (one job per env JSON).
+# Default: only envs listed in ppo_wandb_repro/default_tabletop_repro_envs.txt (table-top + bundled JSON).
+# Set REPRO_ALL_CONFIGS=1 to submit one job per configs/*.json (except manifest.json).
 #
 # From repo root:
 #   SBATCH_EXTRA=(--account=YOUR_ACCT --partition=gpu) ./scripts/maniskill/submit_ppo_wandb_repro_slurm.sh
 #
 # Optional env:
+#   REPRO_ALL_CONFIGS=1                       # every JSON under configs/, not just default list
 #   ENVS_OVERRIDE="PickCube-v1 PushCube-v1"   # subset (must match *.json basenames without .json)
 #   TRACK_WANDB=0                             # add --no-track on workers (default 1)
 #   SEED=1788                                 # one seed per job instead of all seeds in JSON
@@ -30,6 +32,8 @@ fi
 SBATCH_SCRIPT="${SBATCH_SCRIPT:-${ROOT}/scripts/maniskill/ppo_wandb_repro_single_env.sbatch}"
 SLURM_LOG_DIR="${SLURM_LOG_DIR:-${ROOT}/slurm-logs}"
 CONFIG_DIR="${ROOT}/scripts/maniskill/ppo_wandb_repro/configs"
+DEFAULT_ENV_FILE="${ROOT}/scripts/maniskill/ppo_wandb_repro/default_tabletop_repro_envs.txt"
+REPRO_ALL_CONFIGS="${REPRO_ALL_CONFIGS:-0}"
 SBATCH_EXTRA=(${SBATCH_EXTRA:-})
 ENVS_OVERRIDE="${ENVS_OVERRIDE:-}"
 TRACK_WANDB="${TRACK_WANDB:-1}"
@@ -52,13 +56,27 @@ collect_configs() {
       fi
       out+=("${p}")
     done
-  else
+  elif [ "${REPRO_ALL_CONFIGS}" != "0" ] && [ -n "${REPRO_ALL_CONFIGS}" ]; then
     local f
     for f in "${CONFIG_DIR}"/*.json; do
       [ -f "${f}" ] || continue
       [ "$(basename "${f}")" = "manifest.json" ] && continue
       out+=("${f}")
     done
+  else
+    if [ ! -f "${DEFAULT_ENV_FILE}" ]; then
+      echo "Missing default env list: ${DEFAULT_ENV_FILE}" >&2
+      exit 1
+    fi
+    local e
+    while IFS= read -r e; do
+      local p="${CONFIG_DIR}/${e}.json"
+      if [ ! -f "${p}" ]; then
+        echo "skip missing config: ${e} (${p})" >&2
+        continue
+      fi
+      out+=("${p}")
+    done < <(awk '!/^[[:space:]]*#/ && NF { print $1 }' "${DEFAULT_ENV_FILE}")
   fi
   printf '%s\n' "${out[@]}"
 }
