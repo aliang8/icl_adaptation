@@ -93,6 +93,15 @@ Two patterns:
      ./scripts/maniskill/submit_ppo_wandb_repro_slurm.sh
    ```
 
+   **USC CARC** (Discovery / Endeavour): use the template aligned with [carc_usage](https://github.com/kylewang1999/carc_usage) (`consolidated.md` — run `myaccount` for account/partition). Edit placeholders in `scripts/maniskill/carc_ppo_wandb_repro_single_env.sbatch`, then:
+
+   ```bash
+   SBATCH_EXTRA=(--account=YOUR_ENDEAVOUR_ACCOUNT --partition=YOUR_CONDO_PARTITION) \
+     ./scripts/maniskill/submit_ppo_wandb_repro_carc.sh
+   ```
+
+   Or set `SBATCH_SCRIPT` to that file when calling `submit_ppo_wandb_repro_slurm.sh`. Override GPU type in the `.sbatch` file if needed (e.g. `#SBATCH --gpus=h200:1` per CARC Endeavour examples).
+
    Writes expanded batch scripts under `slurm-logs/` and submits them. Optional: `ENVS_OVERRIDE="PickCube-v1"`, `SEED=1788`, `TRACK_WANDB=0`, `WANDB_ENTITY=...`.
 
 2. **Fixed script hyperparameters** (`train_ppo_many_envs.sh` defaults): one job per env id.

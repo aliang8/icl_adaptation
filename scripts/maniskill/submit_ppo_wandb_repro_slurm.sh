@@ -26,7 +26,8 @@ if ! command -v sbatch >/dev/null 2>&1; then
   exit 1
 fi
 
-SBATCH_SCRIPT="${ROOT}/scripts/maniskill/ppo_wandb_repro_single_env.sbatch"
+# Override for CARC: SBATCH_SCRIPT=scripts/maniskill/carc_ppo_wandb_repro_single_env.sbatch
+SBATCH_SCRIPT="${SBATCH_SCRIPT:-${ROOT}/scripts/maniskill/ppo_wandb_repro_single_env.sbatch}"
 SLURM_LOG_DIR="${SLURM_LOG_DIR:-${ROOT}/slurm-logs}"
 CONFIG_DIR="${ROOT}/scripts/maniskill/ppo_wandb_repro/configs"
 SBATCH_EXTRA=(${SBATCH_EXTRA:-})
