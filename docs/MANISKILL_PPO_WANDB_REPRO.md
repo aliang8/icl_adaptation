@@ -13,6 +13,38 @@ Configs are stored as **JSON** (not YAML): `scripts/maniskill/ppo_wandb_repro/co
 
 Bulk loop `train_ppo_many_envs.sh` keeps W&B off unless you set `TRACK_WANDB=1` (avoids many accidental runs).
 
+## Example: repo on USC CARC `/project2/...`
+
+If the clone lives under project storage (typical on CARC), point everything at that root:
+
+```bash
+export REPO_ROOT=/project2/biyik_1165/aliang80/icl_adaptation
+cd "$REPO_ROOT"
+export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:$PYTHONPATH}"
+export MANISKILL_PYTHON="${REPO_ROOT}/.venv-maniskill/bin/python"   # if you use the ManiSkill venv there
+```
+
+Refresh JSON configs and run one task:
+
+```bash
+cd /project2/biyik_1165/aliang80/icl_adaptation
+uv run python scripts/maniskill/fetch_ppo_wandb_configs.py
+uv run python scripts/maniskill/run_ppo_wandb_repro.py \
+  --config scripts/maniskill/ppo_wandb_repro/configs/PickCube-v1.json
+```
+
+Submit Slurm jobs from the login node (after editing account/partition in `carc_ppo_wandb_repro_single_env.sbatch` or passing them in `SBATCH_EXTRA`). `REPO_ROOT` in the job environment must be this path:
+
+```bash
+cd /project2/biyik_1165/aliang80/icl_adaptation
+SBATCH_EXTRA=(--account=YOUR_ENDEAVOUR_ACCOUNT --partition=YOUR_CONDO_PARTITION) \
+  ./scripts/maniskill/submit_ppo_wandb_repro_carc.sh
+```
+
+The generated jobs pass `REPO_ROOT=$PWD` at submit time, so run the submit script from this directory (or `cd` there first).
+
+Other snippets in this doc use `/scr/aliang80/icl_adaptation` only as a placeholder; substitute `$REPO_ROOT` or the `/project2/...` path above.
+
 ## Fetch configs from W&B (separate step)
 
 Run whenever you want to refresh hyperparameters from the project:

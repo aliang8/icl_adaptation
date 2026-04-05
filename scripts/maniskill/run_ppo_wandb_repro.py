@@ -83,11 +83,26 @@ def main() -> None:
         "--extra",
         nargs=argparse.REMAINDER,
         default=[],
-        help="Pass through to ppo_train_icldata.py after a bare --",
+        help="Extra args for ppo_train_icldata.py (must appear after --extra). Prefer a bare -- below.",
     )
-    args = parser.parse_args()
-    if args.extra and args.extra[0] == "--":
-        args.extra = args.extra[1:]
+
+    # Everything after a bare `--` goes to PPO (same as GNU tools). A bare `--` alone does *not*
+    # populate argparse.REMAINDER on `--extra`, so sbatch/scripts use `-- ...` and we split here.
+    argv = sys.argv[1:]
+    passthrough: list[str] = []
+    if "--" in argv:
+        split_at = argv.index("--")
+        passthrough = argv[split_at + 1 :]
+        argv = argv[:split_at]
+
+    args = parser.parse_args(argv)
+    extra_from_flag: list[str] = []
+    if args.extra:
+        ex = list(args.extra)
+        if ex and ex[0] == "--":
+            ex = ex[1:]
+        extra_from_flag = ex
+    args.extra = extra_from_flag + passthrough
 
     py = args.python or Path(os.environ.get("MANISKILL_PYTHON", _default_maniskill_python(repo_root)))
 
