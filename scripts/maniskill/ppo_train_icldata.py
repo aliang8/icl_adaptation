@@ -323,22 +323,25 @@ if __name__ == "__main__":
             import wandb
             config = vars(args)
             _rm = args.reward_mode if args.reward_mode is not None else "normalized_dense"
-            config["env_cfg"] = dict(
-                **env_kwargs,
+            # Merge without duplicate keys: env_kwargs may already contain reward_mode (W&B repro JSON).
+            _train_log = {**env_kwargs}
+            _train_log.update(
                 num_envs=args.num_envs,
                 env_id=args.env_id,
                 reward_mode=_rm,
                 env_horizon=max_episode_steps,
                 partial_reset=args.partial_reset,
             )
-            config["eval_env_cfg"] = dict(
-                **env_kwargs,
+            config["env_cfg"] = _train_log
+            _eval_log = {**env_kwargs}
+            _eval_log.update(
                 num_envs=args.num_eval_envs,
                 env_id=args.env_id,
                 reward_mode=_rm,
                 env_horizon=max_episode_steps,
                 partial_reset=False,
             )
+            config["eval_env_cfg"] = _eval_log
             _wb_kw = dict(
                 project=args.wandb_project_name,
                 sync_tensorboard=False,
