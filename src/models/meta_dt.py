@@ -47,6 +47,7 @@ class MetaDecisionTransformer(nn.Module):
         predict_returns: bool = False,
         predict_state: bool = False,
         condition_rtg: bool = True,
+        sequence_token_layout: Optional[str] = None,
         use_trial_index_embedding: bool = True,
         max_trial_embeddings: int = 64,
         **kwargs,
@@ -57,7 +58,23 @@ class MetaDecisionTransformer(nn.Module):
         # Keep flags under different names so they aren't overwritten by the layer attributes below
         self._predict_returns = predict_returns
         self._predict_state = predict_state
-        self._condition_rtg = condition_rtg
+        raw_layout = (
+            str(sequence_token_layout).strip().lower().replace("-", "_")
+            if sequence_token_layout is not None and str(sequence_token_layout).strip()
+            else ""
+        )
+        if raw_layout in ("none", "null"):
+            raw_layout = ""
+        if raw_layout:
+            allowed = {"rtg_state_action", "state_action", "state_action_reward"}
+            if raw_layout not in allowed:
+                raise ValueError(
+                    f"sequence_token_layout must be one of {sorted(allowed)}; got {raw_layout!r}"
+                )
+            self._sequence_token_layout = raw_layout
+        else:
+            self._sequence_token_layout = "rtg_state_action" if condition_rtg else "state_action"
+        self._condition_rtg = self._sequence_token_layout == "rtg_state_action"
         self.use_trial_index_embedding = use_trial_index_embedding
         self.max_trial_embeddings = max(1, int(max_trial_embeddings))
         self.act_dim = act_dim
@@ -84,6 +101,7 @@ class MetaDecisionTransformer(nn.Module):
 
         self.max_ep_len = max_ep_len
         self.embed_timestep = nn.Embedding(max_ep_len, hidden_size)
+        # Single Linear(1, H) for RTG tokens, prompt RTG, and (s,a,r) per-step reward scalars.
         self.embed_return = nn.Linear(1, hidden_size)
         self.embed_action = nn.Linear(act_dim, hidden_size)
         if self._fuse_context_in_state:
@@ -141,36 +159,69 @@ class MetaDecisionTransformer(nn.Module):
             if ti is None:
                 ti = torch.zeros((B, T), dtype=torch.long, device=batch.states.device)
             trial_e = self._embed_trial_idx(ti)
-        return_emb = None
 
-        if self._condition_rtg:
-            return_emb = self.embed_return(batch.returns_to_go) + self.embed_timestep(
-                batch.timesteps.long()
+        layout = self._sequence_token_layout
+        if layout == "state_action_reward" and batch.prompt is not None:
+            raise ValueError(
+                "sequence_token_layout=state_action_reward does not support an ICL prompt "
+                "(query-only / Algorithm Distillation)."
             )
-            if trial_e is not None:
-                return_emb = return_emb + trial_e
+
         action_emb = self.embed_action(batch.actions) + self.embed_timestep(batch.timesteps.long())
         if trial_e is not None:
             action_emb = action_emb + trial_e
 
+        query_pair: Optional[Tuple[Tensor, Tensor]] = None
+        query_triple: Optional[Tuple[Tensor, Tensor, Tensor]] = None
+        triple_is_rtg_prefix = False
+
+        if layout == "rtg_state_action":
+            rtemb = self.embed_return(batch.returns_to_go) + self.embed_timestep(
+                batch.timesteps.long()
+            )
+            if trial_e is not None:
+                rtemb = rtemb + trial_e
+            query_triple = (rtemb, state_emb, action_emb)
+            triple_is_rtg_prefix = True
+        elif layout == "state_action_reward":
+            if batch.rewards is None:
+                raise ValueError(
+                    "DTBatch.rewards is required when sequence_token_layout=state_action_reward"
+                )
+            rw = batch.rewards
+            if rw.dim() == 2:
+                rw = rw.unsqueeze(-1)
+            rwemb = self.embed_return(rw.float()) + self.embed_timestep(batch.timesteps.long())
+            if trial_e is not None:
+                rwemb = rwemb + trial_e
+            query_triple = (state_emb, action_emb, rwemb)
+            triple_is_rtg_prefix = False
+        else:
+            query_pair = (state_emb, action_emb)
+
         stacked, stacked_mask, tokens_per_step = self._stack_with_prompt(
-            return_emb, state_emb, action_emb, mask, batch.prompt, T
+            query_pair,
+            query_triple,
+            mask,
+            batch.prompt,
+            T,
+            triple_is_rtg_prefix=triple_is_rtg_prefix,
         )
         hidden = self._run_backbone(stacked, stacked_mask, tokens_per_step)
-        # Match kzl Decision Transformer head indexing after
-        # x.reshape(B, T, tokens_per_step, H).permute(0, 2, 1, 3):
-        # https://github.com/kzl/decision-transformer/blob/master/gym/decision_transformer/models/decision_transformer.py
-        # return/state preds: hidden at action token (index 2 for r,s,a); action pred: state token (index 1).
-        action_hidden_idx = tokens_per_step - 2  # 1 for (r,s,a), 0 for (s,a) only
+        # (r,s,a): action pred from state (index 1). (s,a): from state (0). (s,a,r): from state (0).
+        if tokens_per_step == 3 and layout == "state_action_reward":
+            action_hidden_idx = 0
+        else:
+            action_hidden_idx = tokens_per_step - 2
         pred_returns = None
         pred_states = None
         if tokens_per_step == 3:
-            pred_returns = (
-                self.predict_return(hidden[:, 2])[:, -T:, :] if self._predict_returns else None
-            )
-            pred_states = (
-                self.predict_state(hidden[:, 2])[:, -T:, :] if self._predict_state else None
-            )
+            if layout == "state_action_reward":
+                h_aux = hidden[:, 0]
+            else:
+                h_aux = hidden[:, 2]
+            pred_returns = self.predict_return(h_aux)[:, -T:, :] if self._predict_returns else None
+            pred_states = self.predict_state(h_aux)[:, -T:, :] if self._predict_state else None
         pred_actions_full = self.predict_action(hidden[:, action_hidden_idx])
         pred_actions = pred_actions_full[:, -T:, :]
 
@@ -217,18 +268,22 @@ class MetaDecisionTransformer(nn.Module):
 
     def _stack_with_prompt(
         self,
-        return_emb: Optional[Tensor],
-        state_emb: Tensor,
-        action_emb: Tensor,
+        query_pair: Optional[Tuple[Tensor, Tensor]],
+        query_triple: Optional[Tuple[Tensor, Tensor, Tensor]],
         mask: Tensor,
         prompt: Optional[Tuple[Tensor, ...]],
         seq_length: int,
+        *,
+        triple_is_rtg_prefix: bool,
     ) -> Tuple[Tensor, Tensor, int]:
-        B = state_emb.shape[0]
-        if return_emb is not None:
+        if (query_pair is None) == (query_triple is None):
+            raise ValueError("Provide exactly one of query_pair or query_triple")
+        B = mask.shape[0]
+        if query_triple is not None:
+            t0, t1, t2 = query_triple
             tokens_per_step = 3
             stacked = (
-                torch.stack((return_emb, state_emb, action_emb), dim=1)
+                torch.stack((t0, t1, t2), dim=1)
                 .permute(0, 2, 1, 3)
                 .reshape(B, 3 * seq_length, self.hidden_size)
             )
@@ -236,9 +291,10 @@ class MetaDecisionTransformer(nn.Module):
                 torch.stack((mask, mask, mask), dim=1).permute(0, 2, 1).reshape(B, 3 * seq_length)
             )
         else:
+            s0, s1 = query_pair  # type: ignore[misc]
             tokens_per_step = 2
             stacked = (
-                torch.stack((state_emb, action_emb), dim=1)
+                torch.stack((s0, s1), dim=1)
                 .permute(0, 2, 1, 3)
                 .reshape(B, 2 * seq_length, self.hidden_size)
             )
@@ -248,6 +304,10 @@ class MetaDecisionTransformer(nn.Module):
         stacked = self.embed_ln(stacked)
 
         if prompt is not None:
+            if query_triple is not None and not triple_is_rtg_prefix:
+                raise ValueError(
+                    "ICL prompt is not supported when the query uses (state, action, reward) layout"
+                )
             prompt_trial = None
             if len(prompt) >= 7:
                 (
@@ -286,7 +346,7 @@ class MetaDecisionTransformer(nn.Module):
                 pt_e = self._embed_trial_idx(prompt_trial)
                 ps_emb = ps_emb + pt_e
                 pa_emb = pa_emb + pt_e
-            if return_emb is not None:
+            if query_triple is not None and triple_is_rtg_prefix:
                 prtg = self.prompt_embed_return(prompt_returns_to_go)
                 prtg_emb = prtg + self.prompt_embed_timestep(prompt_ts)
                 if self.embed_trial_idx is not None:
@@ -416,6 +476,22 @@ class MetaDecisionTransformer(nn.Module):
                 f"got states T={L_s0}, actions T={L_a0}"
             )
 
+        L_s_m = states.shape[1]
+        rvec = rewards.reshape(-1).float().to(states.device)
+        L_rew = int(rvec.numel())
+        if L_rew == L_s_m:
+            rewards_ta = rvec.reshape(1, L_s_m, 1)
+        elif L_rew == L_s_m - 1:
+            zr = torch.zeros(1, device=rvec.device, dtype=rvec.dtype)
+            rewards_ta = torch.cat([rvec, zr], dim=0).reshape(1, L_s_m, 1)
+        elif L_rew == 0 and L_s_m == 1:
+            rewards_ta = torch.zeros(1, 1, 1, device=states.device, dtype=torch.float32)
+        else:
+            raise ValueError(
+                f"get_action: need len(rewards)==len(states) or len(states)-1; "
+                f"got states T={L_s_m}, rewards n={L_rew}"
+            )
+
         trial_indices_kw = kwargs.get("trial_indices")
         if prompt is not None and len(prompt) >= 7:
             pm, pt = prompt[5], prompt[6]
@@ -442,6 +518,7 @@ class MetaDecisionTransformer(nn.Module):
             contexts = contexts[:, -query_cap:]
             actions = actions[:, -query_cap:]
             returns_to_go = returns_to_go[:, -query_cap:]
+            rewards_ta = rewards_ta[:, -query_cap:]
             timesteps = timesteps[:, -query_cap:]
             if trial_indices_kw is not None:
                 trial_indices_kw = trial_indices_kw[:, -query_cap:]
@@ -457,11 +534,12 @@ class MetaDecisionTransformer(nn.Module):
                 dtype=torch.long,
             )
 
-        L_s, L_c, L_a, L_r, L_t = (
+        L_s, L_c, L_a, L_r, L_rw, L_t = (
             states.shape[1],
             contexts.shape[1],
             actions.shape[1],
             returns_to_go.shape[1],
+            rewards_ta.shape[1],
             timesteps.shape[1],
         )
         L_tr = trial_indices.shape[1]
@@ -470,6 +548,7 @@ class MetaDecisionTransformer(nn.Module):
             pad_c = query_cap - L_c
             pad_a = query_cap - L_a
             pad_r = query_cap - L_r
+            pad_rw = query_cap - L_rw
             pad_t = query_cap - L_t
             pad_tr = query_cap - L_tr
             states = torch.cat(
@@ -483,6 +562,9 @@ class MetaDecisionTransformer(nn.Module):
             ).float()
             returns_to_go = torch.cat(
                 [torch.zeros(1, pad_r, 1, device=device), returns_to_go], dim=1
+            ).float()
+            rewards_ta = torch.cat(
+                [torch.zeros(1, pad_rw, 1, device=device), rewards_ta], dim=1
             ).float()
             timesteps = torch.cat(
                 [torch.zeros(1, pad_t, device=device, dtype=torch.long), timesteps], dim=1
@@ -540,6 +622,7 @@ class MetaDecisionTransformer(nn.Module):
             contexts=contexts,
             actions=actions,
             returns_to_go=returns_to_go,
+            rewards=rewards_ta if self._sequence_token_layout == "state_action_reward" else None,
             timesteps=timesteps,
             attention_mask=attention_mask,
             trial_indices=trial_indices,

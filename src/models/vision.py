@@ -11,6 +11,7 @@ from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class PatchEmbed(nn.Module):
@@ -68,6 +69,10 @@ class SingleViewEncoder(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, C, H, W) -> (B, num_tokens, embed_dim)
         B = x.shape[0]
+        th, tw = self.patch_embed.img_size
+        if int(x.shape[-2]) != th or int(x.shape[-1]) != tw:
+            # Match token count to camera/modality pos tables (fixed at init from img_size).
+            x = F.interpolate(x, size=(th, tw), mode="bilinear", align_corners=False)
         x = self.patch_embed(x)
         if self.cls_token is not None:
             cls = self.cls_token.expand(B, -1, -1)

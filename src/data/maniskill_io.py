@@ -413,10 +413,10 @@ def merge_maniskill_trajectory_hdf5(
 
 
 def resolve_maniskill_trajectory_path(data_root: Union[str, Path], env_id: str) -> Path:
-    """``<data_root>/maniskill/<env_id>/trajectories.h5``."""
+    """``<data_root>/maniskill/<env_id>/trajectories_state.h5``."""
     root = Path(data_root)
     safe = env_id.replace("/", "_").replace(" ", "_")
-    return root / "maniskill" / safe / "trajectories.h5"
+    return root / "maniskill" / safe / "trajectories_state.h5"
 
 
 def episode_meta_from_final_info(
@@ -708,9 +708,9 @@ def collect_episodes_vector_env(
 
 
 def default_icl_export_path(icl_data_root: str, env_id: str) -> Path:
-    """``<icl_data_root>/maniskill/<env_id>/trajectories.h5`` (flat env_id, safe for paths)."""
+    """``<icl_data_root>/maniskill/<env_id>/trajectories_state.h5`` (flat env_id, safe for paths)."""
     safe = env_id.replace("/", "_").replace(" ", "_")
-    return Path(icl_data_root) / "maniskill" / safe / "trajectories.h5"
+    return Path(icl_data_root) / "maniskill" / safe / "trajectories_state.h5"
 
 
 def icl_image_snapshots_dir(icl_data_root: str, env_id: str) -> Path:

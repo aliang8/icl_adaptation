@@ -35,6 +35,8 @@ vision_proprio_attention_fusion: true
 freeze_vision_encoder: false
 # Process vision encoder in chunks of N images (null = no chunking). Default 8 reduces OOM with dinov2.
 vision_encoder_chunk_size: 8
+# Patch/crossmae (H, W); null uses data.image_size or first trajectory RGB (T,H,W,3).
+vision_encoder_img_size: null
 # When data.use_precomputed_embeddings=true, set to embedding dim (e.g. 1536 for dinov2 2 views). Vision encoder is not loaded at train time; needed for inference.
 precomputed_vision_embed_dim: null
 # ICRT-style: only compute action loss on query segment (default true)

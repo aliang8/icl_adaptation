@@ -7,7 +7,7 @@ import os
 import random
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Any, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -307,8 +307,87 @@ def validate_dataset_paths(env_name: str, paths, data_cfg) -> None:
             )
 
 
-def build_model(cfg, state_dim: int, action_dim: int, num_instructions: Optional[int] = None):
+def _infer_hw_from_trajectory_images(
+    trajectories: Optional[List[Any]],
+) -> Optional[Tuple[int, int]]:
+    """First (T,H,W,3) uint8 view in trajectory ``images`` list."""
+    if not trajectories:
+        return None
+    for t in trajectories:
+        if not isinstance(t, dict):
+            continue
+        imgs = t.get("images")
+        if not isinstance(imgs, list) or not imgs:
+            continue
+        a = np.asarray(imgs[0])
+        if a.ndim == 4 and a.shape[-1] == 3:
+            return int(a.shape[1]), int(a.shape[2])
+        if a.ndim == 4 and a.shape[1] == 3:
+            return int(a.shape[2]), int(a.shape[3])
+    return None
+
+
+def resolve_vision_encoder_hw(
+    cfg,
+    trajectories: Optional[List[Any]],
+) -> Tuple[int, int]:
+    """
+    Order: ``model.vision_encoder_img_size``, ``data.image_size``, then trajectory RGB shapes.
+    """
     m = cfg.model
+    raw = OmegaConf.select(m, "vision_encoder_img_size", default=None)
+    if raw is not None:
+        vis = OmegaConf.to_container(raw, resolve=True)
+        if isinstance(vis, (list, tuple)) and len(vis) >= 2:
+            return int(vis[0]), int(vis[1])
+        raise ValueError(
+            f"model.vision_encoder_img_size must be [H, W] with two ints when set; got {vis!r}"
+        )
+    d_raw = OmegaConf.select(cfg.data, "image_size", default=None)
+    if d_raw is not None:
+        img = OmegaConf.to_container(d_raw, resolve=True)
+        if isinstance(img, (list, tuple)) and len(img) >= 2:
+            return int(img[0]), int(img[1])
+    hw = _infer_hw_from_trajectory_images(trajectories)
+    if hw is not None:
+        return hw
+    raise ValueError(
+        "Could not resolve vision (H, W): set model.vision_encoder_img_size=[H,W] or "
+        "data.image_size=[H,W], or use trajectories with RGB under key 'images' "
+        "(per-view arrays shaped (T, H, W, 3))."
+    )
+
+
+def resolve_sequence_token_layout(cfg: Any) -> str:
+    """Model input layout: AD defaults to (state, action, reward) without RTG conditioning."""
+    from omegaconf import OmegaConf
+
+    raw = OmegaConf.select(cfg, "model.sequence_token_layout", default=None)
+    if raw is not None:
+        rs = str(raw).strip().lower().replace("-", "_")
+        if rs and rs not in ("none", "null", "~"):
+            return rs
+    ctx = str(OmegaConf.select(cfg, "data.context_style", default="")).strip().lower()
+    if ctx in ("algorithm_distillation", "ad", "ad_timeline"):
+        return "state_action_reward"
+    m = cfg.model
+    return "rtg_state_action" if bool(m.condition_rtg) else "state_action"
+
+
+def build_model(
+    cfg,
+    state_dim: int,
+    action_dim: int,
+    num_instructions: Optional[int] = None,
+    trajectories: Optional[List[Any]] = None,
+):
+    m = cfg.model
+    seq_layout = resolve_sequence_token_layout(cfg)
+    if seq_layout == "state_action_reward":
+        log.info(
+            "sequence_token_layout=state_action_reward: (s,a,r) sequence, no RTG; "
+            "experiment.eval_target_return is ignored during rollouts."
+        )
     n_inner = m.n_inner or (4 * m.hidden_size)
     num_ctx = int(cfg.data.num_context_trajectories)
     enable_trial_index_embedding = bool(m.use_trial_index_embedding) and num_ctx > 1
@@ -338,13 +417,21 @@ def build_model(cfg, state_dim: int, action_dim: int, num_instructions: Optional
         query_loss_only=m.query_loss_only,
         predict_returns=m.predict_returns,
         predict_state=m.predict_state,
-        condition_rtg=m.condition_rtg,
+        condition_rtg=(seq_layout == "rtg_state_action"),
+        sequence_token_layout=seq_layout,
         use_trial_index_embedding=enable_trial_index_embedding,
         max_trial_embeddings=m.max_trial_embeddings,
     )
     if m.use_vision or m.use_language:
         use_precomputed = cfg.data.use_precomputed_embeddings
         precomputed_dim = m.precomputed_vision_embed_dim
+        vision_encoder_img_size = None
+        if m.use_vision:
+            vision_encoder_img_size = resolve_vision_encoder_hw(cfg, trajectories)
+            log.info(
+                "vision_encoder_img_size={} (model override, data.image_size, or trajectory RGB)",
+                vision_encoder_img_size,
+            )
         model = VLADecisionTransformer(
             **common,
             use_vision=m.use_vision,
@@ -358,6 +445,7 @@ def build_model(cfg, state_dim: int, action_dim: int, num_instructions: Optional
             vision_encoder_attention_pool=m.vision_encoder_attention_pool,
             freeze_vision_encoder=m.freeze_vision_encoder,
             vision_encoder_chunk_size=m.vision_encoder_chunk_size,
+            vision_encoder_img_size=vision_encoder_img_size,
             use_precomputed_embeddings=use_precomputed,
             precomputed_vision_embed_dim=precomputed_dim,
             vision_proprio_attention_fusion=m.vision_proprio_attention_fusion,
@@ -407,6 +495,7 @@ def make_train_step_fn(task_instructions, use_precomputed_embeddings: bool = Fal
         "prompt_m",
         "prompt_trial_idx",
         "instructions",
+        "images",
     ]
 
     def _print_shapes(model, batch, dt_batch, image_embeddings):
@@ -425,6 +514,9 @@ def make_train_step_fn(task_instructions, use_precomputed_embeddings: bool = Fal
             if prompt_t_len == 0 and 9 <= i <= 15:
                 continue
             x = batch[i]
+            if x is None:
+                log.info("[train_batch]   {}: None", name)
+                continue
             if isinstance(x, torch.Tensor):
                 log.info("[train_batch]   {}: {} {}", name, x.dtype, tuple(x.shape))
             elif isinstance(x, (list, tuple)) and x and isinstance(x[0], torch.Tensor):
@@ -447,16 +539,6 @@ def make_train_step_fn(task_instructions, use_precomputed_embeddings: bool = Fal
                 )
         if prompt_t_len == 0:
             log.info("[train_batch]   prompt_*: (no ICL context, T=0 — skipped per-field lines)")
-        if len(batch) > 17 and batch[17] is not None:
-            imgs = batch[17]
-            if isinstance(imgs, (list, tuple)):
-                for v, t in enumerate(imgs):
-                    if isinstance(t, torch.Tensor):
-                        log.info("[train_batch]   images view[{}]: {}", v, tuple(t.shape))
-            elif isinstance(imgs, torch.Tensor):
-                log.info("[train_batch]   image_embeddings (precomputed): {}", tuple(imgs.shape))
-            else:
-                log.info("[train_batch]   images/embeddings: {}", type(imgs).__name__)
         if prompt_t_len > 0:
             log.info("[train_batch]   --- DTBatch (prompt + query) ---")
         else:
@@ -544,15 +626,18 @@ def make_train_step_fn(task_instructions, use_precomputed_embeddings: bool = Fal
         # is off, indices are ignored but must still be passed when the flag is on (otherwise
         # forward() substitutes zeros and trial conditioning is silently disabled).
         trial_batch = query_trial_idx.long()
-        prompt = (
-            prompt_s,
-            prompt_a,
-            prompt_r,
-            prompt_rtg,
-            prompt_ts,
-            prompt_m,
-            prompt_trial_idx.long(),
-        )
+        # Collate keeps a (B, 0, …) prompt for no-ICL runs; DTBatch uses None so forward sees “no prompt”.
+        prompt = None
+        if int(prompt_s.shape[1]) > 0:
+            prompt = (
+                prompt_s,
+                prompt_a,
+                prompt_r,
+                prompt_rtg,
+                prompt_ts,
+                prompt_m,
+                prompt_trial_idx.long(),
+            )
         # VLA-DT: instruction indices (one per sample) from task_instructions
         instruction_indices = None
         if model.use_language and task_list and instructions is not None:
@@ -585,11 +670,17 @@ def make_train_step_fn(task_instructions, use_precomputed_embeddings: bool = Fal
                         log.info("Vision encoder output: {}", tuple(image_embeddings.shape))
                     _vision_encoder_logged[0] = True
 
+        rew_batch = None
+        if getattr(model, "_sequence_token_layout", "") == "state_action_reward":
+            rew_batch = rewards
+            if rew_batch.dim() == 2:
+                rew_batch = rew_batch.unsqueeze(-1)
         dt_batch = DTBatch(
             states=states,
             contexts=contexts,
             actions=actions,
             returns_to_go=rtg,
+            rewards=rew_batch,
             timesteps=timesteps,
             attention_mask=masks,
             trial_indices=trial_batch,
@@ -755,7 +846,7 @@ def main():
     _print_config(cfg)
 
     if args.export_only:
-        model = build_model(cfg, state_dim, action_dim)
+        model = build_model(cfg, state_dim, action_dim, trajectories=None)
         load_checkpoint(args.export_only, model, device=device, weights_only=True)
         export_dir = run_dir / "artifacts" / "inference"
         export_dir.mkdir(parents=True, exist_ok=True)
@@ -801,6 +892,27 @@ def main():
         ms_task = env_name.split("/", 1)[1]
         traj_path = resolve_maniskill_trajectory_path(paths.data_root, ms_task)
         trajectories, prompt_per_task = load_maniskill_trajectories(str(traj_path))
+        if bool(data_cfg.use_vision):
+            from src.data.maniskill_state_filter import (
+                apply_maniskill_vision_proprio_to_bundle,
+                maniskill_task_from_env_name,
+                vision_proprio_slice_for_task,
+            )
+
+            _ms_task = maniskill_task_from_env_name(env_name)
+            if vision_proprio_slice_for_task(_ms_task) is not None:
+                trajectories, prompt_per_task = apply_maniskill_vision_proprio_to_bundle(
+                    trajectories, prompt_per_task, env_name
+                )
+                log.info(
+                    "ManiSkill use_vision: state trimmed to proprio + tcp_pose only (task {})",
+                    _ms_task,
+                )
+            else:
+                log.warning(
+                    "ManiSkill use_vision: no proprio trim layout for {}; using full state vector",
+                    _ms_task,
+                )
         state_dim = int(trajectories[0]["observations"].shape[1])
         action_dim = int(trajectories[0]["actions"].shape[1])
         log.info(
@@ -1060,7 +1172,13 @@ def main():
             )
 
     num_instructions = len(dataset.task_instructions) if dataset.task_instructions else None
-    model = build_model(cfg, state_dim, action_dim, num_instructions=num_instructions).to(device)
+    model = build_model(
+        cfg,
+        state_dim,
+        action_dim,
+        num_instructions=num_instructions,
+        trajectories=dataset.trajectories or None,
+    ).to(device)
     _print_model_architecture(model)
     optimizer, scheduler = build_optimizer_scheduler(model, cfg)
     use_wandb = args.wandb or sys_cfg.use_wandb
@@ -1187,6 +1305,15 @@ def main():
             ms_rm = None
         if isinstance(ms_cm, str) and not ms_cm.strip():
             ms_cm = None
+        ms_state_slice = None
+        if str(eval_rollout_env).startswith("ManiSkill/") and bool(data_cfg.use_vision):
+            from src.data.maniskill_state_filter import (
+                maniskill_task_from_env_name,
+                vision_proprio_slice_for_task,
+            )
+
+            _tid = maniskill_task_from_env_name(str(eval_rollout_env))
+            ms_state_slice = vision_proprio_slice_for_task(_tid)
         # inference_mode: no autograd graph. Without this, rollout chains ~max_episode_steps forwards
         # via actions_t = cat(..., action) and retains the full graph -> CUDA OOM.
         was_training = model.training
@@ -1240,6 +1367,7 @@ def main():
                     maniskill_control_mode=ms_cm
                     if str(eval_rollout_env).startswith("ManiSkill/")
                     else None,
+                    maniskill_state_obs_slice=ms_state_slice,
                 )
                 if cfg.experiment.run_action_compare_eval and dataset.trajectories:
                     action_metrics = run_action_compare_eval(

@@ -10,15 +10,14 @@ Reference: https://github.com/Max-Fu/icrt (ICRA 2025)
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, List, Optional, Tuple, Union
 
-import torch
 import torch.nn as nn
 from torch import Tensor
 
 from src.models.meta_dt import MetaDecisionTransformer
-from src.models.types import DTBatch, DTOutput
-from src.models.vision_encoders import build_vision_encoder, VisionProprioAttentionFusion
+from src.models.types import DTBatch
+from src.models.vision_encoders import VisionProprioAttentionFusion, build_vision_encoder
 
 
 class LanguageEmbedder(nn.Module):
@@ -75,6 +74,7 @@ class VLADecisionTransformer(MetaDecisionTransformer):
         vision_encoder_attention_pool: bool = False,
         freeze_vision_encoder: bool = False,
         vision_encoder_chunk_size: Optional[int] = None,
+        vision_encoder_img_size: Optional[Union[Tuple[int, int], List[int]]] = None,
         use_precomputed_embeddings: bool = False,
         precomputed_vision_embed_dim: Optional[int] = None,
         vision_proprio_attention_fusion: bool = True,
@@ -105,8 +105,22 @@ class VLADecisionTransformer(MetaDecisionTransformer):
         self._use_language_input = use_language_input
         self.vision_fusion = vision_fusion
         self.vision_proprio_attention_fusion = vision_proprio_attention_fusion
+        self.vision_encoder_img_size: Optional[Tuple[int, int]] = None
 
         if use_vision:
+            if vision_encoder_img_size is None:
+                raise ValueError(
+                    "vision_encoder_img_size [H, W] is required when use_vision=True "
+                    "(train.build_model resolves it from data.image_size or trajectory RGB)."
+                )
+            vis_hw = vision_encoder_img_size
+            if not (isinstance(vis_hw, (list, tuple)) and len(vis_hw) >= 2):
+                raise ValueError(
+                    "vision_encoder_img_size must be a length-2 sequence [H, W]; "
+                    f"got {vision_encoder_img_size!r}"
+                )
+            ih, iw = int(vis_hw[0]), int(vis_hw[1])
+            self.vision_encoder_img_size = (ih, iw)
             if use_precomputed_embeddings and precomputed_vision_embed_dim is not None:
                 self.vision_encoder = None
                 vision_embed_dim = precomputed_vision_embed_dim
@@ -126,7 +140,7 @@ class VLADecisionTransformer(MetaDecisionTransformer):
                     encoder_type=vision_encoder_type,
                     num_views=num_views,
                     embed_dim=image_embed_dim,
-                    img_size=(224, 224),
+                    img_size=(ih, iw),
                     pool=vision_encoder_pool,
                     attention_pool=vision_encoder_attention_pool,
                     chunk_size=vision_encoder_chunk_size,

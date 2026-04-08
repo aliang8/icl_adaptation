@@ -104,7 +104,7 @@ def main():
         cfg = OmegaConf.load(run_dir / ".hydra" / "config.yaml")
     else:
         cfg = get_config(str(config_dir), overrides=["data=[base,libero_cosmos]"])
-    model = build_model(cfg, state_dim, act_dim).to(device)
+    model = build_model(cfg, state_dim, act_dim, trajectories=trajectories or None).to(device)
     from src.engine.checkpointing import load_checkpoint
 
     load_checkpoint(str(ckpt_path), model, device=device, weights_only=True)

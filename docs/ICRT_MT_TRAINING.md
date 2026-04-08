@@ -55,7 +55,7 @@ uv run python -m src.train \
 ```
 
 - `data=[base,icrt_mt]` merges `configs/data/base.yaml` with `configs/data/icrt_mt.yaml` (points to `datasets/ICRT-MT/dataset_config.json`).
-- `model=vla_dt` selects the Vision-Language-Action DT (`configs/model/vla_dt.yaml`) with vision and language conditioning.
+- `model=vla_dt` selects the VLA-DT; when `model.vision_encoder_img_size` is unset, training infers **(H, W)** from `data.image_size` (ICRT-MT uses `[224, 224]` in `configs/data/icrt_mt.yaml`).
 - `experiment.eval_every_steps=0` disables the eval hook (no rollout viz, no eval metrics).
 - Training will write to the usual run directory under `outputs/icl_adaptation/<date>/icrt_mt_run__seed_<X>__<hash>/`.
 

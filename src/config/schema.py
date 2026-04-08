@@ -45,6 +45,8 @@ class ModelConfig:
     freeze_vision_encoder: bool = False
     # Process vision encoder in chunks of this many images (None = no chunking). Default 8 reduces OOM for DINOv2.
     vision_encoder_chunk_size: Optional[int] = 8
+    # Patch/crossmae (H, W); null -> infer from data.image_size or trajectory RGB shapes.
+    vision_encoder_img_size: Optional[List[int]] = None
     # When data.use_precomputed_embeddings=true: vision encoder is not loaded at train time; set this to the embedding dim (e.g. 1536 for dinov2 2 views). Required for inference to load the encoder.
     precomputed_vision_embed_dim: Optional[int] = None
     # ICRT-style: attention over [view0, view1, proprio] (or [view0, proprio] if 1 view) to fuse vision + proprio. Default True.
@@ -56,6 +58,9 @@ class ModelConfig:
     predict_state: bool = False
     # Condition on return-to-go in the input (RTG embedding in sequence). If False, input is (state, action) only.
     condition_rtg: bool = True
+    # Per-timestep sequence layout: null -> from condition_rtg, or ``state_action_reward`` when data.context_style is algorithm_distillation.
+    # ``rtg_state_action`` | ``state_action`` | ``state_action_reward`` (s,a,r tokens; no RTG at train or eval).
+    sequence_token_layout: Optional[str] = None
     # If True, add learned trial-index embeddings when data.num_context_trajectories > 1 (no-op if N<=1).
     use_trial_index_embedding: bool = True
     # Embedding table size; index 0 = padding, 1+ = trial ids (clamped to [0, max_trial_embeddings - 1]).
@@ -73,6 +78,7 @@ class DataConfig:
     horizon: int = 20
     # Query = last K steps of current trajectory; K=1 = OpenVLA-style; None = use horizon.
     # Eval passes this (or horizon) as get_action(query_window=K) so query-only rollouts match train padding.
+    # For context_style=algorithm_distillation: K = DT context width on the concat timeline (multi-trial data, K-step causal window).
     query_history_length: Optional[int] = None
     # Used only when context_style=subsampled (steps per context trajectory); ignored when context_style=full_trajectory
     prompt_length: int = 5
@@ -100,7 +106,7 @@ class DataConfig:
     max_prompt_trajectory_length: Optional[int] = None
     # How to subsample each context trajectory: "none" (full trajectory) | "last" | "uniform" | "random"
     context_subsample_strategy: str = "none"
-    # "subsampled" = prompt_length steps per context traj; "full_trajectory" = full traj per demo (capped per traj, then total)
+    # "subsampled" | "full_trajectory" | "algorithm_distillation" (sorted concat timeline, H-step windows, no ICL prompt)
     context_style: str = "subsampled"
     lazy_dataset: bool = True
     max_training_examples: int = 500_000
@@ -226,9 +232,8 @@ class ExperimentConfig:
     )
     # Cap how many rollouts/trials get frame capture + MP4 (None = all). Saves disk and W&B payload.
     num_eval_rollout_videos: Optional[int] = None
-    eval_render_both_views: bool = (
-        True  # if True, LIBERO eval video shows [primary | wrist] horizontally
-    )
+    # LIBERO: stitch primary and wrist side-by-side in eval videos when both exist.
+    eval_render_both_views: bool = True
     run_action_compare_eval: bool = (
         False  # if True, plot predicted vs GT actions on demos to viz/action_compare/
     )

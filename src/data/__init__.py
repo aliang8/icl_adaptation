@@ -1,3 +1,4 @@
+from src.data.algorithm_distillation_dataset import AlgorithmDistillationTrajectoryDataset
 from src.data.dataset import (
     FullTrajectoryICLTrajectoryDataset,
     ICLTrajectoryDatasetBase,
@@ -21,6 +22,7 @@ from src.data.icrt_dataset import (
 )
 
 __all__ = [
+    "AlgorithmDistillationTrajectoryDataset",
     "FullTrajectoryICLTrajectoryDataset",
     "ICLTrajectoryDatasetBase",
     "SubsampledICLTrajectoryDataset",

@@ -20,6 +20,8 @@ class DTBatch:
     actions: Tensor  # [B, T, act_dim]
     returns_to_go: Tensor  # [B, T, 1]
     timesteps: Tensor  # [B, T]
+    # Per-step env rewards [B, T, 1] for ``sequence_token_layout=state_action_reward`` (Algorithm Distillation).
+    rewards: Optional[Tensor] = None
     attention_mask: Optional[Tensor] = None  # [B, T]
     # Trial id per timestep: **0** = padding; prompt uses **1..**; query = max(valid prompt trial) + 1.
     trial_indices: Optional[Tensor] = None  # [B, T], long

@@ -96,9 +96,16 @@ def run_action_compare_eval(
                 prev_actions = prev_actions.reshape(1, t, act_dim)
                 pad_last = torch.zeros(1, 1, act_dim, device=device)
                 actions_input = torch.cat([prev_actions, pad_last], dim=1)
-            returns_to_go = torch.from_numpy(rtg_seg).float().to(device)
             timesteps = torch.from_numpy(timesteps_np).long().to(device)
             rewards_unused = torch.zeros(0, device=device, dtype=torch.float32)
+            if getattr(model, "_sequence_token_layout", "") == "state_action_reward":
+                returns_to_go = torch.zeros(1, L, 1, device=device, dtype=torch.float32)
+                rewards_for_ga = (
+                    torch.from_numpy(rewards[:L].astype(np.float32)).reshape(1, L, 1).to(device)
+                )
+            else:
+                returns_to_go = torch.from_numpy(rtg_seg).float().to(device)
+                rewards_for_ga = rewards_unused
 
             with torch.no_grad():
                 qwin = int(model.max_length) if model.max_length is not None else None
@@ -106,7 +113,7 @@ def run_action_compare_eval(
                     states,
                     contexts,
                     actions_input,
-                    rewards_unused,
+                    rewards_for_ga,
                     returns_to_go,
                     timesteps,
                     prompt=None,

@@ -122,3 +122,67 @@ CUDA_VISIBLE_DEVICES=3 ./.venv-maniskill/bin/python -m src.train \
   system.run_name=maniskill-pickcube_dt_rtg_only_lr_1e-4 \
   paths.data_root=/scr2/shared/icl_adaptation/datasets \
   --wandb
+
+# ManiSkill PickCube — same as RTG-only block but **pixels + DINOv2** (model=vla_dt). Training always reads
+# paths.data_root/maniskill/PickCube-v1/trajectories.h5 — merge snapshots into that path (backup old file first), e.g.:
+#   uv run python scripts/maniskill/maniskill_merge_trajectories.py \
+#     -o /scr2/shared/icl_adaptation/datasets/maniskill/PickCube-v1/trajectories.h5 \
+#     /scr2/shared/icl_adaptation/datasets/maniskill/PickCube-v1/image_snapshots
+export PYTHONPATH="${PWD}${PYTHONPATH:+:$PYTHONPATH}"
+./.venv-maniskill/bin/python -m src.train \
+  --override data=[base,maniskill_pickcube] \
+  --override model=vla_dt \
+  experiment.max_steps=100000 \
+  data.batch_size=32 \
+  data.num_context_trajectories=0 \
+  data.randomize_num_context_trajectories=false \
+  data.use_vision=true \
+  experiment.eval_every_steps=1000 \
+  experiment.eval_num_trials=1 \
+  experiment.eval_target_return=20 \
+  experiment.num_eval_rollouts=4 \
+  data.rtg_scale=1.0 \
+  data.horizon=20 \
+  model.max_length=20 \
+  model.use_vision=true \
+  model.use_language=false \
+  model.num_views=1 \
+  model.vision_encoder_type=patch \
+  model.freeze_vision_encoder=false \
+  model.query_loss_only=false \
+  model.n_layer=6 \
+  model.n_head=4 \
+  optim.lr=1e-4 \
+  system.run_name=maniskill-pickcube_dt_patch_rgb \
+  paths.data_root=/scr2/shared/icl_adaptation/datasets \
+  --wandb
+
+
+# AD (state-only): concat timeline over trials; K = data.horizon; model.max_length >= K.
+# num_eval_rollouts = independent eval sessions for metric variance only, not context width.
+export PYTHONPATH="${PWD}${PYTHONPATH:+:$PYTHONPATH}"
+./.venv-maniskill/bin/python -m src.train \
+  --override data=[base,maniskill_pickcube] \
+  --override model=vla_dt \
+  experiment.max_steps=100000 \
+  data.batch_size=32 \
+  data.context_style=algorithm_distillation \
+  data.num_context_trajectories=0 \
+  data.randomize_num_context_trajectories=false \
+  data.use_vision=false \
+  experiment.eval_every_steps=1000 \
+  experiment.eval_num_trials=1 \
+  experiment.eval_target_return=20 \
+  experiment.num_eval_rollouts=5 \
+  data.rtg_scale=1.0 \
+  data.horizon=60 \
+  model.max_length=60 \
+  model.use_vision=false \
+  model.use_language=false \
+  model.query_loss_only=false \
+  model.n_layer=6 \
+  model.n_head=4 \
+  optim.lr=1e-4 \
+  system.run_name=maniskill-pickcube_dt_state_ad \
+  paths.data_root=/scr2/shared/icl_adaptation/datasets \
+  --wandb

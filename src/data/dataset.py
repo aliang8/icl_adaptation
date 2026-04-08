@@ -1042,20 +1042,15 @@ def collate_icl_batch(batch: List[Tuple[Any, ...]]) -> Tuple[Any, ...]:
             padded = [_pad_to_length(t, max_len, dim=0, pad_value=pad_val) for t in tensors]
         out.append(torch.stack(padded, dim=0))
     if num_elems > 17:
-        elem_17 = batch[0][17]
+        # Slot 17: precomputed embeddings are a Tensor (dim 2/3); pixels are a list of per-view tensors.
+        # Do not require batch[0][17] to be a Tensor — that wrongly dropped all pixel batches (list of views).
         is_precomputed = any(
             sample[17] is not None
             and isinstance(sample[17], torch.Tensor)
             and sample[17].dim() in (2, 3)
             for sample in batch
         )
-        if not is_precomputed and (
-            elem_17 is None or not isinstance(elem_17, torch.Tensor) or elem_17.dim() not in (2, 3)
-        ):
-            elem_17 = None
-        if elem_17 is None and not is_precomputed:
-            out.append(None)
-        elif is_precomputed:
+        if is_precomputed:
             # Precomputed embeddings: each sample (1, T, D) or None; pad T and stack to (B, T_max, D)
             tensors = [sample[17] for sample in batch]
             non_none = [t for t in tensors if t is not None]
@@ -1162,7 +1157,12 @@ def collate_icl_batch(batch: List[Tuple[Any, ...]]) -> Tuple[Any, ...]:
 def get_icl_trajectory_dataset(
     context_style: str = "subsampled", **kwargs: Any
 ) -> ICLTrajectoryDatasetBase:
-    """Return SubsampledICLTrajectoryDataset or FullTrajectoryICLTrajectoryDataset by ``context_style``."""
-    if context_style == "full_trajectory":
+    """Return dataset class selected by ``context_style``."""
+    style = str(context_style).strip().lower()
+    if style == "full_trajectory":
         return FullTrajectoryICLTrajectoryDataset(**kwargs)
+    if style in ("algorithm_distillation", "ad", "ad_timeline"):
+        from src.data.algorithm_distillation_dataset import AlgorithmDistillationTrajectoryDataset
+
+        return AlgorithmDistillationTrajectoryDataset(**kwargs)
     return SubsampledICLTrajectoryDataset(**kwargs)

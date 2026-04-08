@@ -193,7 +193,13 @@ def main() -> None:
         log.info("Using state_mean/state_std from dataset.")
 
     num_instructions = len(dataset.task_instructions) if dataset.task_instructions else None
-    model = build_model(cfg, state_dim, action_dim, num_instructions=num_instructions).to(device)
+    model = build_model(
+        cfg,
+        state_dim,
+        action_dim,
+        num_instructions=num_instructions,
+        trajectories=dataset.trajectories or None,
+    ).to(device)
     inc = model.load_state_dict(ckpt["model"], strict=bool(args.strict))
     if not args.strict:
         log.info(

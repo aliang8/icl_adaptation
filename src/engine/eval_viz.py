@@ -96,8 +96,8 @@ def _log_eval_transformer_seq(
     """
     if not isinstance(model, MetaDecisionTransformer):
         raise TypeError(f"eval expects MetaDecisionTransformer, got {type(model)}")
-    condition_rtg = model._condition_rtg
-    tokens_per_step = 3 if condition_rtg else 2
+    layout = getattr(model, "_sequence_token_layout", "rtg_state_action")
+    tokens_per_step = 3 if layout in ("rtg_state_action", "state_action_reward") else 2
     if query_window is not None:
         max_len = int(query_window)
     else:
@@ -178,6 +178,7 @@ def _try_make_env(
     maniskill_sim_backend: Optional[str] = None,
     maniskill_reward_mode: Optional[str] = None,
     maniskill_control_mode: Optional[str] = None,
+    maniskill_state_obs_slice: Optional[slice] = None,
 ):
     """Create env: LIBERO suite (libero_10, ...) via make_libero_env, else Gymnasium/gym. Returns None if env or deps missing.
     render_both_views is only used for LIBERO (primary + wrist); Gymnasium envs have a single camera.
@@ -218,6 +219,7 @@ def _try_make_env(
             reward_mode=maniskill_reward_mode,
             control_mode=maniskill_control_mode,
             reconfiguration_freq=1,
+            state_obs_slice=maniskill_state_obs_slice,
         )
 
     import gymnasium as gym
@@ -840,14 +842,17 @@ def _annotated_rollout_frames(
     """Overlay trial id, timestep, RTG token (before ``get_action``), and cumulative env return."""
     if not isinstance(model, MetaDecisionTransformer):
         raise TypeError(f"eval expects MetaDecisionTransformer, got {type(model)}")
-    cond_rtg = model._condition_rtg
+    layout = getattr(model, "_sequence_token_layout", "rtg_state_action")
+    cond_rtg = layout == "rtg_state_action"
     out: List[np.ndarray] = []
     for t, f in enumerate(frames):
         lines = [f"{trial_tag}  t={t}"]
         if cond_rtg and t < len(rtg_per_frame):
             # Same units as training: RTG token = future_return / rtg_scale (~O(1)).
             lines.append(f"RTG target: {rtg_per_frame[t]:.4f}")
-        elif not cond_rtg:
+        elif layout == "state_action_reward":
+            lines.append("policy: (s,a,r) no RTG")
+        else:
             lines.append("RTG: off")
         if cum_return_per_frame is not None and t < len(cum_return_per_frame):
             lines.append(f"return: {cum_return_per_frame[t]:.2f}")
@@ -858,7 +863,7 @@ def _annotated_rollout_frames(
 def _preprocess_frames_for_encoder(
     frames: List[np.ndarray],
     device: Any,
-    size: Tuple[int, int] = (224, 224),
+    size: Tuple[int, int],
 ) -> Any:
     """Convert list of (H, W, 3) uint8 to (1, T, 3, H, W) float, ImageNet normalized. Matches precompute_libero_embeddings."""
     import torch
@@ -886,6 +891,40 @@ def _preprocess_frames_for_encoder(
     return x.unsqueeze(0)
 
 
+def _raise_missing_eval_vision_images(
+    *,
+    model: Any,
+    env_name: str,
+    env: Any,
+    timestep: int,
+) -> None:
+    """Hard fail when a live vision encoder expects pixels but the env provided none."""
+    use_vision_cfg = getattr(model, "use_vision", None)
+    extra = ""
+    if use_vision_cfg is not None:
+        extra = f" model.use_vision={use_vision_cfg!r};"
+    raise RuntimeError(
+        "Vision inference requires camera frames from the eval environment, but "
+        f"image_embeddings could not be built (timestep t={timestep}).{extra} "
+        f"env_name={env_name!r} env_type={type(env).__name__}. "
+        "Implement get_current_images() to return uint8 (H, W, 3) RGB (primary and optionally wrist), "
+        "and for Gymnasium or ManiSkill create the env with render_mode='rgb_array' so render() "
+        "returns pixels."
+    )
+
+
+def _vision_encoder_num_views(vision_encoder: Any) -> int:
+    nv = getattr(vision_encoder, "num_views", None)
+    if nv is not None:
+        return int(nv)
+    inner = getattr(vision_encoder, "encoder", None)
+    if inner is not None:
+        nv2 = getattr(inner, "num_views", None)
+        if nv2 is not None:
+            return int(nv2)
+    return 2
+
+
 def _encode_rollout_images(
     image_list: List[Tuple[Any, Any]],
     model: Any,
@@ -909,15 +948,26 @@ def _encode_rollout_images(
     if not primary_frames and not wrist_frames:
         return None
     if not primary_frames:
-        primary_frames = wrist_frames
+        primary_frames = list(wrist_frames)
     if not wrist_frames:
-        wrist_frames = primary_frames
-    v0 = _preprocess_frames_for_encoder(primary_frames, device)
-    v1 = _preprocess_frames_for_encoder(wrist_frames, device)
-    if v0 is None or v1 is None:
-        return None
+        wrist_frames = list(primary_frames)
+    n_views = _vision_encoder_num_views(vision_encoder)
+    view_tensors = []
+    enc_hw = getattr(model, "vision_encoder_img_size", None)
+    if enc_hw is None:
+        raise RuntimeError(
+            "model.vision_encoder_img_size is required for eval image preprocessing "
+            f"(got {type(model).__name__} with vision_encoder set)."
+        )
+    enc_size = (int(enc_hw[0]), int(enc_hw[1]))
+    for vi in range(n_views):
+        frames = primary_frames if vi == 0 else wrist_frames
+        vt = _preprocess_frames_for_encoder(frames, device, size=enc_size)
+        if vt is None:
+            return None
+        view_tensors.append(vt)
     with torch.no_grad():
-        emb = vision_encoder([v0, v1])
+        emb = vision_encoder(view_tensors)
     if emb is not None and emb.dim() == 3:
         return emb
     return None
@@ -973,8 +1023,13 @@ def _run_one_rollout(
     if isinstance(obs, tuple):
         obs = obs[0]
     frames: List[np.ndarray] = []
-    rtg0 = initial_rtg_token(rtg_scale, eval_target_return=eval_target_return)
-    returns_to_go = torch.tensor([[rtg0]], device=device, dtype=torch.float32)
+    layout = getattr(model, "_sequence_token_layout", "rtg_state_action")
+    use_rtg_rollout = layout == "rtg_state_action"
+    if use_rtg_rollout:
+        rtg0 = initial_rtg_token(rtg_scale, eval_target_return=eval_target_return)
+        returns_to_go = torch.tensor([[rtg0]], device=device, dtype=torch.float32)
+    else:
+        returns_to_go = torch.zeros((1, 1, 1), device=device, dtype=torch.float32)
     if collect_frames:
         frame = _render_rgb_frame(env)
         if frame is not None:
@@ -991,7 +1046,7 @@ def _run_one_rollout(
         1, context_dim, device=device
     )  # get_action expands to len(states) if needed
     actions_t = torch.zeros(0, model.act_dim, device=device)
-    rewards_t = torch.zeros(0, device=device)
+    rewards_t = torch.zeros(0, device=device, dtype=torch.float32)
     timesteps = torch.zeros(1, 1, dtype=torch.long, device=device)
     ep_states = [obs.copy()]
     ep_actions: List[np.ndarray] = []
@@ -1041,8 +1096,16 @@ def _run_one_rollout(
                 )
 
         image_embeddings = None
-        if use_vision and image_list:
-            image_embeddings = _encode_rollout_images(image_list, model, device)
+        if use_vision:
+            if image_list:
+                image_embeddings = _encode_rollout_images(image_list, model, device)
+            if image_embeddings is None:
+                _raise_missing_eval_vision_images(
+                    model=model,
+                    env_name=env_name,
+                    env=env,
+                    timestep=t,
+                )
         ga_kw: Dict[str, Any] = dict(
             image_embeddings=image_embeddings,
             query_trial_index=qti,
@@ -1093,9 +1156,14 @@ def _run_one_rollout(
         states = torch.cat(
             [states, torch.from_numpy(next_obs).float().reshape(1, -1).to(device)], dim=0
         )
-        returns_to_go = torch.cat(
-            [returns_to_go, (returns_to_go[0, -1] - r_env / rtg_scale).reshape(1, 1)], dim=1
-        )
+        if use_rtg_rollout:
+            returns_to_go = torch.cat(
+                [returns_to_go, (returns_to_go[0, -1] - r_env / rtg_scale).reshape(1, 1)], dim=1
+            )
+        else:
+            returns_to_go = torch.cat(
+                [returns_to_go, torch.zeros(1, 1, 1, device=device, dtype=torch.float32)], dim=1
+            )
         timesteps = torch.cat([timesteps, torch.tensor([[t + 1]], device=device)], dim=1)
         if done or truncated:
             break
@@ -1158,6 +1226,7 @@ def run_rollouts_and_save_viz(
     maniskill_sim_backend: Optional[str] = None,
     maniskill_reward_mode: Optional[str] = None,
     maniskill_control_mode: Optional[str] = None,
+    maniskill_state_obs_slice: Optional[slice] = None,
 ) -> Dict[str, float]:
     """
     Run eval rollouts (and, in zero-shot, ``eval_num_trials`` in-session episodes per session).
@@ -1237,9 +1306,12 @@ def run_rollouts_and_save_viz(
         return idx < video_cap
 
     need_pixel_env = collect_frames and (video_cap is None or video_cap > 0)
-    # Gymnasium needs render_mode="rgb_array" at construction for env.render() to return pixels.
+    # Gymnasium / ManiSkill need render_mode="rgb_array" at construction for env.render() pixels.
     gym_render_mode: Optional[str] = None
-    if need_pixel_env and env_name not in LIBERO_SUITES:
+    need_maniskill_vision_render = getattr(model, "vision_encoder", None) is not None and str(
+        env_name
+    ).startswith("ManiSkill/")
+    if env_name not in LIBERO_SUITES and (need_pixel_env or need_maniskill_vision_render):
         gym_render_mode = "rgb_array"
 
     env = _try_make_env(
@@ -1253,6 +1325,7 @@ def run_rollouts_and_save_viz(
         maniskill_sim_backend=maniskill_sim_backend,
         maniskill_reward_mode=maniskill_reward_mode,
         maniskill_control_mode=maniskill_control_mode,
+        maniskill_state_obs_slice=maniskill_state_obs_slice,
     )
     if env is None:
         if env_name in LIBERO_SUITES:
@@ -1317,7 +1390,13 @@ def run_rollouts_and_save_viz(
     state_std_t = np.asarray(state_std_t, dtype=np.float32)
 
     per_trial_eval_G_zs: Optional[List[Optional[float]]] = None
-    if eval_context_mode == "zero_shot_adaptation" and int(eval_num_trials) > 0:
+    _lay_m = getattr(model, "_sequence_token_layout", "rtg_state_action")
+    if _lay_m == "state_action_reward":
+        print(
+            "Eval: state_action_reward layout — (s,a,r) policy; eval_target_return / RTG rollouts unused.",
+            flush=True,
+        )
+    elif eval_context_mode == "zero_shot_adaptation" and int(eval_num_trials) > 0:
         per_trial_eval_G_zs = _resolve_per_trial_eval_target_returns(
             int(eval_num_trials), eval_target_return, eval_target_returns
         )
@@ -1368,8 +1447,8 @@ def run_rollouts_and_save_viz(
         ml_fallback = model.max_length if model.max_length is not None else 20
         current_trial_k = int(K) if K is not None else int(ml_fallback)
         ml_model = model.max_length
-        cond_rtg = model._condition_rtg
-        tps = 3 if cond_rtg else 2
+        _lay = getattr(model, "_sequence_token_layout", "rtg_state_action")
+        tps = 3 if _lay in ("rtg_state_action", "state_action_reward") else 2
         ctx_cap: Optional[int] = None
         if num_context_trajectories is not None:
             ctx_cap = max(0, int(num_context_trajectories))
@@ -1917,20 +1996,19 @@ def run_rollouts_and_save_viz(
     if rtg_dyn_paths and logger is not None and logger._wandb is not None:
         import wandb
 
-        for ti, p in enumerate(rtg_dyn_paths):
-            if len(rtg_dyn_paths) == 1:
-                key = "eval/rtg_reward_dynamics"
-            elif len(rtg_dyn_paths) == 2 and ti == 0:
-                key = "eval/rtg_reward_dynamics"
-            elif len(rtg_dyn_paths) == 2 and ti == 1:
-                key = "eval/rtg_reward_dynamics_mean_std"
-            else:
-                key = f"eval/rtg_reward_dynamics_trial_{ti + 1}"
-            logger.log_wandb_dict(
-                {key: wandb.Image(str(p))},
-                step=step,
-                wandb_commit=wb_commit_charts,
-            )
+        # One W&B panel: prefer mean±std across rollouts/sessions when a second PNG exists;
+        # all paths are still saved under viz/ for local inspection.
+        wb_rtg_path: Path
+        wb_rtg_path = Path(rtg_dyn_paths[-1])
+        for p in rtg_dyn_paths:
+            if "_mean_std" in Path(p).stem:
+                wb_rtg_path = Path(p)
+                break
+        logger.log_wandb_dict(
+            {"eval/rtg_reward_dynamics": wandb.Image(str(wb_rtg_path))},
+            step=step,
+            wandb_commit=wb_commit_charts,
+        )
 
     if len(all_returns) == 0:
         metrics = {
