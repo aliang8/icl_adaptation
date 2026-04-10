@@ -31,10 +31,17 @@ import h5py
 
 import torch.nn.functional as F
 
-from src.data.trajectories import sort_trajectories_by_return
+from loguru import logger as log
+
+from src.data.trajectories import sort_trajectories_by_return, trajectory_return
 
 HDF5_TRAJ_FILE_ATTR = "icl_adaptation_maniskill_trajectories"
 HDF5_TRAJ_VERSION = 2
+
+# Episode metrics from ManiSkill / Gymnasium; bool or 0/1 after JSON round-trip.
+_BOOLISH_EPISODE_META_KEYS = frozenset(
+    {"success_once", "success_at_end", "fail_once", "fail_at_end"}
+)
 
 # Row chunk size along the flat time axis (timesteps per HDF5 chunk).
 _H5_FLAT_CHUNK_ROWS = 8192
@@ -326,13 +333,202 @@ def load_trajectories_hdf5(path: Path) -> List[Dict[str, Any]]:
     return out
 
 
-def load_trajectories_file(path: Union[str, Path]) -> List[Dict[str, Any]]:
-    """Load ManiSkill trajectory bundle from ``.h5`` / ``.hdf5`` (flat v2 only)."""
+def load_trajectories_file(
+    path: Union[str, Path],
+    *,
+    episode_length_eq: Optional[int] = None,
+    log_summary: bool = False,
+) -> List[Dict[str, Any]]:
+    """Load ManiSkill trajectory bundle from ``.h5`` / ``.hdf5`` (flat v2 only).
+
+    If ``episode_length_eq`` is set, keep only trajectories whose reward length equals that value
+    (typical AD use: ``max_episode_steps``). When ``log_summary`` is true, logs a formatted summary
+    before and after filtering (if any).
+    """
     p = Path(path)
     suf = p.suffix.lower()
-    if suf in (".h5", ".hdf5"):
-        return load_trajectories_hdf5(p)
-    raise ValueError(f"Unsupported trajectory file type: {p} (expected .h5 or .hdf5)")
+    if suf not in (".h5", ".hdf5"):
+        raise ValueError(f"Unsupported trajectory file type: {p} (expected .h5 or .hdf5)")
+    tr = load_trajectories_hdf5(p)
+    hint = str(p)
+    if log_summary:
+        log.info(
+            "{}\n{}",
+            f"ManiSkill trajectory bundle (raw): {p.name}",
+            format_maniskill_trajectory_summary(tr, source_hint=hint),
+        )
+    if episode_length_eq is not None:
+        tr, n_before, n_after = filter_trajectories_episode_length_eq(tr, int(episode_length_eq))
+        log.info(
+            "ManiSkill length filter: kept {}/{} episodes with T == {}",
+            n_after,
+            n_before,
+            int(episode_length_eq),
+        )
+        if log_summary:
+            log.info(
+                "{}\n{}",
+                f"ManiSkill trajectory bundle (after T=={int(episode_length_eq)}): {p.name}",
+                format_maniskill_trajectory_summary(tr, source_hint=hint),
+            )
+    return tr
+
+
+def episode_length_from_trajectory(t: Dict[str, Any]) -> int:
+    """Episode length ``T`` from ``rewards`` (fallback ``observations``)."""
+    r = t.get("rewards")
+    if r is not None:
+        return int(np.asarray(r, dtype=np.float32).reshape(-1).shape[0])
+    o = t.get("observations")
+    if o is not None:
+        return int(np.asarray(o, dtype=np.float32).shape[0])
+    raise ValueError("trajectory missing rewards and observations")
+
+
+def filter_trajectories_episode_length_eq(
+    trajectories: List[Dict[str, Any]],
+    target_length: int,
+) -> Tuple[List[Dict[str, Any]], int, int]:
+    """Keep episodes with ``T == target_length``. Returns ``(filtered, n_before, n_after)``."""
+    n_before = len(trajectories)
+    tl = int(target_length)
+    out: List[Dict[str, Any]] = []
+    for t in trajectories:
+        if episode_length_from_trajectory(t) == tl:
+            out.append(t)
+    return out, n_before, len(out)
+
+
+def _collect_episode_meta_scalars(
+    em: Dict[str, Any],
+    meta_bool: Dict[str, List[float]],
+    meta_num: Dict[str, List[float]],
+) -> None:
+    for k, v in em.items():
+        if isinstance(v, (bool, np.bool_)):
+            meta_bool.setdefault(k, []).append(float(bool(v)))
+            continue
+        if (
+            k in _BOOLISH_EPISODE_META_KEYS
+            and isinstance(v, (int, np.integer, float, np.floating))
+            and not isinstance(v, bool)
+        ):
+            fv = float(v)
+            if fv in (0.0, 1.0):
+                meta_bool.setdefault(k, []).append(fv)
+                continue
+        if isinstance(v, (int, np.integer)) and not isinstance(v, bool):
+            meta_num.setdefault(k, []).append(float(v))
+            continue
+        if isinstance(v, (float, np.floating)):
+            meta_num.setdefault(k, []).append(float(v))
+
+
+def format_maniskill_trajectory_summary(
+    trajs: List[Dict[str, Any]],
+    *,
+    source_hint: str = "",
+) -> str:
+    """
+    Human-readable stats: counts, length / return distribution, RGB presence, ``episode_meta``
+    aggregates (success rates, numeric means).
+    """
+    n = len(trajs)
+    lines: List[str] = []
+    if source_hint:
+        lines.append(f"  source: {source_hint}")
+    if n == 0:
+        lines.append("  (empty)")
+        return "\n".join(lines)
+
+    lens: List[int] = []
+    rets: List[float] = []
+    n_img = 0
+    img_shape: Optional[Tuple[int, ...]] = None
+    obs_dim: Optional[int] = None
+    act_dim: Optional[int] = None
+    n_meta = 0
+    meta_bool: Dict[str, List[float]] = {}
+    meta_num: Dict[str, List[float]] = {}
+
+    for t in trajs:
+        o = t.get("observations")
+        a = t.get("actions")
+        r = t.get("rewards")
+        if o is None or a is None or r is None:
+            continue
+        oa = np.asarray(o, dtype=np.float32)
+        aa = np.asarray(a, dtype=np.float32)
+        lens.append(int(oa.shape[0]))
+        rets.append(trajectory_return(t))
+        if obs_dim is None:
+            obs_dim = int(oa.shape[-1]) if oa.ndim >= 2 else int(oa.size)
+        if act_dim is None:
+            act_dim = int(aa.shape[-1]) if aa.ndim >= 2 else int(aa.size)
+        imgs = t.get("images")
+        if isinstance(imgs, list) and len(imgs) > 0:
+            n_img += 1
+            if img_shape is None:
+                img_shape = tuple(np.asarray(imgs[0]).shape)
+        em = t.get("episode_meta")
+        if isinstance(em, dict) and em:
+            n_meta += 1
+            _collect_episode_meta_scalars(em, meta_bool, meta_num)
+
+    if not lens:
+        lines.append("  (no valid trajectories: missing obs/actions/rewards)")
+        return "\n".join(lines)
+
+    la = np.asarray(lens, dtype=np.float64)
+    ra = np.asarray(rets, dtype=np.float64)
+    lines.append(f"  episodes:           {len(lens)}")
+    lines.append(
+        f"  episode length:     mean={la.mean():.2f}  std={la.std():.2f}  "
+        f"min={int(la.min())}  max={int(la.max())}"
+    )
+    lines.append(
+        f"  return (sum r):      mean={ra.mean():.6g}  std={ra.std():.6g}  "
+        f"min={ra.min():.6g}  max={ra.max():.6g}"
+    )
+    if obs_dim is not None:
+        lines.append(f"  state_dim:          {obs_dim}")
+    if act_dim is not None:
+        lines.append(f"  action_dim:         {act_dim}")
+    lines.append(f"  with images:        {n_img}/{len(lens)}")
+    if img_shape is not None:
+        lines.append(f"  image shape (1st):  {img_shape}")
+    lines.append(f"  with episode_meta:  {n_meta}/{len(lens)}")
+    if n_meta < len(lens):
+        lines.append(f"  episode_meta missing: {len(lens) - n_meta}/{len(lens)}")
+
+    if meta_bool:
+        lines.append("  episode_meta (boolean / 0-1):")
+        for k in sorted(meta_bool.keys()):
+            vals = np.asarray(meta_bool[k], dtype=np.float64)
+            lines.append(
+                f"    {k:20s}  true_rate={vals.mean():.4f}  (n={len(vals)} episodes with key)"
+            )
+
+    if meta_num:
+        lines.append("  episode_meta (numeric):")
+        for k in sorted(meta_num.keys()):
+            vals = np.asarray(meta_num[k], dtype=np.float64)
+            lines.append(
+                f"    {k:20s}  mean={vals.mean():.4f}  std={vals.std():.4f}  "
+                f"min={vals.min():.4f}  max={vals.max():.4f}  (n={len(vals)})"
+            )
+
+    return "\n".join(lines)
+
+
+def summarize_maniskill_trajectories(
+    trajs: List[Dict[str, Any]],
+    *,
+    title: str = "ManiSkill trajectories",
+    source_hint: str = "",
+) -> None:
+    """Log :func:`format_maniskill_trajectory_summary` under ``title``."""
+    log.info("{}\n{}", title, format_maniskill_trajectory_summary(trajs, source_hint=source_hint))
 
 
 def _assert_trajectories_compatible_for_merge(trajs: List[Dict[str, Any]]) -> None:

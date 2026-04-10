@@ -3,7 +3,7 @@
 data_dir: datasets
 data_quality: ""
 horizon: 20
-# Query = last K steps of current trajectory (K=1 is OpenVLA-style; null = use horizon)
+# ICL: query segment K (null = horizon). algorithm_distillation: training window = horizon; if set, also eval get_action history K.
 query_history_length: null
 prompt_length: 5
 # DT RTG: cumsum(raw env rewards) / rtg_scale (step rewards unchanged in trajectories).

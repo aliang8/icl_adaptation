@@ -11,6 +11,10 @@ eval_reward_model: null
 eval_target_return: null
 # Zero-shot: optional list of G per trial (len must match eval_num_trials). null -> use eval_target_return with (i+1)/K*G per trial when K>1
 eval_target_returns: null
+# Eval env reset seeds; null = auto list from num_eval_rollouts (× trials if randomize_scene_between_trials)
+eval_scene_seeds: null
+# Zero-shot multi-trial: false = same scene every trial in a session; true = new seed per trial
+randomize_scene_between_trials: false
 save_eval_video: true  # set true to save eval rollout videos to viz/samples/step_XXX/videos/
 # null = record every rollout/trial; int = only first N (still run all rollouts for metrics)
 num_eval_rollout_videos: null

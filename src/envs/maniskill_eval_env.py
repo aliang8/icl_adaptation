@@ -16,7 +16,7 @@ import numpy as np
 
 
 def _vec_render_to_hwc_u8(vec_env: Any) -> Optional[np.ndarray]:
-    """ManiSkill ``render()`` -> (H, W, 3) uint8 RGB (aligned with eval_viz._render_rgb_frame)."""
+    """ManiSkill ``render()`` -> (H, W, 3) uint8 RGB (aligned with ``src.envs.eval_gym.render_rgb_frame``)."""
     frame = vec_env.render()
     if frame is None:
         return None

@@ -891,7 +891,13 @@ def main():
 
         ms_task = env_name.split("/", 1)[1]
         traj_path = resolve_maniskill_trajectory_path(paths.data_root, ms_task)
-        trajectories, prompt_per_task = load_maniskill_trajectories(str(traj_path))
+        _ms_ctx = str(data_cfg.context_style).strip().lower()
+        _ms_ad = _ms_ctx in ("algorithm_distillation", "ad", "ad_timeline")
+        trajectories, prompt_per_task = load_maniskill_trajectories(
+            str(traj_path),
+            episode_length_eq=int(data_cfg.max_episode_steps) if _ms_ad else None,
+            log_summary=True,
+        )
         if bool(data_cfg.use_vision):
             from src.data.maniskill_state_filter import (
                 apply_maniskill_vision_proprio_to_bundle,
@@ -1250,6 +1256,17 @@ def main():
             if data_cfg.query_history_length is not None
             else int(data_cfg.horizon)
         )
+        _ctx_st = str(data_cfg.context_style).strip().lower()
+        if _ctx_st in ("algorithm_distillation", "ad", "ad_timeline"):
+            _train_k = int(data_cfg.horizon)
+            if int(eval_query_window) != _train_k:
+                log.info(
+                    "algorithm_distillation: eval query_window K={} (train K=data.horizon={}); "
+                    "ensure model.max_length >= {}",
+                    eval_query_window,
+                    _train_k,
+                    max(int(eval_query_window), _train_k),
+                )
         prompt_trajectories = None
         if eval_mode == "prompt" and dataset.trajectories:
             prompt_trajectories = sample_context_trajectories(
@@ -1292,6 +1309,12 @@ def main():
         )
         if eval_target_returns_list is not None:
             eval_target_returns_list = [float(x) for x in list(eval_target_returns_list)]
+        eval_scene_seeds_list = OmegaConf.select(cfg, "experiment.eval_scene_seeds", default=None)
+        if eval_scene_seeds_list is not None:
+            eval_scene_seeds_list = [int(x) for x in list(eval_scene_seeds_list)]
+        randomize_scene_between_trials = bool(
+            OmegaConf.select(cfg, "experiment.randomize_scene_between_trials", default=False)
+        )
         # Dual-camera stitch is LIBERO-only; Gymnasium (HalfCheetah, etc.) has a single render view.
         eval_render_both_views = bool(cfg.experiment.eval_render_both_views) and (
             env_name in LIBERO_SUITES
@@ -1368,6 +1391,8 @@ def main():
                     if str(eval_rollout_env).startswith("ManiSkill/")
                     else None,
                     maniskill_state_obs_slice=ms_state_slice,
+                    eval_scene_seeds=eval_scene_seeds_list,
+                    randomize_scene_between_trials=randomize_scene_between_trials,
                 )
                 if cfg.experiment.run_action_compare_eval and dataset.trajectories:
                     action_metrics = run_action_compare_eval(

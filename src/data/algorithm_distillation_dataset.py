@@ -1,17 +1,10 @@
 """
-Algorithm-distillation-style training data: sort trajectories by return, concatenate **many
-episodes into one timeline** (“learning across trials”), then sample a **fixed-length window
-of K consecutive transitions** — the same K-step causal context as DT (no long prompt).
+AD dataset: episodes with length ``== max_episode_steps`` only; then the lowest-return subset (capped
+by ``ALGORITHM_DISTILLATION_TOP_N_EPISODES``) is concatenated low→high by sum of rewards (reversed if
+``context_sort_ascending`` is false). Sample ``data.horizon`` windows along that timeline.
 
-**K** = ``query_history_length`` if set, else ``data.horizon``. Set ``model.max_length`` ≥ K.
-A small K still crosses episode boundaries whenever the random window straddles a concat joint.
-
-**Timestep tokens** are **chunk-relative** only: ``0 … K-1`` within the sampled window (left-pad
-slots use 0). They do **not** reset at real episode boundaries and are **not** clipped to
-``max_episode_steps`` — boundary structure is left to states, rewards, and dones.
-
-**Returns-to-go slot:** query ``rtg`` tensors are **zeros** (collate-compatible). Training uses
-``sequence_token_layout=state_action_reward`` (``(s,a,r)`` tokens; no RTG conditioning).
+Set ``model.max_length`` ≥ train ``horizon`` and optional eval ``query_history_length``.
+``sequence_token_layout=state_action_reward``; query ``rtg`` is zeros for collate.
 """
 
 from __future__ import annotations
@@ -25,21 +18,12 @@ from loguru import logger as log
 from src.data.dataset import ICLTrajectoryDatasetBase, PromptArrays, _empty_prompt_segment
 from src.data.trajectories import trajectory_return
 
+# Max number of lowest-return (after length filter) episodes concatenated into the AD timeline.
+ALGORITHM_DISTILLATION_TOP_N_EPISODES = 30000
+
 
 class AlgorithmDistillationTrajectoryDataset(ICLTrajectoryDatasetBase):
-    """
-    Sort **all** trajectories by episode return and concatenate into one transition sequence so the
-    model trains on **across-trial** statistics. Each sample is exactly **K** consecutive timesteps
-    from that timeline (``K = query_history_length`` or ``horizon``): the same **last-K** DT-style
-    segment length at train and eval — only those K tokens enter the causal transformer.
-
-    **Timestep embeddings** index **position inside the K-step chunk** (and zeros on padded prefix),
-    not time-since-episode-start along the concat timeline.
-
-    The model should use ``sequence_token_layout=state_action_reward`` (default for this
-    ``data.context_style``): per-step **reward** is in the batch; the legacy RTG channel is
-    filled with zeros for pipeline compatibility.
-    """
+    """Builds one flat timeline from the lowest-return capped trajectories."""
 
     def __init__(
         self,
@@ -78,11 +62,11 @@ class AlgorithmDistillationTrajectoryDataset(ICLTrajectoryDatasetBase):
             trajectory_contexts=trajectory_contexts,
             **kwargs,
         )
+        self._query_length = int(self.horizon)
         self.total_prompt_len = 0
         self.prompt_length = None
         self.max_prompt_trajectory_length = None
         self._build_ad_timeline()
-        # Match logging / introspection to the actual DT context width (K), not a larger unused horizon.
         self.horizon = int(self._query_length)
         log.info(
             "AlgorithmDistillation: timeline_len={} context_K={} sort_returns_ascending={}",
@@ -101,10 +85,22 @@ class AlgorithmDistillationTrajectoryDataset(ICLTrajectoryDatasetBase):
         return _empty_prompt_segment(self.state_dim, self.act_dim)
 
     def _build_ad_timeline(self) -> None:
-        trs = self.trajectories
+        trs_all = self.trajectories
+        mes = int(self.max_episode_steps)
+        kept_indices: List[int] = []
+        for i, t in enumerate(trs_all):
+            T = int(np.asarray(t["rewards"], dtype=np.float32).reshape(-1).shape[0])
+            if T == mes:
+                kept_indices.append(i)
+        if len(kept_indices) < len(trs_all):
+            log.info(
+                "AlgorithmDistillation: kept {}/{} trajectories with length == max_episode_steps={}",
+                len(kept_indices),
+                len(trs_all),
+                mes,
+            )
+        trs = [trs_all[i] for i in kept_indices]
         n = len(trs)
-        # Permutation by return (stable sort); avoid sort_trajectories_by_return + O(M²) identity
-        # lookup from ordered list back to original indices.
         if n == 0:
             self._timeline_len = 0
             self._obs_cat = np.zeros((0, self.state_dim), dtype=np.float32)
@@ -116,9 +112,26 @@ class AlgorithmDistillationTrajectoryDataset(ICLTrajectoryDatasetBase):
             return
 
         rets = np.array([trajectory_return(t) for t in trs], dtype=np.float64)
-        order = np.argsort(rets, kind="stable")
+        _n_keep = min(int(ALGORITHM_DISTILLATION_TOP_N_EPISODES), n)
+        rank_asc = np.argsort(rets, kind="stable")
+        order = rank_asc[:_n_keep]
         if not self.context_sort_ascending:
             order = order[::-1]
+        if _n_keep < n:
+            log.info(
+                "AlgorithmDistillation: using lowest-{} of {} filtered trajectories by return (cap={})",
+                _n_keep,
+                n,
+                ALGORITHM_DISTILLATION_TOP_N_EPISODES,
+            )
+        log.info(
+            "AlgorithmDistillation: concat along timeline (context_sort_ascending={}): "
+            "first_episode_sum_r={:.6g} last_episode_sum_r={:.6g} (among lowest-{} by return)",
+            self.context_sort_ascending,
+            float(rets[int(order[0])]),
+            float(rets[int(order[-1])]),
+            _n_keep,
+        )
 
         obs_parts: List[np.ndarray] = []
         act_parts: List[np.ndarray] = []
@@ -129,7 +142,7 @@ class AlgorithmDistillationTrajectoryDataset(ICLTrajectoryDatasetBase):
         image_template: Optional[List[np.ndarray]] = None
 
         if self.use_vision:
-            for j in range(n):
+            for j in range(len(order)):
                 t = trs[int(order[j])]
                 imgs = t.get("images")
                 if isinstance(imgs, list) and len(imgs) > 0:
@@ -138,13 +151,16 @@ class AlgorithmDistillationTrajectoryDataset(ICLTrajectoryDatasetBase):
             if image_template is not None:
                 img_parts_per_view = [[] for _ in range(len(image_template))]
 
-        for j in range(n):
-            orig_idx = int(order[j])
-            t = trs[orig_idx]
+        for j in range(len(order)):
+            pos_in_filtered = int(order[j])
+            orig_idx = int(kept_indices[pos_in_filtered])
+            t = trs[pos_in_filtered]
             rew = np.asarray(t["rewards"], dtype=np.float32).reshape(-1)
             T = int(rew.shape[0])
-            if T <= 0:
-                continue
+            if T != mes:
+                raise RuntimeError(
+                    f"AD timeline: internal error, expected T={mes} after filter, got T={T}"
+                )
             obs = np.asarray(t["observations"], dtype=np.float32)
             act = np.asarray(t["actions"], dtype=np.float32)
             if obs.shape[0] < T:
@@ -153,8 +169,7 @@ class AlgorithmDistillationTrajectoryDataset(ICLTrajectoryDatasetBase):
                 )
             obs = obs[:T]
             act = act[:T]
-            term = t.get("terminals", t.get("dones", np.zeros(T, dtype=np.float32)))
-            term = np.asarray(term, dtype=np.float32).reshape(-1)[:T]
+            term = np.asarray(t["terminals"], dtype=np.float32).reshape(-1)[:T]
 
             obs_parts.append(obs)
             act_parts.append(act)
@@ -249,10 +264,7 @@ class AlgorithmDistillationTrajectoryDataset(ICLTrajectoryDatasetBase):
         action_seg = np.asarray(self._act_cat[g : g + tlen], dtype=np.float32)
         reward_seg = np.asarray(self._rew_cat[g : g + tlen], dtype=np.float32).reshape(-1, 1)
         done_seg = np.asarray(self._done_cat[g : g + tlen], dtype=np.float32)
-        # RTG channel unused for (s,a,r) AD; zeros keep dataloader / collate shape-stable.
         rtg_seg = np.zeros((tlen, 1), dtype=np.float32)
-        # Chunk-relative time: 0..tlen-1 within this K-window only (no episode reset, no cap at
-        # max_episode_steps). Episode structure is implicit in state / reward / done only.
         ts_seg = np.arange(tlen, dtype=np.float32)
 
         if pad_len > 0:
@@ -329,4 +341,5 @@ class AlgorithmDistillationTrajectoryDataset(ICLTrajectoryDatasetBase):
         )
         if self.use_vision:
             result = result + (images_t,)
+
         return result

@@ -268,6 +268,12 @@ def main() -> None:
     eval_target_returns_list = OmegaConf.select(cfg, "experiment.eval_target_returns", default=None)
     if eval_target_returns_list is not None:
         eval_target_returns_list = [float(x) for x in list(eval_target_returns_list)]
+    eval_scene_seeds_list = OmegaConf.select(cfg, "experiment.eval_scene_seeds", default=None)
+    if eval_scene_seeds_list is not None:
+        eval_scene_seeds_list = [int(x) for x in list(eval_scene_seeds_list)]
+    randomize_scene_between_trials = bool(
+        OmegaConf.select(cfg, "experiment.randomize_scene_between_trials", default=False)
+    )
 
     num_rollouts = int(exp.num_eval_rollouts)
     log.info(
@@ -319,6 +325,8 @@ def main() -> None:
                 cfg, "experiment.num_eval_rollout_videos", default=None
             ),
             d4rl_score_ref=d4rl_score_ref,
+            eval_scene_seeds=eval_scene_seeds_list,
+            randomize_scene_between_trials=randomize_scene_between_trials,
         )
 
     for k, v in sorted(metrics.items()):

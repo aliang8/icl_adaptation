@@ -329,9 +329,7 @@ class ICLTrajectoryDatasetBase(Dataset, ABC):
         action_seg = traj["actions"][start : si + 1]
         reward_seg = traj["rewards"][start : si + 1].reshape(-1, 1)
         context_seg = traj_contexts[start : si + 1]
-        done_seg = traj.get("terminals", traj.get("dones", np.zeros(len(traj["rewards"]))))[
-            start : si + 1
-        ]
+        done_seg = np.asarray(traj["terminals"], dtype=np.float32).reshape(-1)[start : si + 1]
         tlen = state_seg.shape[0]
         pad_len = K - tlen
         state_seg = np.concatenate([np.zeros((pad_len, state_seg.shape[1])), state_seg], axis=0)

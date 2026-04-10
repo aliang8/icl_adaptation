@@ -41,7 +41,7 @@ class LanguageEmbedder(nn.Module):
 class VLADecisionTransformer(MetaDecisionTransformer):
     """
     Meta-DT with optional vision (multi-view images) and language (instruction) conditioning.
-    Same forward(batch) -> DTOutput API; encode_state fuses image and language when present.
+    Same forward(batch) -> DTOutput API; encode_state(...) fuses image and language when present.
     """
 
     def __init__(
@@ -173,24 +173,40 @@ class VLADecisionTransformer(MetaDecisionTransformer):
             self.language_proj = None
             self.instruction_embed = None
 
-    def encode_state(self, batch: DTBatch) -> Tensor:
-        """State + context + timestep; then fuse image and language when present."""
-        state_emb = super().encode_state(batch)
+    def encode_state(
+        self,
+        states: Tensor,
+        timesteps: Tensor,
+        trial_indices: Optional[Tensor] = None,
+        *,
+        contexts: Optional[Tensor] = None,
+        image_embeddings: Optional[Tensor] = None,
+        instruction_indices: Optional[Tensor] = None,
+    ) -> Tensor:
+        """Same proprio path as Meta-DT; add vision and language when present."""
+        state_emb = super().encode_state(
+            states,
+            timesteps,
+            trial_indices,
+            contexts=contexts,
+            image_embeddings=image_embeddings,
+            instruction_indices=instruction_indices,
+        )
 
-        if batch.image_embeddings is not None:
+        if image_embeddings is not None:
             if self.vision_fusion_module is not None:
-                v = self.vision_fusion_module(batch.image_embeddings, batch.states)
+                v = self.vision_fusion_module(image_embeddings, states)
                 state_emb = state_emb + v
             elif self.vision_proj is not None:
-                v = self.vision_proj(batch.image_embeddings)
+                v = self.vision_proj(image_embeddings)
                 state_emb = state_emb + v
 
         if (
             self._use_language_input
-            and batch.instruction_indices is not None
+            and instruction_indices is not None
             and self.instruction_embed is not None
         ):
-            lang = self.instruction_embed(batch.instruction_indices)
+            lang = self.instruction_embed(instruction_indices)
             if self.language_proj is not None:
                 lang = self.language_proj(lang).unsqueeze(1)
             state_emb = state_emb + lang

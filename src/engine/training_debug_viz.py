@@ -11,7 +11,7 @@ from typing import Any, List, Optional
 import numpy as np
 from loguru import logger as log
 
-from src.engine.eval_viz import _annotate_eval_frame
+from src.engine.eval_visuals import annotate_eval_frame
 
 
 def _chw01_to_uint8_hwc(arr: np.ndarray) -> np.ndarray:
@@ -127,7 +127,7 @@ def save_training_sample_videos(
                 f"env_t={ts:.0f}  mask={m:.0f}  RTG(/rtg_scale)={rtg:.4f}",
                 f"context valid steps={prompt_valid:.0f}/{prompt_total:.0f}  rtg_scale={rtg_scale}",
             ]
-            frames.append(_annotate_eval_frame(img, lines))
+            frames.append(annotate_eval_frame(img, lines))
         path = out_dir / f"clip_{clip_id:02d}_traj{traj_idx:05d}_si{si:04d}.mp4"
         _write_mp4(frames, path, fps=fps)
         log.info("Wrote training debug video: {}", path)

@@ -76,9 +76,9 @@ class DataConfig:
     data_quality: Union[str, List[str]] = "medium"
     data_dir: str = "all_datasets"
     horizon: int = 20
-    # Query = last K steps of current trajectory; K=1 = OpenVLA-style; None = use horizon.
-    # Eval passes this (or horizon) as get_action(query_window=K) so query-only rollouts match train padding.
-    # For context_style=algorithm_distillation: K = DT context width on the concat timeline (multi-trial data, K-step causal window).
+    # ICL / subsampled / full_trajectory: last K steps of the query trajectory; K=1 = OpenVLA-style; null = horizon.
+    # algorithm_distillation: training window on the concat timeline is always ``horizon``; if ``query_history_length``
+    # is set, eval rollouts use that as ``get_action`` history length (else eval uses ``horizon``).
     query_history_length: Optional[int] = None
     # Used only when context_style=subsampled (steps per context trajectory); ignored when context_style=full_trajectory
     prompt_length: int = 5
@@ -234,6 +234,14 @@ class ExperimentConfig:
     num_eval_rollout_videos: Optional[int] = None
     # LIBERO: stitch primary and wrist side-by-side in eval videos when both exist.
     eval_render_both_views: bool = True
+    # Eval ``env.reset(seed=...)`` pool (Gymnasium / ManiSkill). None or empty: ``run_rollouts_and_save_viz``
+    # fills a deterministic list sized to ``num_eval_rollouts`` (or × ``eval_num_trials`` when zero-shot
+    # and ``randomize_scene_between_trials``). Explicit list: indices cycle if shorter than needed.
+    eval_scene_seeds: Optional[List[int]] = None
+    # Zero-shot with multiple in-session trials: if False (default), every trial in a session uses
+    # the same reset seed so the scene matches across trials; if True, seed changes per trial.
+    # Single-trial prompt/no-prompt rollouts: always one seed per rollout index from the pool (or legacy step+ep).
+    randomize_scene_between_trials: bool = False
     run_action_compare_eval: bool = (
         False  # if True, plot predicted vs GT actions on demos to viz/action_compare/
     )

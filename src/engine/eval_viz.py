@@ -1,80 +1,37 @@
-"""
-Eval rollout visualization: run env rollouts and save state/action curves and returns to viz/samples/step_XXXXX/.
-"""
+"""Eval rollouts: env episodes, logging, and sample viz under run_dir/viz/."""
 
 from __future__ import annotations
 
-import math
-import os
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
+import torch
+
 from src.data.rtg import initial_rtg_token
-from src.engine.logging import Logger
+from src.engine.eval_context import build_prompt_tuple
+from src.engine.eval_visuals import (
+    annotated_rollout_frames,
+    cum_return_per_frame,
+    encode_rollout_images,
+    raise_missing_eval_vision_images,
+    save_eval_rtg_reward_figure,
+)
+from src.engine.reward_models import get_return_from_reward_model
+from src.envs.eval_gym import render_rgb_frame, try_make_eval_env, wrap_record_video
+from src.envs.libero_env import LIBERO_SUITES
 from src.models.meta_dt import MetaDecisionTransformer
-
-# Dataset / config may use D4RL-era ids (e.g. HalfCheetah-v2). Core Gymnasium only registers
-# modern MuJoCo envs (v4+); v2/v3 in gymnasium-robotics still need deprecated mujoco_py.
-# Map to v5 for eval when observation/action shapes match (HalfCheetah: 17 / 6).
-_GYMNASIUM_EVAL_ENV_ALIASES = {
-    "HalfCheetah-v2": "HalfCheetah-v5",
-    "halfcheetah-v2": "HalfCheetah-v5",
-}
-_EVAL_ENV_ALIAS_LOGGED: set[str] = set()
-
-
-def _resolve_per_trial_eval_target_returns(
-    eval_num_trials: int,
-    eval_target_return: Optional[float],
-    eval_target_returns: Optional[List[float]],
-) -> List[Optional[float]]:
-    """Target future return G (env units) per zero-shot in-session trial. K = eval_num_trials."""
-    K = max(0, int(eval_num_trials))
-    if K == 0:
-        return []
-    if eval_target_returns is not None:
-        lst = [float(x) for x in list(eval_target_returns)]
-        if len(lst) != K:
-            raise ValueError(
-                "eval_target_returns length must equal eval_num_trials: "
-                f"got len={len(lst)}, eval_num_trials={K}"
-            )
-        return lst
-    if eval_target_return is not None:
-        G = float(eval_target_return)
-        if K > 1:
-            # Evenly spaced up to full G: trial i gets (i+1)/K * G (e.g. K=4 → 25%,50%,75%,100%).
-            return [G * (i + 1) / K for i in range(K)]
-        return [G]
-    return [None] * K
-
-
-def _action_prediction_stats_from_rollouts(
-    rollouts_actions: List[np.ndarray],
-) -> Dict[str, float]:
-    """Mean / min / max over all predicted actions (env steps × rollouts)."""
-    if not rollouts_actions:
-        return {}
-    parts: List[np.ndarray] = []
-    for a in rollouts_actions:
-        if a is None or a.size == 0:
-            continue
-        x = np.asarray(a, dtype=np.float64)
-        if x.ndim == 1:
-            x = x.reshape(-1, 1)
-        parts.append(x.reshape(-1, x.shape[-1]))
-    if not parts:
-        return {}
-    A = np.concatenate(parts, axis=0)
-    if A.size == 0:
-        return {}
-    return {
-        "eval/action_pred_mean": float(np.mean(A)),
-        "eval/action_pred_min": float(np.min(A)),
-        "eval/action_pred_max": float(np.max(A)),
-    }
+from src.utils.eval_utils import (
+    action_prediction_stats_from_rollouts,
+    compose_grid_frames_sequence,
+    default_eval_scene_seeds,
+    eval_episode_reset_seed,
+    grid_layout_dims,
+    pack_flat_clips_to_grid,
+    resolve_per_trial_eval_target_returns,
+    write_frames_video,
+)
 
 
 def _log_eval_transformer_seq(
@@ -86,17 +43,9 @@ def _log_eval_transformer_seq(
     tag: str,
     query_window: Optional[int] = None,
 ) -> None:
-    """
-    Print how long the transformer sequence is on each eval get_action call.
-
-    OOM during eval is usually from attention over (prompt + padded query): with condition_rtg,
-    each env/query timestep becomes 3 tokens, so positions ≈ 3 * (prompt_timesteps + K).
-    K is ``query_window`` when passed (data horizon / query_history_length), else ``model.max_length``.
-    With no ICL prompt, the query uses left-pad only until history reaches K, then exactly K steps.
-    """
     if not isinstance(model, MetaDecisionTransformer):
         raise TypeError(f"eval expects MetaDecisionTransformer, got {type(model)}")
-    layout = getattr(model, "_sequence_token_layout", "rtg_state_action")
+    layout = model._sequence_token_layout
     tokens_per_step = 3 if layout in ("rtg_state_action", "state_action_reward") else 2
     if query_window is not None:
         max_len = int(query_window)
@@ -125,260 +74,7 @@ def _log_eval_transformer_seq(
         )
 
 
-def _render_rgb_frame(env: Any) -> Optional[np.ndarray]:
-    """RGB frame from Gymnasium env (create with render_mode='rgb_array').
-
-    ManiSkill vector envs return a batched ``torch.Tensor`` (B, H, W, 3) uint8, not a NumPy array;
-    without converting here, eval collects no frames and W&B / disk videos stay empty.
-    """
-    frame = env.render()
-    if frame is None:
-        return None
-
-    try:
-        import torch
-
-        if isinstance(frame, torch.Tensor):
-            frame = frame.detach().cpu().numpy()
-    except ImportError:
-        pass
-
-    if not isinstance(frame, np.ndarray):
-        return None
-
-    arr = np.asarray(frame)
-    # Drop leading singleton batch dims from vectorized render (B, H, W, C) -> (H, W, C).
-    while arr.ndim == 4 and arr.shape[0] == 1:
-        arr = arr[0]
-
-    if arr.ndim == 3 and arr.shape[0] == 3 and arr.shape[-1] != 3:
-        arr = np.transpose(arr, (1, 2, 0))
-
-    if arr.ndim != 3 or arr.shape[-1] != 3:
-        return None
-
-    if arr.dtype != np.uint8:
-        mx = float(np.max(arr)) if arr.size else 0.0
-        if mx <= 1.0 + 1e-6:
-            arr = np.clip(arr * 255.0, 0, 255)
-        arr = np.clip(arr, 0, 255).astype(np.uint8)
-
-    return arr
-
-
-def _try_make_env(
-    env_name: str,
-    render_both_views: bool = True,
-    render_mode: Optional[str] = None,
-    *,
-    vd4rl_eval_pixel_hw: Optional[int] = None,
-    vd4rl_eval_obs_downsample: Optional[int] = None,
-    vd4rl_eval_seed: int = 0,
-    minari_halfcheetah_dataset_id: Optional[str] = None,
-    maniskill_sim_backend: Optional[str] = None,
-    maniskill_reward_mode: Optional[str] = None,
-    maniskill_control_mode: Optional[str] = None,
-    maniskill_state_obs_slice: Optional[slice] = None,
-):
-    """Create env: LIBERO suite (libero_10, ...) via make_libero_env, else Gymnasium/gym. Returns None if env or deps missing.
-    render_both_views is only used for LIBERO (primary + wrist); Gymnasium envs have a single camera.
-    """
-    from src.envs.libero_env import LIBERO_SUITES, make_libero_env
-
-    if env_name.startswith("VD4RL/dmc/"):
-        from src.envs.vd4rl_eval_env import make_vd4rl_dm_control_pixel_env
-
-        if vd4rl_eval_pixel_hw is None or vd4rl_eval_obs_downsample is None:
-            raise ValueError(
-                f"Env {env_name!r} requires data.vd4rl_pixel_size and data.vd4rl_obs_downsample "
-                "(passed as vd4rl_eval_pixel_hw / vd4rl_eval_obs_downsample from train)."
-            )
-        return make_vd4rl_dm_control_pixel_env(
-            env_name,
-            pixel_hw=int(vd4rl_eval_pixel_hw),
-            obs_downsample=int(vd4rl_eval_obs_downsample),
-            seed=int(vd4rl_eval_seed),
-        )
-
-    if env_name in LIBERO_SUITES:
-        return make_libero_env(
-            suite_name=env_name,
-            task_id=0,
-            state_dim=9,
-            action_dim=7,
-            render_both_views=render_both_views,
-        )
-
-    if env_name.startswith("ManiSkill/"):
-        from src.envs.maniskill_eval_env import make_maniskill_eval_env
-
-        return make_maniskill_eval_env(
-            env_name,
-            render_mode=render_mode,
-            sim_backend=maniskill_sim_backend,
-            reward_mode=maniskill_reward_mode,
-            control_mode=maniskill_control_mode,
-            reconfiguration_freq=1,
-            state_obs_slice=maniskill_state_obs_slice,
-        )
-
-    import gymnasium as gym
-
-    gym_id = _GYMNASIUM_EVAL_ENV_ALIASES.get(env_name, env_name)
-    if gym_id != env_name and env_name not in _EVAL_ENV_ALIAS_LOGGED:
-        _EVAL_ENV_ALIAS_LOGGED.add(env_name)
-        print(
-            f"Eval env alias: {env_name!r} -> {gym_id!r} "
-            f"(core Gymnasium MuJoCo; same obs/act dims as D4RL/Minari HalfCheetah)"
-        )
-
-    if minari_halfcheetah_dataset_id and gym_id == "HalfCheetah-v5":
-        from src.envs.minari_halfcheetah_eval import make_halfcheetah_env_via_minari
-
-        return make_halfcheetah_env_via_minari(
-            minari_halfcheetah_dataset_id, render_mode=render_mode
-        )
-
-    try:
-        if render_mode is not None:
-            return gym.make(gym_id, render_mode=render_mode)
-        return gym.make(gym_id)
-    except Exception as e:
-        msg = str(e).lower()
-        # If alias failed or user passed another -v2 id, give a clear hint.
-        if "gymnasium-robotics" in msg or "mujoco v2" in msg or "mujoco v3" in msg:
-            raise RuntimeError(
-                f"Could not create Gymnasium env {gym_id!r} (from config {env_name!r}). "
-                f"For HalfCheetah, use MuJoCo-backed Gymnasium (HalfCheetah-v5) and "
-                f"`uv sync --extra d4rl` so `mujoco` is installed. Original error: {e}"
-            ) from e
-        raise
-
-
-class _GymnasiumToGymStepAdapter:
-    """Wraps an env so step() returns 4 values (obs, reward, done, info). Use before gym's RecordVideo."""
-
-    def __init__(self, env: Any):
-        self._env = env
-
-    def __getattr__(self, name: str) -> Any:
-        """Forward attribute access to the underlying Gymnasium env."""
-        env = object.__getattribute__(self, "_env")
-        return object.__getattribute__(env, name)
-
-    def step(self, action: Any):
-        out = self._env.step(action)
-        if len(out) == 5:
-            obs, reward, terminated, truncated, info = out
-            return (obs, reward, bool(terminated or truncated), info)
-        return out
-
-    def reset(self, *args, **kwargs):
-        return self._env.reset(*args, **kwargs)
-
-
-def _wrap_record_video(env: Any, video_folder: Path) -> Tuple[Any, bool]:
-    """Wrap env with RecordVideo (Gymnasium). Returns (wrapped_env, success)."""
-    import gymnasium as gym
-
-    return (
-        gym.wrappers.RecordVideo(env, str(video_folder), episode_trigger=lambda ep: True),
-        True,
-    )
-
-
-def _grid_layout_dims(num_rollouts: int, n_trials: int) -> Tuple[int, int]:
-    """Rows × cols for W&B grid video.
-
-    - ``n_trials > 1``: one row per session (rollout), one column per trial.
-    - ``n_trials == 1``: roughly square grid of independent rollouts (sessions).
-    """
-    if n_trials > 1:
-        return max(0, int(num_rollouts)), max(0, int(n_trials))
-    n = max(0, int(num_rollouts))
-    if n <= 0:
-        return 0, 0
-    r = int(math.ceil(math.sqrt(n)))
-    c = int(math.ceil(n / r))
-    return r, c
-
-
-def _pack_flat_clips_to_grid(
-    clips: List[Optional[List[np.ndarray]]],
-    n_rows: int,
-    n_cols: int,
-) -> List[List[Optional[List[np.ndarray]]]]:
-    """Row-major placement of ``clips[i]`` into an ``n_rows × n_cols`` grid (padded with None)."""
-    grid: List[List[Optional[List[np.ndarray]]]] = [[None] * n_cols for _ in range(n_rows)]
-    for i, cl in enumerate(clips):
-        if i >= n_rows * n_cols:
-            break
-        r, c = divmod(i, n_cols)
-        grid[r][c] = cl
-    return grid
-
-
-def _resize_frame_u8(fr: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
-    fr = np.asarray(fr)
-    if fr.dtype != np.uint8:
-        fr = np.clip(fr, 0, 255).astype(np.uint8)
-    if fr.ndim == 2:
-        fr = np.stack([fr, fr, fr], axis=-1)
-    if fr.shape[0] == target_h and fr.shape[1] == target_w:
-        return fr
-    try:
-        import cv2
-
-        return cv2.resize(fr, (target_w, target_h), interpolation=cv2.INTER_AREA)
-    except Exception:
-        from PIL import Image
-
-        pil = Image.fromarray(fr)
-        pil = pil.resize((target_w, target_h), Image.Resampling.BILINEAR)
-        return np.asarray(pil).astype(np.uint8)
-
-
-def _compose_grid_frames_sequence(
-    grid: List[List[Optional[List[np.ndarray]]]],
-    *,
-    n_rows: int,
-    n_cols: int,
-) -> List[np.ndarray]:
-    """One frame per timestep: ``n_rows × n_cols`` cells, hold-last-frame; black if missing."""
-    target_h, target_w = 0, 0
-    max_t = 0
-    for r in range(n_rows):
-        for c in range(n_cols):
-            clip = grid[r][c] if r < len(grid) and c < len(grid[r]) else None
-            if not clip:
-                continue
-            max_t = max(max_t, len(clip))
-            f0 = np.asarray(clip[0])
-            target_h = max(target_h, int(f0.shape[0]))
-            target_w = max(target_w, int(f0.shape[1]))
-    if max_t == 0 or target_h == 0:
-        return []
-
-    def cell(t: int, clip: Optional[List[np.ndarray]]) -> np.ndarray:
-        if not clip:
-            return np.zeros((target_h, target_w, 3), dtype=np.uint8)
-        ti = min(t, len(clip) - 1)
-        return _resize_frame_u8(clip[ti], target_h, target_w)
-
-    out: List[np.ndarray] = []
-    for t in range(max_t):
-        rows = []
-        for r in range(n_rows):
-            cols = [
-                cell(t, grid[r][c] if r < len(grid) and c < len(grid[r]) else None)
-                for c in range(n_cols)
-            ]
-            rows.append(np.hstack(cols))
-        out.append(np.vstack(rows))
-    return out
-
-
-def _finalize_wandb_eval_rollout_videos(
+def _finalize_eval_rollout_videos(
     logger: Optional[Any],
     video_folder: Path,
     *,
@@ -389,13 +85,23 @@ def _finalize_wandb_eval_rollout_videos(
     n_rows: int,
     n_cols: int,
 ) -> None:
-    """Write ``all_rollouts.mp4`` and log ``eval/rollout_video_grid`` to W&B (single composite; no per-cell uploads)."""
-    grid_frames = _compose_grid_frames_sequence(clips_grid, n_rows=n_rows, n_cols=n_cols)
+    grid_frames = compose_grid_frames_sequence(clips_grid, n_rows=n_rows, n_cols=n_cols)
     if grid_frames:
-        _write_frames_video(video_folder, "all_rollouts.mp4", grid_frames, fps=fps)
-    if logger is None or not isinstance(logger, Logger) or logger._wandb is None:
+        write_frames_video(video_folder, "all_rollouts.mp4", grid_frames, fps=fps)
+    if logger is None or getattr(logger, "_wandb", None) is None:
         return
-    if grid_frames:
+    if not grid_frames:
+        return
+    mp4_path = video_folder / "all_rollouts.mp4"
+    # File-based Video avoids extra client-side encoding passes that can show up as duplicate rows.
+    if mp4_path.is_file() and hasattr(logger, "log_video_from_path"):
+        logger.log_video_from_path(
+            "eval/rollout_video_grid",
+            mp4_path,
+            step=step,
+            wandb_commit=wandb_commit,
+        )
+    elif hasattr(logger, "log_video"):
         logger.log_video(
             "eval/rollout_video_grid",
             grid_frames,
@@ -403,574 +109,6 @@ def _finalize_wandb_eval_rollout_videos(
             fps=fps,
             wandb_commit=wandb_commit,
         )
-
-
-def _write_frames_video(
-    video_folder: Path, filename: str, frames: List[np.ndarray], fps: int = 20
-) -> None:
-    """Write a list of frames to video_folder/{filename}.mp4."""
-    if not frames:
-        return
-    import imageio
-
-    path = video_folder / filename
-    writer = imageio.get_writer(str(path), fps=fps)
-    for f in frames:
-        writer.append_data(np.asarray(f))
-    writer.close()
-
-
-def _pad_ragged_1d(arrays: List[np.ndarray], fill: float = float("nan")) -> np.ndarray:
-    """Stack 1d arrays of different lengths into (N, T_max) with ``fill`` padding."""
-    if not arrays:
-        return np.zeros((0, 0), dtype=np.float64)
-    T = max(int(np.asarray(a).shape[0]) for a in arrays)
-    out = np.full((len(arrays), T), fill, dtype=np.float64)
-    for i, a in enumerate(arrays):
-        v = np.asarray(a, dtype=np.float64).reshape(-1)
-        n = int(v.shape[0])
-        out[i, :n] = v
-    return out
-
-
-def _save_eval_rtg_reward_figure(
-    reward_rows: List[np.ndarray],
-    rtg_rows: List[np.ndarray],
-    *,
-    rtg_scale: float,
-    step: int,
-    out_path: Path,
-    condition_rtg: bool,
-    eval_num_trials: int = 1,
-    num_rollouts: int = 1,
-    eval_context_mode: str = "prompt",
-) -> List[Path]:
-    """Save RTG/reward dynamics. Returns paths of written PNGs.
-
-    Zero-shot with ``eval_num_trials > 1``: (1) **N rows × 2 columns** per-session grid (reward | RTG),
-    row ``s`` = session ``S{s+1}`` with trials stitched on the x-axis; **sharex / sharey per column**;
-    (2) a second PNG, **one row × 2 columns**, mean ± std (shaded) across sessions on the same stitched
-    axis. Otherwise one aggregate figure (mean ± std over episodes).
-    """
-    out_paths: List[Path] = []
-    if not reward_rows or all(np.asarray(r).size == 0 for r in reward_rows):
-        return out_paths
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    _serif = ["Palatino", "Palatino Linotype", "DejaVu Serif"]
-    bg = "#FAFAF8"
-    c_r = "#2E86AB"
-    c_rtg = "#8B3A62"
-
-    K = max(1, int(eval_num_trials))
-    N = max(1, int(num_rollouts))
-    zero_shot_multi = eval_context_mode == "zero_shot_adaptation" and K > 1
-    if zero_shot_multi:
-        n_in = len(reward_rows)
-        if n_in != N * K:
-            print(
-                f"[eval] rtg_reward: zero-shot expected {N * K} traces (sessions × trials), got {n_in}; "
-                "using aggregate plot.",
-                flush=True,
-            )
-            zero_shot_multi = False
-
-    if zero_shot_multi:
-        with plt.rc_context(
-            {
-                "font.family": "serif",
-                "font.serif": _serif,
-                "axes.facecolor": "#FFFFFF",
-                "figure.facecolor": bg,
-                "axes.edgecolor": "#333333",
-                "axes.labelcolor": "#222222",
-                "xtick.color": "#222222",
-                "ytick.color": "#222222",
-                "grid.alpha": 0.35,
-                "grid.linestyle": "-",
-            }
-        ):
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-
-            def _stitch_session(s: int) -> Tuple[np.ndarray, np.ndarray]:
-                r_parts: List[np.ndarray] = []
-                g_parts: List[np.ndarray] = []
-                for t_k in range(K):
-                    idx = s * K + t_k
-                    r_parts.append(np.asarray(reward_rows[idx], dtype=np.float64).reshape(-1))
-                    if rtg_rows and idx < len(rtg_rows):
-                        g_parts.append(np.asarray(rtg_rows[idx], dtype=np.float64).reshape(-1))
-                r_cat = np.concatenate(r_parts) if r_parts else np.zeros(0, dtype=np.float64)
-                g_cat = np.concatenate(g_parts) if g_parts else np.zeros(0, dtype=np.float64)
-                return r_cat, g_cat
-
-            use_rtg = bool(
-                condition_rtg
-                and rtg_rows
-                and not all(
-                    np.asarray(rtg_rows[s * K + t_k]).size == 0
-                    for s in range(N)
-                    for t_k in range(K)
-                )
-            )
-
-            # Trial boundaries on the stitched axis (from session 0 lengths).
-            trial_bounds: List[float] = []
-            cum = 0
-            for t_k in range(K - 1):
-                cum += float(len(np.asarray(reward_rows[t_k], dtype=np.float64).reshape(-1)))
-                trial_bounds.append(cum)
-
-            if use_rtg:
-                fig, axes = plt.subplots(
-                    N,
-                    2,
-                    figsize=(10.5, max(4.0, 1.85 * N)),
-                    squeeze=False,
-                    sharex="col",
-                    sharey="col",
-                    constrained_layout=True,
-                )
-            else:
-                fig, axes = plt.subplots(
-                    N,
-                    1,
-                    figsize=(9.0, max(3.5, 1.6 * N)),
-                    squeeze=False,
-                    sharex=True,
-                    sharey=True,
-                    constrained_layout=True,
-                )
-
-            for s in range(N):
-                r_st, g_st = _stitch_session(s)
-                if r_st.size == 0:
-                    continue
-                xr = np.arange(r_st.size, dtype=np.float64)
-                if use_rtg:
-                    ax_rw = axes[s, 0]
-                    ax_gt = axes[s, 1]
-                else:
-                    ax_rw = axes[s, 0]
-                ax_rw.plot(xr, r_st, color=c_r, linewidth=1.5)
-                for xb in trial_bounds:
-                    ax_rw.axvline(xb, color="#bbbbbb", linestyle="--", linewidth=0.9, alpha=0.9)
-                ax_rw.set_ylabel(f"S{s + 1}")
-                ax_rw.grid(True, axis="y", alpha=0.4)
-                if use_rtg and g_st.size > 0:
-                    xg = np.arange(g_st.size, dtype=np.float64)
-                    ax_gt.plot(xg, g_st, color=c_rtg, linewidth=1.5)
-                    for xb in trial_bounds:
-                        ax_gt.axvline(xb, color="#bbbbbb", linestyle="--", linewidth=0.9, alpha=0.9)
-                    ax_gt.grid(True, axis="y", alpha=0.4)
-
-            if use_rtg:
-                axes[0, 0].set_title("Reward / step")
-                axes[0, 1].set_title("RTG token (before action)")
-                axes[-1, 0].set_xlabel("env steps")
-                axes[-1, 1].set_xlabel("env steps")
-            else:
-                axes[0, 0].set_title("Reward / step")
-                axes[-1, 0].set_xlabel("env steps")
-
-            fig.suptitle(
-                f"Eval step {step} · {K} trials × {N} session(s) · rtg_scale={rtg_scale:g}",
-                fontsize=11,
-                y=1.02,
-                color="#1a1a1a",
-            )
-            fig.savefig(str(out_path), dpi=120, bbox_inches="tight", facecolor=bg)
-            plt.close(fig)
-            out_paths.append(out_path)
-
-            # Second figure: one row, mean ± std across sessions (stitched env-step axis).
-            mean_path = out_path.with_name(out_path.stem + "_mean_std" + out_path.suffix)
-            r_stitched_list = [_stitch_session(s)[0] for s in range(N)]
-            R_pad = _pad_ragged_1d(r_stitched_list)
-            T_r = int(R_pad.shape[1])
-            if T_r > 0:
-                r_mean = np.nanmean(R_pad, axis=0)
-                r_std = np.nanstd(R_pad, axis=0, ddof=0)
-                r_std = np.nan_to_num(r_std, nan=0.0, posinf=0.0, neginf=0.0)
-                x_r = np.arange(T_r, dtype=np.float64)
-
-                agg_two_col = False
-                T_plot = T_r
-                if use_rtg:
-                    g_stitched_list = [_stitch_session(s)[1] for s in range(N)]
-                    G_pad = _pad_ragged_1d(g_stitched_list)
-                    T_g = int(G_pad.shape[1])
-                    T_plot = min(T_r, T_g)
-                    agg_two_col = T_plot >= 1
-
-                if agg_two_col:
-                    x_r = x_r[:T_plot]
-                    r_mean = r_mean[:T_plot]
-                    r_std = r_std[:T_plot]
-                    g_mean = np.nanmean(G_pad[:, :T_plot], axis=0)
-                    g_std = np.nanstd(G_pad[:, :T_plot], axis=0, ddof=0)
-                    g_std = np.nan_to_num(g_std, nan=0.0, posinf=0.0, neginf=0.0)
-                    x_g = np.arange(T_plot, dtype=np.float64)
-
-                    fig_m, (ax_mr, ax_mg) = plt.subplots(
-                        1,
-                        2,
-                        figsize=(10.5, 4.0),
-                        sharex=True,
-                        constrained_layout=True,
-                    )
-                    ax_mr.fill_between(
-                        x_r, r_mean - r_std, r_mean + r_std, color=c_r, alpha=0.28, linewidth=0
-                    )
-                    ax_mr.plot(x_r, r_mean, color=c_r, linewidth=2.0, label="mean ± std")
-                    for xb in trial_bounds:
-                        if xb < T_plot:
-                            ax_mr.axvline(
-                                xb, color="#bbbbbb", linestyle="--", linewidth=0.9, alpha=0.9
-                            )
-                    ax_mr.set_title("Reward / step (mean ± std across sessions)")
-                    ax_mr.set_ylabel("env reward")
-                    ax_mr.set_xlabel("env steps")
-                    ax_mr.grid(True, axis="y", alpha=0.4)
-                    ax_mr.legend(loc="upper right", fontsize=8, framealpha=0.92)
-
-                    ax_mg.fill_between(
-                        x_g, g_mean - g_std, g_mean + g_std, color=c_rtg, alpha=0.28, linewidth=0
-                    )
-                    ax_mg.plot(x_g, g_mean, color=c_rtg, linewidth=2.0, label="mean ± std")
-                    for xb in trial_bounds:
-                        if xb < T_plot:
-                            ax_mg.axvline(
-                                xb, color="#bbbbbb", linestyle="--", linewidth=0.9, alpha=0.9
-                            )
-                    ax_mg.set_title("RTG token (before action), mean ± std across sessions")
-                    ax_mg.set_ylabel("RTG token")
-                    ax_mg.set_xlabel("env steps")
-                    ax_mg.grid(True, axis="y", alpha=0.4)
-                    ax_mg.legend(loc="upper right", fontsize=8, framealpha=0.92)
-                    fig_m.suptitle(
-                        f"Eval step {step} · mean ± std over N={N} session(s) · {K} trials stitched · "
-                        f"rtg_scale={rtg_scale:g}",
-                        fontsize=11,
-                        y=1.03,
-                        color="#1a1a1a",
-                    )
-                else:
-                    fig_m, ax_mr = plt.subplots(1, 1, figsize=(9.0, 3.6), constrained_layout=True)
-                    ax_mr.fill_between(
-                        x_r, r_mean - r_std, r_mean + r_std, color=c_r, alpha=0.28, linewidth=0
-                    )
-                    ax_mr.plot(x_r, r_mean, color=c_r, linewidth=2.0, label="mean ± std")
-                    for xb in trial_bounds:
-                        if xb < T_r:
-                            ax_mr.axvline(
-                                xb, color="#bbbbbb", linestyle="--", linewidth=0.9, alpha=0.9
-                            )
-                    ax_mr.set_title("Reward / step (mean ± std across sessions)")
-                    ax_mr.set_ylabel("env reward")
-                    ax_mr.set_xlabel("env steps")
-                    ax_mr.grid(True, axis="y", alpha=0.4)
-                    ax_mr.legend(loc="upper right", fontsize=8, framealpha=0.92)
-                    fig_m.suptitle(
-                        f"Eval step {step} · mean ± std over N={N} session(s) · {K} trials stitched",
-                        fontsize=11,
-                        y=1.03,
-                        color="#1a1a1a",
-                    )
-
-                fig_m.savefig(str(mean_path), dpi=120, bbox_inches="tight", facecolor=bg)
-                plt.close(fig_m)
-                out_paths.append(mean_path)
-        return out_paths
-
-    R = _pad_ragged_1d(reward_rows)
-    n_roll = int(R.shape[0])
-    T = int(R.shape[1])
-    x = np.arange(T, dtype=int)
-
-    def _plot_reward(ax_r: Any, subtitle: str) -> None:
-        if n_roll <= 1:
-            ax_r.plot(x, R[0], color=c_r, linewidth=2.0, label="rollout")
-            ax_r.set_title(subtitle)
-        else:
-            r_mean = np.nanmean(R, axis=0)
-            r_std = np.nanstd(R, axis=0)
-            r_std = np.nan_to_num(r_std, nan=0.0, posinf=0.0, neginf=0.0)
-            ax_r.fill_between(x, r_mean - r_std, r_mean + r_std, color=c_r, alpha=0.28, linewidth=0)
-            ax_r.plot(x, r_mean, color=c_r, linewidth=2.0, label="mean ± std")
-            ax_r.set_title(subtitle)
-        ax_r.set_ylabel("env reward")
-        ax_r.grid(True, axis="y", alpha=0.4)
-        ax_r.legend(loc="upper right", fontsize=8, framealpha=0.92)
-
-    with plt.rc_context(
-        {
-            "font.family": "serif",
-            "font.serif": _serif,
-            "axes.facecolor": "#FFFFFF",
-            "figure.facecolor": bg,
-            "axes.edgecolor": "#333333",
-            "axes.labelcolor": "#222222",
-            "xtick.color": "#222222",
-            "ytick.color": "#222222",
-            "grid.alpha": 0.35,
-            "grid.linestyle": "-",
-        }
-    ):
-        if condition_rtg and rtg_rows and not all(np.asarray(t).size == 0 for t in rtg_rows):
-            G = _pad_ragged_1d(rtg_rows)
-            share_x = int(G.shape[1]) == int(R.shape[1])
-            fig, (ax_r, ax_g) = plt.subplots(
-                2,
-                1,
-                figsize=(9, 5.4),
-                sharex=share_x,
-                constrained_layout=True,
-                gridspec_kw={"height_ratios": [1, 1], "hspace": 0.08},
-            )
-            r_sub = (
-                "Reward per env step (single eval episode)"
-                if n_roll <= 1
-                else f"Reward per env step (mean ± std over {n_roll} eval episodes)"
-            )
-            _plot_reward(ax_r, r_sub)
-
-            n_rtg = int(G.shape[0])
-            if n_rtg <= 1:
-                ax_g.plot(np.arange(G.shape[1]), G[0], color=c_rtg, linewidth=2.0, label="rollout")
-                ax_g.set_title("RTG token (tail before each action)")
-            else:
-                g_mean = np.nanmean(G, axis=0)
-                g_std = np.nanstd(G, axis=0)
-                g_std = np.nan_to_num(g_std, nan=0.0, posinf=0.0, neginf=0.0)
-                xg = np.arange(G.shape[1], dtype=int)
-                ax_g.fill_between(
-                    xg, g_mean - g_std, g_mean + g_std, color=c_rtg, alpha=0.28, linewidth=0
-                )
-                ax_g.plot(xg, g_mean, color=c_rtg, linewidth=2.0, label="mean ± std")
-                ax_g.set_title(
-                    f"RTG token (mean ± std, n={n_rtg}); update −r / rtg_scale (rtg_scale={rtg_scale:g})"
-                )
-            ax_g.set_ylabel("RTG token")
-            ax_g.set_xlabel("environment step")
-            ax_g.grid(True, axis="y", alpha=0.4)
-            ax_g.legend(loc="upper right", fontsize=8, framealpha=0.92)
-        else:
-            fig, ax_r = plt.subplots(1, 1, figsize=(9, 3.4), constrained_layout=True)
-            r_sub = (
-                "Reward per env step (single eval episode); RTG conditioning off"
-                if n_roll <= 1
-                else f"Reward per env step (mean ± std over {n_roll} eval episodes); RTG conditioning off"
-            )
-            _plot_reward(ax_r, r_sub)
-            ax_r.set_xlabel("environment step")
-
-        fig.suptitle(f"Eval step {step} · rollout dynamics", fontsize=12, y=1.02, color="#1a1a1a")
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(str(out_path), dpi=120, bbox_inches="tight", facecolor=bg)
-        plt.close(fig)
-    out_paths.append(out_path)
-    return out_paths
-
-
-def _annotate_eval_frame(frame: np.ndarray, lines: List[str]) -> np.ndarray:
-    """Draw multiple lines (white stroke + black fill) on frame copy. Requires cv2."""
-    import cv2
-
-    out = np.asarray(frame).copy()
-    h, w = out.shape[:2]
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    sc = max(0.45, min(w, h) / 480.0)
-    thick = max(1, int(sc * 2))
-    y = int(18 * sc + 12)
-    for line in lines:
-        if not line:
-            continue
-        cv2.putText(out, line, (10, y), font, sc, (255, 255, 255), thick, cv2.LINE_AA)
-        cv2.putText(out, line, (10, y), font, sc, (0, 0, 0), max(1, thick - 1), cv2.LINE_AA)
-        y += int(24 * sc + 10)
-    return out
-
-
-def _cum_return_per_frame(frames: List, ep_rewards: List[float]) -> List[float]:
-    """Cumulative sum of env step rewards aligned with each rendered frame (env units).
-
-    Frame 0 is before any step (0.0). After that, one frame per step; value is sum of rewards
-    through that step. Handles ``len(frames) == len(ep_rewards) + 1`` (initial render) or equal
-    lengths if the first render is skipped.
-    """
-    if not frames:
-        return []
-    n_f, n_r = len(frames), len(ep_rewards)
-    if n_f == n_r + 1:
-        out = [0.0]
-        cum = 0.0
-        for i in range(n_r):
-            cum += float(ep_rewards[i])
-            out.append(cum)
-        return out
-    if n_f == n_r:
-        out = []
-        cum = 0.0
-        for i in range(n_r):
-            cum += float(ep_rewards[i])
-            out.append(cum)
-        return out
-    cum = 0.0
-    out = []
-    for i in range(n_f):
-        if i == 0:
-            out.append(0.0)
-        elif i - 1 < n_r:
-            cum += float(ep_rewards[i - 1])
-            out.append(cum)
-        else:
-            out.append(cum)
-    return out
-
-
-def _annotated_rollout_frames(
-    model: Any,
-    frames: List[np.ndarray],
-    rtg_per_frame: List[float],
-    trial_tag: str,
-    cum_return_per_frame: Optional[List[float]] = None,
-) -> List[np.ndarray]:
-    """Overlay trial id, timestep, RTG token (before ``get_action``), and cumulative env return."""
-    if not isinstance(model, MetaDecisionTransformer):
-        raise TypeError(f"eval expects MetaDecisionTransformer, got {type(model)}")
-    layout = getattr(model, "_sequence_token_layout", "rtg_state_action")
-    cond_rtg = layout == "rtg_state_action"
-    out: List[np.ndarray] = []
-    for t, f in enumerate(frames):
-        lines = [f"{trial_tag}  t={t}"]
-        if cond_rtg and t < len(rtg_per_frame):
-            # Same units as training: RTG token = future_return / rtg_scale (~O(1)).
-            lines.append(f"RTG target: {rtg_per_frame[t]:.4f}")
-        elif layout == "state_action_reward":
-            lines.append("policy: (s,a,r) no RTG")
-        else:
-            lines.append("RTG: off")
-        if cum_return_per_frame is not None and t < len(cum_return_per_frame):
-            lines.append(f"return: {cum_return_per_frame[t]:.2f}")
-        out.append(_annotate_eval_frame(f, lines))
-    return out
-
-
-def _preprocess_frames_for_encoder(
-    frames: List[np.ndarray],
-    device: Any,
-    size: Tuple[int, int],
-) -> Any:
-    """Convert list of (H, W, 3) uint8 to (1, T, 3, H, W) float, ImageNet normalized. Matches precompute_libero_embeddings."""
-    import torch
-
-    if not frames:
-        return None
-    h, w = size
-    try:
-        import cv2
-
-        resized = np.stack(
-            [cv2.resize(f, (w, h), interpolation=cv2.INTER_LINEAR) for f in frames],
-            axis=0,
-        )
-    except Exception:
-        resized = np.stack([np.asarray(f) for f in frames], axis=0)
-        if resized.shape[1:3] != (h, w):
-            return None
-    x = torch.from_numpy(resized).float().to(device)
-    x = x.permute(0, 3, 1, 2)
-    x = x / 255.0
-    mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
-    std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
-    x = (x - mean) / std
-    return x.unsqueeze(0)
-
-
-def _raise_missing_eval_vision_images(
-    *,
-    model: Any,
-    env_name: str,
-    env: Any,
-    timestep: int,
-) -> None:
-    """Hard fail when a live vision encoder expects pixels but the env provided none."""
-    use_vision_cfg = getattr(model, "use_vision", None)
-    extra = ""
-    if use_vision_cfg is not None:
-        extra = f" model.use_vision={use_vision_cfg!r};"
-    raise RuntimeError(
-        "Vision inference requires camera frames from the eval environment, but "
-        f"image_embeddings could not be built (timestep t={timestep}).{extra} "
-        f"env_name={env_name!r} env_type={type(env).__name__}. "
-        "Implement get_current_images() to return uint8 (H, W, 3) RGB (primary and optionally wrist), "
-        "and for Gymnasium or ManiSkill create the env with render_mode='rgb_array' so render() "
-        "returns pixels."
-    )
-
-
-def _vision_encoder_num_views(vision_encoder: Any) -> int:
-    nv = getattr(vision_encoder, "num_views", None)
-    if nv is not None:
-        return int(nv)
-    inner = getattr(vision_encoder, "encoder", None)
-    if inner is not None:
-        nv2 = getattr(inner, "num_views", None)
-        if nv2 is not None:
-            return int(nv2)
-    return 2
-
-
-def _encode_rollout_images(
-    image_list: List[Tuple[Any, Any]],
-    model: Any,
-    device: Any,
-) -> Optional[Any]:
-    """Build (1, T, D) image embeddings from list of (primary, wrist) frames. Returns None if no encoder or no images."""
-    import torch
-
-    if not isinstance(model, MetaDecisionTransformer):
-        raise TypeError(f"eval expects MetaDecisionTransformer, got {type(model)}")
-    vision_encoder = model.vision_encoder
-    if vision_encoder is None or not image_list:
-        return None
-    primary_frames = []
-    wrist_frames = []
-    for p, w in image_list:
-        if p is not None:
-            primary_frames.append(p)
-        if w is not None:
-            wrist_frames.append(w)
-    if not primary_frames and not wrist_frames:
-        return None
-    if not primary_frames:
-        primary_frames = list(wrist_frames)
-    if not wrist_frames:
-        wrist_frames = list(primary_frames)
-    n_views = _vision_encoder_num_views(vision_encoder)
-    view_tensors = []
-    enc_hw = getattr(model, "vision_encoder_img_size", None)
-    if enc_hw is None:
-        raise RuntimeError(
-            "model.vision_encoder_img_size is required for eval image preprocessing "
-            f"(got {type(model).__name__} with vision_encoder set)."
-        )
-    enc_size = (int(enc_hw[0]), int(enc_hw[1]))
-    for vi in range(n_views):
-        frames = primary_frames if vi == 0 else wrist_frames
-        vt = _preprocess_frames_for_encoder(frames, device, size=enc_size)
-        if vt is None:
-            return None
-        view_tensors.append(vt)
-    with torch.no_grad():
-        emb = vision_encoder(view_tensors)
-    if emb is not None and emb.dim() == 3:
-        return emb
-    return None
 
 
 def _run_one_rollout(
@@ -1012,8 +150,6 @@ def _run_one_rollout(
 
     RTG tokens match training: ``future_return/rtg_scale``. Step rewards are raw env rewards.
     """
-    import torch
-
     if not isinstance(model, MetaDecisionTransformer):
         raise TypeError(f"eval expects MetaDecisionTransformer, got {type(model)}")
 
@@ -1023,7 +159,7 @@ def _run_one_rollout(
     if isinstance(obs, tuple):
         obs = obs[0]
     frames: List[np.ndarray] = []
-    layout = getattr(model, "_sequence_token_layout", "rtg_state_action")
+    layout = model._sequence_token_layout
     use_rtg_rollout = layout == "rtg_state_action"
     if use_rtg_rollout:
         rtg0 = initial_rtg_token(rtg_scale, eval_target_return=eval_target_return)
@@ -1031,7 +167,7 @@ def _run_one_rollout(
     else:
         returns_to_go = torch.zeros((1, 1, 1), device=device, dtype=torch.float32)
     if collect_frames:
-        frame = _render_rgb_frame(env)
+        frame = render_rgb_frame(env)
         if frame is not None:
             frames.append(frame)
             rtg_for_frames.append(float(returns_to_go[0, -1].detach().cpu()))
@@ -1059,12 +195,17 @@ def _run_one_rollout(
         rtg_snap = float(returns_to_go[0, -1].detach().cpu())
         rtg_tokens_trace.append(rtg_snap)
         prompt_now = prompt
+
         prompt_meta: Dict[str, Any] = {"mode": "static", "prev_trials": 0, "current_trial_steps": 0}
         if prompt_builder is not None:
             prompt_now, prompt_meta = prompt_builder(ep_states, ep_actions, ep_rewards)
         qti = query_trial_index
         if prompt_meta.get("query_trial_index") is not None:
             qti = int(prompt_meta["query_trial_index"])
+
+        # if prompt_now is not None:
+        #     import ipdb; ipdb.set_trace()
+
         if t % 100 == 0 or t < 3:
             n_live = int(states.shape[0])
             p_steps = 0
@@ -1098,9 +239,9 @@ def _run_one_rollout(
         image_embeddings = None
         if use_vision:
             if image_list:
-                image_embeddings = _encode_rollout_images(image_list, model, device)
+                image_embeddings = encode_rollout_images(image_list, model, device)
             if image_embeddings is None:
-                _raise_missing_eval_vision_images(
+                raise_missing_eval_vision_images(
                     model=model,
                     env_name=env_name,
                     env=env,
@@ -1140,7 +281,7 @@ def _run_one_rollout(
             prim, wrist = env.get_current_images()
             image_list.append((prim, wrist))
         if collect_frames:
-            frame = _render_rgb_frame(env)
+            frame = render_rgb_frame(env)
             if frame is not None:
                 frames.append(frame)
                 rtg_for_frames.append(rtg_snap)
@@ -1173,7 +314,7 @@ def _run_one_rollout(
         "rewards": np.array(ep_rewards, dtype=np.float32),
     }
     rtg_arr = np.asarray(rtg_tokens_trace, dtype=np.float64)
-    cum_return_for_frames = _cum_return_per_frame(frames, ep_rewards)
+    cum_return_for_frames = cum_return_per_frame(frames, ep_rewards)
     return (
         ep_return,
         len(ep_states) - 1,
@@ -1227,64 +368,37 @@ def run_rollouts_and_save_viz(
     maniskill_reward_mode: Optional[str] = None,
     maniskill_control_mode: Optional[str] = None,
     maniskill_state_obs_slice: Optional[slice] = None,
+    eval_scene_seeds: Optional[List[int]] = None,
+    randomize_scene_between_trials: bool = False,
 ) -> Dict[str, float]:
+    """Run rollouts, write ``run_dir/viz/samples/step_*/`` plots, optional composite video/W&B.
+
+    Keep ``rtg_scale``, ``context_style``, and prompt/query caps aligned with training config.
+    Zero-shot: ``num_rollouts`` sessions × ``eval_num_trials`` episodes; trial 1 is query-only, later
+    trials use ICL from completed priors. ``num_context_trajectories`` ≤ 0 or ``None`` keeps all priors.
+    ``wandb_defer_step_commit``: log charts/videos with ``commit=False`` so the trainer can commit once.
     """
-    Run eval rollouts (and, in zero-shot, ``eval_num_trials`` in-session episodes per session).
-    Each recorded rollout index can be saved as rollout_0.mp4, rollout_1.mp4, ...
-    For wandb: log one continuous video with per-clip overlays (session/trial labels in zero-shot).
-    When wandb_defer_step_commit=True (training eval), media uses commit=False so the trainer
-    can log scalars at the same step with commit=True without W&B dropping out-of-order steps.
-
-    **``rtg_scale``** must equal ``data.rtg_scale`` from training. RTG **tokens** are
-    ``discount_cumsum(r_env) / rtg_scale`` (see ``dataset.py``). Each rollout step uses raw env
-    reward in the query tensor and decrements the RTG token by ``r_env / rtg_scale``.
-
-    **``eval_target_return``** (optional) is target future cumulative return in **env reward units**;
-    initial token is ``G / rtg_scale``. If omitted, initial token is ``1.0``. **Zero-shot** with
-    ``eval_num_trials > 1``: if ``eval_target_returns`` is set (length must equal
-    ``eval_num_trials``), those values are used per trial; else a single ``eval_target_return`` G
-    yields per-trial targets ``G * (i+1) / K`` for ``i = 0 … K-1``. Prompt / no-prompt modes still
-    use the scalar ``eval_target_return`` only.
-
-    **``num_context_trajectories``** (optional): zero-shot only — max number of **most recent**
-    completed trials kept as prompt context (then sorted ascending by return for the DT prompt).
-    ``None`` = keep all completed trials.
-
-    **``query_window``** (optional): query history cap K passed to ``get_action`` (training
-    ``query_history_length`` or ``horizon``). When set, overrides ``model.max_length`` for
-    trim/left-pad so no-prompt / query-only eval matches the data window.
-
-    **``minari_halfcheetah_dataset_id``** (optional): e.g. ``mujoco/halfcheetah/medium-v0`` —
-    build the eval env with Minari ``recover_environment()`` (falls back to ``HalfCheetah-v5``).
-
-    **``num_eval_rollout_videos``** (optional): max number of rollouts (or zero-shot trials) to
-    record frames for. ``None`` = record all when ``save_video`` or W&B video is on. Metrics still
-    use every rollout. W&B + disk: one composite ``eval/rollout_video_grid`` / ``all_rollouts.mp4``
-    (sessions × trials, or a square grid when ``eval_num_trials==1``); no separate per-rollout videos.
-
-    **``context_style``** must match training (``data.context_style``): ``full_trajectory`` uses
-    per-demo padding to ``max_episode_steps`` then the same global prompt cap as the dataset;
-    ``subsampled`` uses the legacy eval segment shape with training-aligned ``_pad_or_trim_prompt``.
-
-    **Zero-shot** (``eval_context_mode=zero_shot_adaptation``): ``num_rollouts`` is the number of
-    independent adaptation **sessions** (context reset each session); ``eval_num_trials`` is still
-    the sequential trials **within** each session. The **first** trial in each session uses **no**
-    ICL prompt (query-only). **Later** trials use a **fixed** ICL prompt built only from **completed**
-    prior trials (current episode is represented in the query segment only, not duplicated in the prompt).
-
-    **``d4rl_score_ref``** (optional): ``(ref_min, ref_max)`` for D4RL-style normalized return
-    (100 * (R - ref_min) / (ref_max - ref_min)) per rollout; logs ``eval/return_mean_normalized`` and
-    ``eval/return_std_normalized``. Use for MuJoCo HalfCheetah (D4RL / Minari); not for VD4RL
-    dm_control tasks (different reward scale).
-    """
-    from src.envs.libero_env import LIBERO_SUITES
-
     if not isinstance(model, MetaDecisionTransformer):
         raise TypeError(
             f"run_rollouts_and_save_viz expects MetaDecisionTransformer, got {type(model)}"
         )
 
     _t_rollout_start = time.perf_counter()
+
+    resolved_scene_seeds: List[int]
+    if eval_scene_seeds:
+        resolved_scene_seeds = [int(x) for x in eval_scene_seeds if x is not None]
+    else:
+        resolved_scene_seeds = []
+    eval_scene_seeds_explicit = len(resolved_scene_seeds) > 0
+    if not resolved_scene_seeds:
+        resolved_scene_seeds = default_eval_scene_seeds(
+            eval_context_mode=eval_context_mode,
+            num_rollouts=num_rollouts,
+            eval_num_trials=eval_num_trials,
+            randomize_scene_between_trials=randomize_scene_between_trials,
+            seed_base=int(vd4rl_eval_seed),
+        )
 
     use_wandb_video = logger is not None and logger._wandb is not None
     # Several media logs share one W&B step; never commit=True on each video or the step advances N times.
@@ -1308,13 +422,13 @@ def run_rollouts_and_save_viz(
     need_pixel_env = collect_frames and (video_cap is None or video_cap > 0)
     # Gymnasium / ManiSkill need render_mode="rgb_array" at construction for env.render() pixels.
     gym_render_mode: Optional[str] = None
-    need_maniskill_vision_render = getattr(model, "vision_encoder", None) is not None and str(
-        env_name
-    ).startswith("ManiSkill/")
+    need_maniskill_vision_render = model.vision_encoder is not None and str(env_name).startswith(
+        "ManiSkill/"
+    )
     if env_name not in LIBERO_SUITES and (need_pixel_env or need_maniskill_vision_render):
         gym_render_mode = "rgb_array"
 
-    env = _try_make_env(
+    env = try_make_eval_env(
         env_name,
         render_both_views=eval_render_both_views,
         render_mode=gym_render_mode,
@@ -1356,6 +470,12 @@ def run_rollouts_and_save_viz(
             f"Eval rollouts: mode={eval_context_mode!r}, num_rollouts={num_rollouts}",
             flush=True,
         )
+    print(
+        f"[eval] scene reset: seed_pool_len={len(resolved_scene_seeds)} "
+        f"source={'config' if eval_scene_seeds_explicit else 'auto'} "
+        f"randomize_scene_between_trials={randomize_scene_between_trials}",
+        flush=True,
+    )
 
     viz_dir = run_dir / "viz" / "samples" / f"step_{step:06d}"
     viz_dir.mkdir(parents=True, exist_ok=True)
@@ -1371,10 +491,8 @@ def run_rollouts_and_save_viz(
         )
     elif save_video:
         video_folder.mkdir(parents=True, exist_ok=True)
-        env, _ = _wrap_record_video(env, video_folder)
+        env, _ = wrap_record_video(env, video_folder)
         print(f"Eval rollout videos will be saved to: {video_folder.resolve()}")
-
-    import torch
 
     state_mean_t = state_mean
     state_std_t = state_std
@@ -1390,14 +508,14 @@ def run_rollouts_and_save_viz(
     state_std_t = np.asarray(state_std_t, dtype=np.float32)
 
     per_trial_eval_G_zs: Optional[List[Optional[float]]] = None
-    _lay_m = getattr(model, "_sequence_token_layout", "rtg_state_action")
+    _lay_m = model._sequence_token_layout
     if _lay_m == "state_action_reward":
         print(
             "Eval: state_action_reward layout — (s,a,r) policy; eval_target_return / RTG rollouts unused.",
             flush=True,
         )
     elif eval_context_mode == "zero_shot_adaptation" and int(eval_num_trials) > 0:
-        per_trial_eval_G_zs = _resolve_per_trial_eval_target_returns(
+        per_trial_eval_G_zs = resolve_per_trial_eval_target_returns(
             int(eval_num_trials), eval_target_return, eval_target_returns
         )
         _toks = [initial_rtg_token(rtg_scale, eval_target_return=g) for g in per_trial_eval_G_zs]
@@ -1414,9 +532,6 @@ def run_rollouts_and_save_viz(
             f"(per-step env rewards are raw; token -= r/rtg_scale).",
             flush=True,
         )
-
-    from src.engine.eval_context import build_prompt_tuple
-    from src.engine.reward_models import get_return_from_env, get_return_from_reward_model
 
     def _return_for_traj(traj_dict: Dict[str, np.ndarray], ep_return: float) -> float:
         if eval_reward_source == "env":
@@ -1447,26 +562,37 @@ def run_rollouts_and_save_viz(
         ml_fallback = model.max_length if model.max_length is not None else 20
         current_trial_k = int(K) if K is not None else int(ml_fallback)
         ml_model = model.max_length
-        _lay = getattr(model, "_sequence_token_layout", "rtg_state_action")
+        _lay = model._sequence_token_layout
         tps = 3 if _lay in ("rtg_state_action", "state_action_reward") else 2
         ctx_cap: Optional[int] = None
         if num_context_trajectories is not None:
             ctx_cap = max(0, int(num_context_trajectories))
         ctx_desc = (
             f"up to {ctx_cap} most recent completed trials (then sorted asc. by return)"
-            if ctx_cap is not None
+            if ctx_cap is not None and ctx_cap > 0
             else "all completed prior trials (sorted asc. by return)"
         )
-        print(
-            f"[zero_shot eval] Policy: trial 1 = query-only; trials 2+ = ICL prompt from [{ctx_desc}] "
-            f"only (fixed during the episode). Query segment: last {current_trial_k} env steps via get_action. "
-            f"total_prompt_cap={total_len} max_prompt_traj_len={max_traj_len} "
-            f"context_style={context_style} max_episode_steps={max_episode_steps} "
-            f"context_subsample_strategy={context_subsample_strategy} "
-            f"query_pad_max_length={ml_model} tokens_per_dt_step={tps}. "
-            f"ICL prompt layout matches training (dataset padding for this context_style).",
-            flush=True,
-        )
+        if _lay == "state_action_reward":
+            print(
+                f"[zero_shot eval] Algorithm distillation: trials 2+ use ``build_prompt_tuple`` prior demos; "
+                f"``MetaDecisionTransformer.forward`` concatenates prior demos then query on the time axis "
+                f"and runs one ``embed_*`` pass (same as training). Live episode stays in the query; last {current_trial_k} "
+                f"steps after concat come from ``get_action`` (``query_window`` / horizon). "
+                f"Sorted by return: [{ctx_desc}]. max_episode_steps={max_episode_steps} "
+                f"query_pad_max_length={ml_model} tokens_per_dt_step={tps}.",
+                flush=True,
+            )
+        else:
+            print(
+                f"[zero_shot eval] Policy: trial 1 = query-only; trials 2+ = ICL prompt from [{ctx_desc}] "
+                f"only (fixed during the episode). Query segment: last {current_trial_k} env steps via get_action. "
+                f"total_prompt_cap={total_len} max_prompt_traj_len={max_traj_len} "
+                f"context_style={context_style} max_episode_steps={max_episode_steps} "
+                f"context_subsample_strategy={context_subsample_strategy} "
+                f"query_pad_max_length={ml_model} tokens_per_dt_step={tps}. "
+                f"ICL prompt layout matches training (dataset padding for this context_style).",
+                flush=True,
+            )
         zs_clip_grid: List[List[Optional[List[np.ndarray]]]] = [
             [None] * n_trials for _ in range(num_rollouts)
         ]
@@ -1478,7 +604,9 @@ def run_rollouts_and_save_viz(
                 if ctx_cap is None:
                     recent = list(context_list)
                 elif ctx_cap <= 0:
-                    recent = []
+                    # ``data.num_context_trajectories=0`` (common for AD) must not zero out eval priors:
+                    # otherwise ``prev_trajs`` is always empty and ``prompt_now`` stays None for trial 1+.
+                    recent = list(context_list)
                 else:
                     recent = (
                         context_list[-ctx_cap:]
@@ -1583,6 +711,7 @@ def run_rollouts_and_save_viz(
                     ),
                     query_window=query_window,
                 )
+                _qti_rollout = 1 if _lay == "state_action_reward" and trial == 0 else trial
                 ep_return, length, S, A, traj_dict, frames, rtg_ff, rtg_trace, cum_ret_ff = (
                     _run_one_rollout(
                         model,
@@ -1603,9 +732,16 @@ def run_rollouts_and_save_viz(
                             if per_trial_eval_G_zs is not None
                             else eval_target_return
                         ),
-                        query_trial_index=trial,
+                        query_trial_index=_qti_rollout,
                         query_window=query_window,
-                        reset_seed=step + rep * 100_000 + trial,
+                        reset_seed=eval_episode_reset_seed(
+                            step=step,
+                            session_rep=rep,
+                            trial=trial,
+                            n_trials_in_session=n_trials,
+                            eval_scene_seeds=resolved_scene_seeds,
+                            randomize_scene_between_trials=randomize_scene_between_trials,
+                        ),
                     )
                 )
                 ret = _return_for_traj(traj_dict, ep_return)
@@ -1623,19 +759,19 @@ def run_rollouts_and_save_viz(
                 all_reward_traces.append(np.asarray(traj_dict["rewards"], dtype=np.float64))
                 all_rtg_traces.append(np.asarray(rtg_trace, dtype=np.float64))
                 if _collect_frames_for_index(global_idx) and frames:
-                    ann = _annotated_rollout_frames(
+                    ann = annotated_rollout_frames(
                         model,
                         frames,
                         rtg_ff,
                         f"S{rep + 1} T{trial + 1}",
-                        cum_return_per_frame=cum_ret_ff,
+                        cum_return_per_frame_vals=cum_ret_ff,
                     )
                     zs_clip_grid[rep][trial] = ann
         if collect_frames and any(
             zs_clip_grid[r][c] is not None for r in range(num_rollouts) for c in range(n_trials)
         ):
             if n_trials > 1:
-                _finalize_wandb_eval_rollout_videos(
+                _finalize_eval_rollout_videos(
                     logger,
                     video_folder,
                     step=step,
@@ -1647,9 +783,9 @@ def run_rollouts_and_save_viz(
                 )
             else:
                 zs_flat = [zs_clip_grid[r][0] for r in range(num_rollouts)]
-                zr, zc = _grid_layout_dims(num_rollouts, 1)
-                zcg = _pack_flat_clips_to_grid(zs_flat, zr, zc)
-                _finalize_wandb_eval_rollout_videos(
+                zr, zc = grid_layout_dims(num_rollouts, 1)
+                zcg = pack_flat_clips_to_grid(zs_flat, zr, zc)
+                _finalize_eval_rollout_videos(
                     logger,
                     video_folder,
                     step=step,
@@ -1702,6 +838,14 @@ def run_rollouts_and_save_viz(
                     eval_target_return=eval_target_return,
                     query_trial_index=len(prompt_trajectories) + 1,
                     query_window=query_window,
+                    reset_seed=eval_episode_reset_seed(
+                        step=step,
+                        session_rep=ep,
+                        trial=0,
+                        n_trials_in_session=1,
+                        eval_scene_seeds=resolved_scene_seeds,
+                        randomize_scene_between_trials=randomize_scene_between_trials,
+                    ),
                 )
             )
             all_returns.append(ep_return)
@@ -1711,18 +855,18 @@ def run_rollouts_and_save_viz(
             all_reward_traces.append(np.asarray(traj_dict["rewards"], dtype=np.float64))
             all_rtg_traces.append(np.asarray(rtg_trace, dtype=np.float64))
             if _collect_frames_for_index(ep) and frames:
-                ann = _annotated_rollout_frames(
+                ann = annotated_rollout_frames(
                     model,
                     frames,
                     rtg_ff,
                     f"Rollout {ep + 1}",
-                    cum_return_per_frame=cum_ret_ff,
+                    cum_return_per_frame_vals=cum_ret_ff,
                 )
                 prompt_clips[ep] = ann
         if collect_frames and any(c is not None for c in prompt_clips):
-            pr, pc = _grid_layout_dims(num_rollouts, 1)
-            pcg = _pack_flat_clips_to_grid(prompt_clips, pr, pc)
-            _finalize_wandb_eval_rollout_videos(
+            pr, pc = grid_layout_dims(num_rollouts, 1)
+            pcg = pack_flat_clips_to_grid(prompt_clips, pr, pc)
+            _finalize_eval_rollout_videos(
                 logger,
                 video_folder,
                 step=step,
@@ -1760,6 +904,14 @@ def run_rollouts_and_save_viz(
                     env_name=env_name,
                     eval_target_return=eval_target_return,
                     query_window=query_window,
+                    reset_seed=eval_episode_reset_seed(
+                        step=step,
+                        session_rep=ep,
+                        trial=0,
+                        n_trials_in_session=1,
+                        eval_scene_seeds=resolved_scene_seeds,
+                        randomize_scene_between_trials=randomize_scene_between_trials,
+                    ),
                 )
             )
             all_returns.append(ep_return)
@@ -1769,18 +921,18 @@ def run_rollouts_and_save_viz(
             all_reward_traces.append(np.asarray(traj_dict["rewards"], dtype=np.float64))
             all_rtg_traces.append(np.asarray(rtg_trace, dtype=np.float64))
             if _collect_frames_for_index(ep) and frames:
-                ann = _annotated_rollout_frames(
+                ann = annotated_rollout_frames(
                     model,
                     frames,
                     rtg_ff,
                     f"Rollout {ep + 1}",
-                    cum_return_per_frame=cum_ret_ff,
+                    cum_return_per_frame_vals=cum_ret_ff,
                 )
                 bare_clips[ep] = ann
         if collect_frames and any(c is not None for c in bare_clips):
-            br, bc = _grid_layout_dims(num_rollouts, 1)
-            bcg = _pack_flat_clips_to_grid(bare_clips, br, bc)
-            _finalize_wandb_eval_rollout_videos(
+            br, bc = grid_layout_dims(num_rollouts, 1)
+            bcg = pack_flat_clips_to_grid(bare_clips, br, bc)
+            _finalize_eval_rollout_videos(
                 logger,
                 video_folder,
                 step=step,
@@ -1827,6 +979,7 @@ def run_rollouts_and_save_viz(
     from matplotlib.ticker import MaxNLocator
 
     _font = {"family": "serif", "serif": ["Palatino", "Palatino Linotype", "DejaVu Serif"]}
+    wb_eval_charts: Dict[str, Any] = {}
     # Per-trial / grouped return plots only when K>1; for K==1 scalars (eval/return_mean, std) suffice.
     if len(all_returns) > 0 and int(eval_num_trials) > 1:
         arr = np.asarray(all_returns, dtype=np.float64)
@@ -1974,15 +1127,10 @@ def run_rollouts_and_save_viz(
         if logger is not None and logger._wandb is not None:
             import wandb
 
-            p = str(summary_path)
-            logger.log_wandb_dict(
-                {"eval/returns_summary": wandb.Image(p)},
-                step=step,
-                wandb_commit=wb_commit_charts,
-            )
+            wb_eval_charts["eval/returns_summary"] = wandb.Image(str(summary_path))
 
     rtg_dyn_path = viz_dir / "eval_rtg_reward_dynamics.png"
-    rtg_dyn_paths = _save_eval_rtg_reward_figure(
+    rtg_dyn_paths = save_eval_rtg_reward_figure(
         all_reward_traces,
         all_rtg_traces,
         rtg_scale=rtg_scale,
@@ -1993,22 +1141,21 @@ def run_rollouts_and_save_viz(
         num_rollouts=int(num_rollouts),
         eval_context_mode=str(eval_context_mode),
     )
-    if rtg_dyn_paths and logger is not None and logger._wandb is not None:
-        import wandb
+    # W&B: RTG/reward dynamics figure (disabled — duplicate Media panels; PNGs still under viz/).
+    # if rtg_dyn_paths and logger is not None and logger._wandb is not None:
+    #     import wandb
+    #
+    #     wb_rtg_path: Path
+    #     wb_rtg_path = Path(rtg_dyn_paths[-1])
+    #     for p in rtg_dyn_paths:
+    #         if "_mean_std" in Path(p).stem:
+    #             wb_rtg_path = Path(p)
+    #             break
+    #     wb_eval_charts["eval/rtg_reward_dynamics"] = wandb.Image(str(wb_rtg_path))
 
-        # One W&B panel: prefer mean±std across rollouts/sessions when a second PNG exists;
-        # all paths are still saved under viz/ for local inspection.
-        wb_rtg_path: Path
-        wb_rtg_path = Path(rtg_dyn_paths[-1])
-        for p in rtg_dyn_paths:
-            if "_mean_std" in Path(p).stem:
-                wb_rtg_path = Path(p)
-                break
-        logger.log_wandb_dict(
-            {"eval/rtg_reward_dynamics": wandb.Image(str(wb_rtg_path))},
-            step=step,
-            wandb_commit=wb_commit_charts,
-        )
+    if wb_eval_charts and logger is not None and logger._wandb is not None:
+        payload: Dict[str, Any] = {"train/global_step": int(step), **wb_eval_charts}
+        logger.log_wandb_dict(payload, step=step, wandb_commit=wb_commit_charts)
 
     if len(all_returns) == 0:
         metrics = {
@@ -2029,7 +1176,7 @@ def run_rollouts_and_save_viz(
             norm = d4rl_normalize_returns(all_returns, rmin, rmax)
             metrics["eval/return_mean_normalized"] = float(np.mean(norm))
             metrics["eval/return_std_normalized"] = float(np.std(norm))
-    ap_stats = _action_prediction_stats_from_rollouts(all_actions_list)
+    ap_stats = action_prediction_stats_from_rollouts(all_actions_list)
     metrics.update(ap_stats)
     if ap_stats:
         print(

@@ -40,6 +40,15 @@ class Logger:
 
             cfg_dict = OmegaConf.to_container(config, resolve=True) if config is not None else {}
             self._wandb = wandb.init(project=project, entity=entity, name=run_name, config=cfg_dict)
+            try:
+                wandb.define_metric("train/global_step")
+                for _media_key in (
+                    "eval/returns_summary",
+                    "eval/rollout_video_grid",
+                ):
+                    wandb.define_metric(_media_key, step_metric="train/global_step")
+            except Exception:
+                pass
 
     def log_metrics(
         self, metrics: Dict[str, float], step: int, *, wandb_commit: bool = True
@@ -52,9 +61,7 @@ class Logger:
                 if self._wandb is not None:
                     wb_payload[k] = v
         if self._wandb is not None and wb_payload:
-            wb_payload["train/global_step"] = step
-            # commit=False accumulates with other logs at the same step; final commit must follow
-            # (see trainer: eval media first with commit=False, then log_metrics commit=True).
+            wb_payload["train/global_step"] = int(step)
             self._wandb.log(wb_payload, step=step, commit=wandb_commit)
 
     def log_scalar(self, tag: str, value: float, step: int, *, wandb_commit: bool = True) -> None:
@@ -82,11 +89,13 @@ class Logger:
         arr = np.stack(frames)
         if arr.dtype != np.uint8:
             arr = np.clip(arr, 0, 255).astype(np.uint8)
-        # W&B expects (T, C, H, W); we have (T, H, W, C)
         if arr.ndim == 4 and arr.shape[-1] == 3:
             arr = np.moveaxis(arr, -1, 1)
         self._wandb.log(
-            {tag: wandb.Video(arr, fps=fps, format=format)},
+            {
+                "train/global_step": int(step),
+                tag: wandb.Video(arr, fps=fps, format=format),
+            },
             step=step,
             commit=wandb_commit,
         )
@@ -108,7 +117,10 @@ class Logger:
         if not path.exists():
             return
         self._wandb.log(
-            {tag: wandb.Video(str(path), format="mp4")},
+            {
+                "train/global_step": int(step),
+                tag: wandb.Video(str(path), format="mp4"),
+            },
             step=step,
             commit=wandb_commit,
         )
@@ -130,17 +142,31 @@ class Logger:
             from PIL import Image
 
             img = Image.open(buf)
-            self._wandb.log({tag: wandb.Image(img)}, step=step, commit=wandb_commit)
+            self._wandb.log(
+                {"train/global_step": int(step), tag: wandb.Image(img)},
+                step=step,
+                commit=wandb_commit,
+            )
         elif isinstance(image, (str, Path)) and Path(image).exists():
-            self._wandb.log({tag: wandb.Image(str(image))}, step=step, commit=wandb_commit)
+            self._wandb.log(
+                {"train/global_step": int(step), tag: wandb.Image(str(image))},
+                step=step,
+                commit=wandb_commit,
+            )
         else:
-            self._wandb.log({tag: wandb.Image(image)}, step=step, commit=wandb_commit)
+            self._wandb.log(
+                {"train/global_step": int(step), tag: wandb.Image(image)},
+                step=step,
+                commit=wandb_commit,
+            )
 
     def log_wandb_dict(self, data: Dict[str, Any], step: int, *, wandb_commit: bool = True) -> None:
-        """Single wandb.log; use wandb_commit=False when more keys follow at the same step."""
+        """Single ``wandb.log``; use ``wandb_commit=False`` when more keys follow at the same step."""
         if self._wandb is None or not data:
             return
-        self._wandb.log(data, step=step, commit=wandb_commit)
+        payload = dict(data)
+        payload.setdefault("train/global_step", int(step))
+        self._wandb.log(payload, step=step, commit=wandb_commit)
 
     def flush(self) -> None:
         """Flush TensorBoard buffers only. Does not end the W&B run."""
@@ -213,6 +239,6 @@ def log_metrics(
         metrics.update(eval_metrics)
     if batch_metrics:
         metrics.update(batch_metrics)
-    logger.log_metrics(metrics, step, wandb_commit=wandb_commit)
     if checkpoint_path:
-        logger.log_scalar("checkpoint/path_step", float(step), step, wandb_commit=wandb_commit)
+        metrics["checkpoint/path_step"] = float(step)
+    logger.log_metrics(metrics, step, wandb_commit=wandb_commit)
