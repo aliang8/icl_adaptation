@@ -258,7 +258,7 @@ class MetaDecisionTransformer(nn.Module):
             actions = batch.actions
             returns_to_go = batch.returns_to_go
             timesteps = batch.timesteps
-            ti = batch.trial_indices    3
+            ti = batch.trial_indices
             if ti is None:
                 ti = torch.zeros((B, T_query), dtype=torch.long, device=batch.states.device)
             contexts = batch.contexts if self._fuse_context_in_state else None

@@ -1,6 +1,7 @@
 # Example: ICL training on ManiSkill data from scripts/maniskill/ppo_train_icldata.py
-# Expects: paths.data_root/maniskill/PickCube-v1/trajectories.h5.
-# PPO defaults to exporting the on-policy rollout stream into that file (--icl-save-rollout-buffer).
+# Shard list is explicit (no manifest / glob discovery). Relative entries try paths.data_root
+# first, then <paths.repo_root>/datasets/... (so local ./datasets/... still works if data_root
+# points at a shared copy that is missing shards).
 #
 # python scripts/maniskill/ppo_train_icldata.py --env-id PickCube-v1 ... --icl-data-root <same as paths.data_root>
 # python src/train.py data=maniskill_pickcube model.use_vision=true data.use_vision=true ...
@@ -10,6 +11,12 @@ defaults:
   - _self_
 
 env_name: ManiSkill/PickCube-v1
+trajectory_hdf5_paths:
+  - maniskill/PickCube-v1/trajectories_shard_00000.h5
+  - maniskill/PickCube-v1/trajectories_shard_00001.h5
+  - maniskill/PickCube-v1/trajectories_shard_00002.h5
+  - maniskill/PickCube-v1/trajectories_shard_00003.h5
+  - maniskill/PickCube-v1/trajectories_shard_00004.h5
 rtg_scale: 1.0
 horizon: 20
 max_episode_steps: 50

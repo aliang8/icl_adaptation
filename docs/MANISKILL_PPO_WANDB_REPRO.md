@@ -75,7 +75,7 @@ One seed only (official runs use `1788`, `4796`, `9351`):
 
 ```bash
 uv run python scripts/maniskill/run_ppo_wandb_repro.py \
-  --config scripts/maniskill/ppo_wandb_repro/configs/PickCube-v1.json \
+  --config scripts/maniskill/ppo_wandb_repro/configs/PickCube-v1_test.json \
   --seed 1788
 ```
 
@@ -106,21 +106,56 @@ Pass extra flags to `ppo_train_icldata.py` after `--`:
 ENVS_OVERRIDE="PickCube-v1" ./scripts/maniskill/run_ppo_wandb_repro.sh -- --icl-data-root datasets
 ```
 
-### RGB / image observations in `trajectories.h5`
+### RGB / image observations (ICL export)
 
-The **full stitched PPO rollout buffer** (`--icl-save-rollout-buffer`, on by default) is **state, actions, and rewards only** — it does not record pixels from training rollouts.
+The **full stitched PPO rollout buffer** (`--icl-save-rollout-buffer`, on by default) is normally **state, actions, and rewards only**. Optional **`--icl-rollout-render-rgb`** records **`rgb_array`** every **training** rollout step into the **same** stitched episodes (`images_view_*` inside **`trajectories_shard_*.h5`** / the final export). That path is slow at large `num_envs`; use **`--reconfiguration-freq 0`**, **`physx_cuda`**, and a modest **`--icl-shard-max-episodes`** / **`--icl-rollout-rgb-shard-max-episodes`**. It **disables** **`--icl-image-snapshot-*`**.
 
-To **append RGB episodes at the end** (final policy, `render_mode=rgb_array`) into the same `<icl_data_root>/maniskill/<env_id>/trajectories.h5`, pass **`--icl-collect-episodes N`** (and optionally **`--icl-max-steps-per-episode`**). Those runs are **extra** on-policy rollouts after training, not a pixel dump of the entire historical buffer.
+- **Periodic RGB during training (snapshots):** when `global_step` crosses each **`--icl-image-snapshot-every-steps N`** boundary (after the policy update), the script rolls out **`--icl-image-snapshot-episodes`** short episodes with `render_mode=rgb_array`. Episodes are buffered and written as **`trajectories_image_shard_*.h5`** in **`datasets/maniskill/<env_id>/`** (same folder as state rollout shards), with RGB in **`images_view_*`**. Stored frame size is **`--icl-rgb-resize-hw`** (square H=W; **default 128**, not full 256×256 task renders). Set **`--icl-image-snapshot-shard-max-episodes K`** for episodes per file, or leave it at **`0`** to reuse **`--icl-shard-max-episodes`** when that is > 0 (you must set at least one). Training end flushes any partial buffer. Tune **`--icl-snapshot-hdf5-image-compression`** (`gzip` / `lzf` / `none`) for speed vs size.
 
-Example (W&B repro + final-policy RGB episodes):
+- **RGB after training ends:** pass **`--icl-collect-episodes N`** (and optionally **`--icl-max-steps-per-episode`**) to append final-policy RGB into the **main** export path (same single `.h5`).
+
+- **Large state-only runs:** **`--icl-shard-max-episodes M`** (`M>0`) flushes rollout episodes to `trajectories_shard_00000.h5`, … during training instead of holding everything until the end; see `icl_shards_manifest.json` in the task folder.
+
+Example (W&B repro + **sharded** state rollout export + periodic RGB snapshots):
 
 ```bash
 uv run python scripts/maniskill/run_ppo_wandb_repro.py \
   --config scripts/maniskill/ppo_wandb_repro/configs/PickCube-v1.json \
-  -- --icl-collect-episodes 64 --icl-max-steps-per-episode 512
+  --seed 1788 \
+  -- --icl-data-root datasets \
+     --icl-shard-max-episodes 50000 \
+     --icl-rgb-resize-hw 128 \
+     --icl-image-snapshot-shard-max-episodes 1000 \
+     --icl-image-snapshot-every-steps 2000 \
+     --icl-image-snapshot-episodes 5 \
+     --icl-image-snapshot-max-steps 50 \
+     --reward-scale 3 \
+     --success-reward-bonus 5
 ```
 
-For **periodic** RGB snapshots during training (separate files under `.../image_snapshots/`), use **`--icl-image-snapshot-every-steps`** and **`--icl-image-snapshot-episodes`** (see `ppo_train_icldata.py` module docstring).
+**RGB embedded in the on-policy rollout shards** (no `trajectories_image_shard_*` snapshots): render every training rollout step and flush HDF5s so RAM stays bounded. There is still **one** episode list in memory; **`--icl-shard-max-episodes`** alone sets how often **`trajectories_shard_*.h5`** is written. Optional **`--icl-rollout-rgb-shard-max-episodes K`** only matters when you want a **smaller** flush than the main cap (e.g. `--icl-shard-max-episodes 50000` but flush every **800** RGB-heavy episodes); the code uses **`min`** of the two when both are positive. If `K` is **0**, only **`--icl-shard-max-episodes`** applies—no need to duplicate it.
+
+Example ( **`--reconfiguration-freq 0`** helps batched `rgb_array` render; add **`--num-envs 64`** etc. if your JSON uses a large vector width):
+
+```bash
+uv run python scripts/maniskill/run_ppo_wandb_repro.py \
+  --config scripts/maniskill/ppo_wandb_repro/configs/PickCube-v1.json \
+  --seed 1788 \
+  -- --icl-data-root datasets \
+     --reconfiguration-freq 0 \
+     --icl-shard-ram-flush-episodes 4096 \
+     --icl-shard-max-episodes 50000 \
+     --icl-rollout-render-rgb \
+     --icl-rgb-resize-hw 128 \
+     --reward-scale 3 \
+     --success-reward-bonus 5
+```
+
+**One seed:** pass **`--seed <int>`** on **`run_ppo_wandb_repro.py`** (before **`--`**). Omit **`--seed`** to run every seed listed in the JSON (official table-top runs use **`1788`**, **`4796`**, **`9351`**). Anything after **`--`** is forwarded only to **`ppo_train_icldata.py`**.
+
+**Reward shaping (differs from strict W&B repro):** **`--reward-scale 3`** multiplies rewards in the **on-policy PPO rollout** (after the optional success add). **`--success-reward-bonus 10`** adds **10 env reward units** on the **terminal** timestep when **`final_info`** reports success, **before** `reward_scale`. Sharded **state** rollout HDF5s and **`trajectories_image_shard_*.h5`** both store **the same scaled per-step rewards** as PPO (bonus in env units, then × `reward_scale` on every step).
+
+State rollouts flush every **50 000** episodes in this snippet; RGB snapshot shards use **1000** episodes per `trajectories_image_shard_*.h5` here (buffer fills after **200** snapshot rounds at 5 episodes each), which **lowers RAM** and writes image HDF5s sooner than inheriting a large rollout cap. **`--icl-rgb-resize-hw 128`** matches the **`ppo_train_icldata.py`** default (omit the flag to get 128×128); use **`256`** only if you need higher-res HDF5s. If you omit **`--icl-image-snapshot-shard-max-episodes`**, RGB inherits from **`--icl-shard-max-episodes`** with an internal **1000-episode cap** when the rollout cap is larger. Raise **`--icl-image-snapshot-shard-max-episodes`** only if you want fewer, bigger RGB files (more memory before flush). Use **`uv run`** from the project `.venv` or **`python ...`** from `.venv-maniskill` so **`h5py`** matches `scripts/maniskill/requirements.txt` (see `docs/MANISKILL.md`).
 
 ## Related scripts
 

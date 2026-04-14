@@ -1,20 +1,35 @@
 """
 PPO training for ManiSkill (from upstream ``examples/baselines/ppo/ppo.py``) with ICL export.
 
-Writes ``<icl_data_root>/maniskill/<env_id>/trajectories.h5`` — flat HDF5 (concatenated timesteps,
-``episode_starts`` / ``episode_lengths``, gzip chunks) for ``get_icl_trajectory_dataset`` / ``train.py``
-(``data.env_name=ManiSkill/<env_id>``).
+Writes ``<icl_data_root>/maniskill/<env_id>/trajectories_state_5M.h5`` by default — flat HDF5 (concatenated
+timesteps, ``episode_starts`` / ``episode_lengths``, gzip chunks) for ``get_icl_trajectory_dataset`` /
+``train.py`` (``data.env_name=ManiSkill/<env_id>``).
+
+With ``--icl-shard-max-episodes N`` (N>0), rollout episodes go to rotating files
+``trajectories_shard_00000.h5``, ``trajectories_shard_00001.h5``, … (each at most N episodes, **training
+completion order** within a shard; no sort-by-return). Optional ``--icl-shard-ram-flush-episodes K`` (K>0)
+writes the **current** shard incrementally (first chunk creates the HDF5, later chunks **append**) so RAM
+need not hold a full N-episode shard. A small ``icl_shards_manifest.json`` lists shard names for merging
+or multi-file training. Optional ``--icl-save-episode-fraction F`` (0<F≤1, default 1) subsamples **completed
+on-policy rollout** episodes before HDF5 export (e.g. ``0.33`` keeps about one third on average); does not
+affect PPO learning, RGB snapshots, or ``--icl-collect-episodes``.
 
 By default **stitches the full on-policy PPO rollout stream** (all training iterations) into
-episode dicts: **state**, **actions**, **rewards** (env units; unscaled from PPO ``reward_scale``),
-plus optional **episode_meta** (ManiSkill success/length metrics from ``final_info`` when present).
-**RGB:** use ``--icl-image-snapshot-every-steps N`` and ``--icl-image-snapshot-episodes X`` to write
-``image_snapshots/trajectories_step_XXXXXXXX.h5`` when training crosses each ``N`` env-step boundary
-(policy after that iteration's update). Optional ``--icl-collect-episodes`` appends final-policy RGB
-episodes into the main ``trajectories.h5``. Use ``--icl-rgb-resize-hw 256`` (default) to store frames at
-256×256 (human render camera is set to that size in ManiSkill so ``env.render()`` is not full-res then resized).
-Set ``0`` for native task camera resolution. Snapshot HDF5 image compression defaults to
-``lzf`` (``--icl-snapshot-hdf5-image-compression``); use ``none`` for fastest writes or ``gzip`` for smaller files.
+episode dicts: **state**, **actions**, **rewards** (same per-step values as PPO learning: optional terminal ``--success-reward-bonus``, then ``--reward_scale``),
+plus optional **episode_meta** (from ``final_info`` when present; **return** / **r** / mean **reward**
+scaled like PPO: +``success_reward_bonus`` on success then ×``reward_scale``).
+**RGB:** (1) use ``--icl-image-snapshot-every-steps N`` … periodic **snapshot** rollouts → ``trajectories_image_shard_*.h5``,
+or (2) ``--icl-rollout-render-rgb`` to ``render()`` every **training** rollout step and embed frames in the **same**
+stitched on-policy episodes as state (``images_view_*`` in ``trajectories_shard_*.h5`` / final HDF5). (2) disables (1).
+For **snapshot** RGB only: if ``--icl-image-snapshot-shard-max-episodes`` is 0 but ``--icl-shard-max-episodes`` is set,
+snapshot shards use ``min(icl_shard_max_episodes, 1000)`` episodes per file.
+Optional
+``--icl-collect-episodes`` appends final-policy RGB
+episodes into the main ``trajectories.h5``. Use ``--icl-rgb-resize-hw 128`` (default) to store frames at
+128×128 (human render camera is set to that size in ManiSkill so ``env.render()`` is not full-res then resized).
+Set ``0`` for native task camera resolution. RGB is embedded in the same ``.h5`` as ``images_view_*``.
+``--icl-snapshot-hdf5-image-compression`` (``gzip`` / ``lzf`` / ``none``) applies to ``images_view_*``
+on every export path that writes RGB (snapshots, final file, shards, ``--icl-export-only``).
 RGB rollouts use ``--icl-rgb-collect-num-envs`` parallel ManiSkill envs (GPU ``physx_cuda``; ``physx_cpu`` forces 1).
 
 Requires: ``pip install mani-skill tyro`` (see ``docs/MANISKILL.md``). Weights & Biases is **on** by default
@@ -22,6 +37,7 @@ Requires: ``pip install mani-skill tyro`` (see ``docs/MANISKILL.md``). Weights &
 as ``eval/*`` (and ``train/*`` episode metrics when episodes complete during rollouts).
 """
 
+import json
 import os
 import random
 import sys
@@ -37,18 +53,43 @@ _REPO_ROOT = _Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from src.data.maniskill_io import (
+from src.data.ic_replay_buffer_hdf5 import (
     append_ppo_rollout_to_episode_buffers,
-    collect_episodes_vector_env,
-    default_icl_export_path,
-    episode_meta_from_final_info,
+    append_trajectories_hdf5,
     flush_episode_buffers,
-    icl_image_snapshot_path,
+    render_batch_to_rgb_list,
     save_trajectories_hdf5,
 )
+from src.data.maniskill_io import (
+    collect_episodes_vector_env,
+    episode_meta_from_final_info,
+    episode_success_from_batched_final_info,
+    scale_episode_meta_for_icl_export,
+)
+
+
+def _icl_task_dir(icl_data_root: str, env_id: str) -> _Path:
+    safe = env_id.replace("/", "_").replace(" ", "_")
+    return _Path(icl_data_root).expanduser().resolve() / "maniskill" / safe
+
+
+def _icl_state_shard_path(icl_data_root: str, env_id: str, shard_index: int) -> _Path:
+    return _icl_task_dir(icl_data_root, env_id) / f"trajectories_shard_{int(shard_index):05d}.h5"
+
+
+def _icl_monolith_export_path(icl_data_root: str, env_id: str) -> _Path:
+    """Single HDF5 when not using rollout shards (legacy on-disk name)."""
+    return _icl_task_dir(icl_data_root, env_id) / "trajectories_state_5M.h5"
+
+
+def _icl_image_snapshot_shard_path(icl_data_root: str, env_id: str, shard_index: int) -> _Path:
+    d = _icl_task_dir(icl_data_root, env_id)
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"trajectories_image_shard_{int(shard_index):05d}.h5"
 
 # ManiSkill specific imports
 import mani_skill.envs  # noqa: F401 — register envs
+import src.envs.maniskill_pickcube_placed_only  # noqa: F401 — PickCube-v1-PlaceOnly
 import numpy as np
 import torch
 import torch.nn as nn
@@ -98,8 +139,10 @@ class Args:
     """the number of parallel environments"""
     num_eval_envs: int = 8
     """the number of parallel evaluation environments"""
-    partial_reset: bool = True
-    """whether to let parallel environments reset upon termination instead of truncation"""
+    partial_reset: bool = False
+    """If True, parallel envs reset on task ``terminated`` (e.g. early success). If False (default),
+    ``ManiSkillVectorEnv`` uses ``ignore_terminations=True``: episodes continue until time-limit
+    ``truncated`` at max horizon. Override with ``--partial-reset``."""
     eval_partial_reset: bool = False
     """whether to let parallel evaluation environments reset upon termination instead of truncation"""
     num_steps: int = 50
@@ -114,7 +157,7 @@ class Args:
     """the control mode to use for the environment"""
     sim_backend: str = "physx_cuda"
     """Simulation backend for ``gym.make`` (W&B ``gpu`` == ``physx_cuda`` in ManiSkill)."""
-    reward_mode: Optional[str] = None
+    reward_mode: Optional[str] = "dense"
     """If set (e.g. ``normalized_dense``), passed to ``gym.make``; ``None`` uses the task default."""
     anneal_lr: bool = False
     """Toggle learning rate annealing for policy and value networks"""
@@ -141,7 +184,9 @@ class Args:
     target_kl: float = 0.1
     """the target KL divergence threshold"""
     reward_scale: float = 1.0
-    """Scale the reward by this factor"""
+    """Scale the reward by this factor (applied after optional ``success_reward_bonus``)."""
+    success_reward_bonus: float = 0.0
+    """If non-zero, add this to the **env** reward on the terminal step when ``final_info`` reports success (``success_once`` / ``success_at_end`` / ``success``). Applied **before** ``reward_scale`` on PPO rollouts and in ``collect_episodes_vector_env`` (then ``reward_scale`` is applied to every stored step), so **RGB snapshot** shards match PPO step rewards. Same for ``--icl-collect-episodes`` / ``--icl-export-only``."""
     eval_freq: int = 25
     """run vectorized eval every this many policy **iterations** (update steps), starting at iteration 1"""
     save_train_video_freq: Optional[int] = None
@@ -150,9 +195,15 @@ class Args:
 
     # ICL dataset export (this repo): see module docstring
     icl_data_root: str = "datasets"
-    """Root under cwd; writes ``<icl_data_root>/maniskill/<env_id>/trajectories.h5``."""
+    """Root under cwd; writes under ``<icl_data_root>/maniskill/<env_id>/``."""
+    icl_shard_max_episodes: int = 0
+    """If >0, each ``trajectories_shard_XXXXX.h5`` holds at most this many episodes (disk shard cap). 0=single file at end."""
+    icl_shard_ram_flush_episodes: int = 0
+    """If >0 (and ``icl_shard_max_episodes`` >0), flush at least this many completed episodes from RAM to the **current** shard file as soon as possible—creating the file with the first chunk, then **appending** until the shard reaches ``icl_shard_max_episodes``. Reduces peak RAM vs buffering a full shard. 0=only flush when a full shard of episodes is ready (legacy)."""
+    icl_save_episode_fraction: float = 0.5
+    """Each **completed** on-policy rollout episode is written to ICL HDF5 with this probability (seeded ``random``). ``1.0`` = all. E.g. ``0.33`` keeps about one third on average, reducing disk use. Does not apply to ``--icl-image-snapshot-*`` or ``--icl-collect-episodes``."""
     icl_save_rollout_buffer: bool = True
-    """If True (training only), export **all** PPO rollout data as stitched episodes (state only, no RGB)."""
+    """If True (training only), export on-policy PPO rollouts as stitched episodes (state only unless RGB rollout); use ``icl_save_episode_fraction`` to subsample."""
     icl_collect_episodes: int = 0
     """After training, roll out this many **additional** episodes with the final policy (RGB via render). 0=skip."""
     icl_max_steps_per_episode: int = 512
@@ -160,17 +211,24 @@ class Args:
     icl_export_only: bool = False
     """If True, skip PPO; load ``--checkpoint`` and only write ICL ``trajectories.h5``."""
     icl_image_snapshot_every_steps: int = 0
-    """If >0, save RGB trajectory snapshot ``.h5`` when training crosses each ``N`` env-step boundary (after update)."""
+    """If >0, collect RGB snapshots when training crosses each ``N`` env-step boundary (after update); shards need ``icl_image_snapshot_shard_max_episodes`` or ``icl_shard_max_episodes`` > 0."""
     icl_image_snapshot_episodes: int = 8
     """Episodes per RGB snapshot (``icl_image_snapshot_every_steps`` > 0)."""
     icl_image_snapshot_max_steps: int = 512
     """Max env steps per episode in RGB snapshots."""
-    icl_rgb_resize_hw: int = 256
-    """If >0, set ManiSkill ``human_render_camera_configs`` to H=W and store RGB at that size (resize is a no-op if render matches). 0=native."""
+    icl_image_snapshot_shard_max_episodes: int = 0
+    """Episodes per ``trajectories_image_shard_*.h5``. If 0 and ``icl_shard_max_episodes`` > 0, uses ``min(icl_shard_max_episodes, 1000)`` for RGB (state shards can stay larger). Set explicitly for bigger RGB shards (more RAM before first flush)."""
+    icl_rgb_resize_hw: int = 128
+    """If >0, set ManiSkill ``
+    human_render_camera_configs`` to H=W and store RGB at that size (resize is a no-op if render matches). 0=native."""
     icl_snapshot_hdf5_image_compression: str = "lzf"
-    """Periodic image snapshots only: ``gzip`` (smaller), ``lzf`` (faster), or ``none`` (fastest, largest)."""
+    """``gzip`` / ``lzf`` / ``none`` for ``images_view_*`` whenever this script writes RGB to HDF5."""
     icl_rgb_collect_num_envs: int = 8
     """Parallel envs for RGB rollouts (snapshots + ``icl_collect_episodes``). 1=serial. >1 needs ``physx_cuda``."""
+    icl_rollout_render_rgb: bool = False
+    """If True with ``icl_save_rollout_buffer``, call ``env.render()`` every training rollout timestep and store RGB in the same ICL episodes (HDF5 ``images_view_*``). Needs batched ``rgb_array`` (``physx_cuda`` when ``num_envs``>1). **Disables** ``icl_image_snapshot_*``. Very slow at large ``num_envs`` — lower ``num_envs`` or use smaller ``icl_shard_max_episodes`` / ``icl_rollout_rgb_shard_max_episodes``."""
+    icl_rollout_rgb_shard_max_episodes: int = 0
+    """With ``icl_rollout_render_rgb`` only: optional **extra** cap. Flush uses ``min(icl_shard_max_episodes, this)`` when both >0; if this is 0, only ``icl_shard_max_episodes`` applies (same queue for state+RGB—no second shard series)."""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -186,6 +244,41 @@ def _icl_rgb_resize_hw(args: Args) -> Optional[int]:
     return h if h > 0 else None
 
 
+# When inheriting from ``icl_shard_max_episodes``, cap RGB separately: state shards are small per
+# episode but buffered RGB is huge — inheriting 10_000 would mean no ``trajectories_image_shard_*.h5``
+# until 10_000 snapshot episodes (or a clean process exit). SIGKILL then yields zero image files.
+_ICL_RGB_SNAPSHOT_SHARD_CAP_WHEN_INHERITING = 1000
+
+
+def _icl_rollout_shard_flush_cap(args: Args) -> int:
+    """Episodes per ``trajectories_shard_*.h5`` flush when writing rollout ICL (state ± RGB)."""
+    base = int(args.icl_shard_max_episodes)
+    if not bool(args.icl_rollout_render_rgb):
+        return base
+    cap = int(args.icl_rollout_rgb_shard_max_episodes)
+    if cap > 0 and base > 0:
+        return min(base, cap)
+    if cap > 0:
+        return cap
+    return base
+
+
+def _icl_effective_image_snapshot_shard_cap(args: Args) -> int:
+    """Episodes per RGB snapshot HDF5 file.
+
+    Explicit ``icl_image_snapshot_shard_max_episodes`` wins. If 0 and ``icl_shard_max_episodes`` > 0,
+    use ``min(icl_shard_max_episodes, _ICL_RGB_SNAPSHOT_SHARD_CAP_WHEN_INHERITING)`` so image shards
+    flush to disk without waiting for a full state-shard-sized RGB buffer.
+    """
+    k = int(args.icl_image_snapshot_shard_max_episodes)
+    if k > 0:
+        return k
+    r = int(args.icl_shard_max_episodes)
+    if r <= 0:
+        return 0
+    return min(r, _ICL_RGB_SNAPSHOT_SHARD_CAP_WHEN_INHERITING)
+
+
 def _mani_skill_env_kwargs(args: Args) -> dict:
     kw = dict(obs_mode="state", render_mode="rgb_array", sim_backend=args.sim_backend)
     if args.reward_mode is not None:
@@ -194,9 +287,141 @@ def _mani_skill_env_kwargs(args: Args) -> dict:
         kw["control_mode"] = args.control_mode
     rh = int(args.icl_rgb_resize_hw)
     if rh > 0:
-        # Avoid full-res GPU render + CPU/GPU downscale: match rgb_array camera to HDF5 target (e.g. 256).
+        # Avoid full-res GPU render + CPU/GPU downscale: match rgb_array camera to HDF5 target (e.g. 128).
         kw["human_render_camera_configs"] = dict(width=rh, height=rh)
     return kw
+
+
+@dataclass
+class _IclRolloutShardState:
+    """Tracks the open rollout shard HDF5 (append after first ``save_trajectories_hdf5``)."""
+
+    open_shard_index: int = 0
+    n_episodes_in_open_shard: int = 0
+
+
+def _icl_rollout_shard_file_count(state: _IclRolloutShardState) -> int:
+    return int(state.open_shard_index) + (1 if int(state.n_episodes_in_open_shard) > 0 else 0)
+
+
+def _icl_flush_rollout_shards_incremental(
+    episodes: list,
+    state: _IclRolloutShardState,
+    *,
+    shard_max: int,
+    ram_flush_every: int,
+    end_of_run: bool,
+    icl_data_root: str,
+    env_id: str,
+    image_hdf5_compression: str,
+) -> None:
+    """Move episodes from RAM to shard HDF5s (mutates ``episodes`` and ``state``).
+
+    With ``ram_flush_every`` > 0 and ``end_of_run`` False, writes chunks of up to that many
+    episodes when possible, appending to the current shard until it holds ``shard_max`` episodes,
+    then rotates to the next file. With ``ram_flush_every`` 0, only flushes when at least
+    ``room`` episodes are available (legacy full-shard-from-RAM behavior, but ``room`` respects
+    a partially filled on-disk shard).
+    """
+    if int(shard_max) <= 0 or not episodes:
+        return
+    ram_flush_every = int(ram_flush_every)
+
+    while episodes:
+        room = int(shard_max) - int(state.n_episodes_in_open_shard)
+        if room <= 0:
+            state.open_shard_index += 1
+            state.n_episodes_in_open_shard = 0
+            room = int(shard_max)
+        if end_of_run:
+            take = min(len(episodes), room)
+        elif ram_flush_every > 0:
+            if len(episodes) >= room:
+                take = room
+            elif len(episodes) >= ram_flush_every:
+                take = min(ram_flush_every, room, len(episodes))
+            else:
+                break
+        else:
+            if len(episodes) >= room:
+                take = room
+            else:
+                break
+
+        chunk = episodes[:take]
+        del episodes[:take]
+        p = _icl_state_shard_path(icl_data_root, env_id, state.open_shard_index)
+        if int(state.n_episodes_in_open_shard) == 0:
+            save_trajectories_hdf5(
+                chunk,
+                p,
+                sort_by_return=False,
+                image_hdf5_compression=str(image_hdf5_compression),
+            )
+            how = "wrote"
+        else:
+            append_trajectories_hdf5(p, chunk)
+            how = "appended"
+        state.n_episodes_in_open_shard += int(take)
+        print(
+            f"[ICL shard] {how} episodes={len(chunk)} -> {p.name} "
+            f"(episodes_in_shard={state.n_episodes_in_open_shard}/{shard_max})",
+            flush=True,
+        )
+        if int(state.n_episodes_in_open_shard) >= int(shard_max):
+            state.open_shard_index += 1
+            state.n_episodes_in_open_shard = 0
+
+
+def _icl_write_shards_manifest(
+    icl_data_root: str,
+    env_id: str,
+    shard_max_episodes: int,
+    n_shard_files: int,
+) -> None:
+    if n_shard_files <= 0:
+        return
+    base = _icl_task_dir(icl_data_root, env_id)
+    base.mkdir(parents=True, exist_ok=True)
+    files = [f"trajectories_shard_{i:05d}.h5" for i in range(n_shard_files)]
+    doc = {
+        "env_id": env_id,
+        "icl_shard_max_episodes": int(shard_max_episodes),
+        "n_shards": int(n_shard_files),
+        "h5_files": files,
+        "note": "RGB is embedded as images_view_* in each .h5 when present.",
+    }
+    mp = base / "icl_shards_manifest.json"
+    mp.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+    print(f"[ICL] Wrote {mp.resolve()}", flush=True)
+
+
+def _icl_flush_image_snapshot_shards(
+    buf: list,
+    *,
+    shard_max: int,
+    icl_data_root: str,
+    env_id: str,
+    image_compression: str,
+    next_shard_index: int,
+) -> int:
+    """Write as many full ``shard_max``-episode shards from ``buf`` as possible; return next shard index."""
+    while int(shard_max) > 0 and len(buf) >= int(shard_max):
+        chunk = buf[: int(shard_max)]
+        del buf[: int(shard_max)]
+        p = _icl_image_snapshot_shard_path(icl_data_root, env_id, next_shard_index)
+        save_trajectories_hdf5(
+            chunk,
+            p,
+            sort_by_return=True,
+            image_hdf5_compression=str(image_compression),
+        )
+        print(
+            f"[ICL image snapshot shard] episodes={len(chunk)} -> {p.name}",
+            flush=True,
+        )
+        next_shard_index += 1
+    return next_shard_index
 
 
 def _make_rgb_collect_vector_env(args: Args, num_episodes_cap: int, *, tag: str = "") -> Any:
@@ -299,6 +524,42 @@ if __name__ == "__main__":
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
+    if bool(args.icl_rollout_render_rgb):
+        if not bool(args.icl_save_rollout_buffer) or bool(args.evaluate):
+            raise SystemExit(
+                "icl_rollout_render_rgb requires --icl-save-rollout-buffer (default) and not --evaluate"
+            )
+        if int(args.icl_image_snapshot_every_steps) > 0:
+            print(
+                "[ICL] icl_rollout_render_rgb is on: ignoring --icl-image-snapshot-* (no snapshot collection).",
+                flush=True,
+            )
+        sim_be = str(args.sim_backend).strip().lower()
+        if sim_be == "physx_cpu" and int(args.num_envs) > 1:
+            raise SystemExit(
+                "icl_rollout_render_rgb with num_envs>1 requires physx_cuda for batched rgb_array render"
+            )
+        rcfg = args.reconfiguration_freq
+        if rcfg is not None and int(rcfg) != 0:
+            print(
+                "[ICL] Warning: icl_rollout_render_rgb is most reliable with --reconfiguration-freq 0 "
+                "(batched render across envs).",
+                flush=True,
+            )
+    if int(args.icl_shard_ram_flush_episodes) < 0:
+        raise SystemExit("icl_shard_ram_flush_episodes must be >= 0")
+    if int(args.icl_shard_ram_flush_episodes) > 0 and int(args.icl_shard_max_episodes) <= 0:
+        raise SystemExit(
+            "icl_shard_ram_flush_episodes requires icl_shard_max_episodes > 0 (per-file episode cap)"
+        )
+    _save_frac = float(args.icl_save_episode_fraction)
+    if _save_frac <= 0.0 or _save_frac > 1.0:
+        raise SystemExit("icl_save_episode_fraction must be in (0, 1]")
+    if _save_frac < 1.0:
+        print(
+            f"[ICL] icl_save_episode_fraction={_save_frac} (on-policy rollout HDF5 only; PPO unchanged)",
+            flush=True,
+        )
     if args.exp_name is None:
         args.exp_name = os.path.basename(__file__)[: -len(".py")]
         run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
@@ -337,6 +598,8 @@ if __name__ == "__main__":
             al,
             ah,
             rgb_resize_hw=_rsz,
+            success_reward_bonus=float(args.success_reward_bonus),
+            reward_scale=float(args.reward_scale),
         )
         t1 = time.perf_counter()
         print(
@@ -344,8 +607,12 @@ if __name__ == "__main__":
             f"collect_s={t1 - t0:.2f} -> writing HDF5...",
             flush=True,
         )
-        out_path = default_icl_export_path(args.icl_data_root, args.env_id)
-        save_trajectories_hdf5(trajs, out_path)
+        out_path = _icl_monolith_export_path(args.icl_data_root, args.env_id)
+        save_trajectories_hdf5(
+            trajs,
+            out_path,
+            image_hdf5_compression=str(args.icl_snapshot_hdf5_image_compression),
+        )
         t2 = time.perf_counter()
         print(
             f"[ICL export_only] Saved {len(trajs)} trajectories to {out_path.resolve()} "
@@ -432,7 +699,7 @@ if __name__ == "__main__":
                 env_id=args.env_id,
                 reward_mode=_rm,
                 env_horizon=max_episode_steps,
-                partial_reset=False,
+                partial_reset=args.eval_partial_reset,
             )
             config["eval_env_cfg"] = _eval_log
             _wb_kw = dict(
@@ -468,6 +735,8 @@ if __name__ == "__main__":
         device
     )
     logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
+    # Per-step reward used for GAE, value targets, policy loss, and ICL rollout HDF5 (single source).
+    # Filled in the rollout loop as: env r_t, optional +success_reward_bonus on terminal success, then *reward_scale.
     rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
     dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
     values = torch.zeros((args.num_steps, args.num_envs)).to(device)
@@ -497,15 +766,27 @@ if __name__ == "__main__":
     icl_trajs: list = []
     icl_buffers: list = []
     if args.icl_save_rollout_buffer and not args.evaluate:
-        icl_buffers = [{"obs": [], "act": [], "rew": []} for _ in range(args.num_envs)]
+        if bool(args.icl_rollout_render_rgb):
+            icl_buffers = [{"obs": [], "act": [], "rew": [], "rgb": []} for _ in range(args.num_envs)]
+        else:
+            icl_buffers = [{"obs": [], "act": [], "rew": []} for _ in range(args.num_envs)]
 
     snapshot_cenv = None
     snapshot_al, snapshot_ah = None, None
+    icl_image_snapshot_shard_cap = 0
     if (
         not args.evaluate
+        and not bool(args.icl_rollout_render_rgb)
         and args.icl_image_snapshot_every_steps > 0
         and args.icl_image_snapshot_episodes > 0
     ):
+        icl_image_snapshot_shard_cap = _icl_effective_image_snapshot_shard_cap(args)
+        if icl_image_snapshot_shard_cap <= 0:
+            raise SystemExit(
+                "RGB snapshots only write trajectories_image_shard_*.h5 in the ManiSkill task folder. "
+                "Set --icl-image-snapshot-shard-max-episodes K or --icl-shard-max-episodes K "
+                "(the latter is used when the former is 0)."
+            )
         snapshot_cenv = _make_rgb_collect_vector_env(
             args, args.icl_image_snapshot_episodes, tag=" snapshot"
         )
@@ -513,6 +794,19 @@ if __name__ == "__main__":
         snapshot_ah = torch.from_numpy(snapshot_cenv.single_action_space.high).to(device)
 
     last_icl_image_snap_boundary = -1
+    icl_image_snapbuf: list = []
+    icl_image_snap_shard_next = 0
+    icl_rollout_shard_state = _IclRolloutShardState()
+    sh_max = int(args.icl_shard_max_episodes)
+    sh_flush = _icl_rollout_shard_flush_cap(args)
+    if sh_max < 0:
+        raise SystemExit("icl_shard_max_episodes must be >= 0")
+    if bool(args.icl_rollout_render_rgb) and sh_flush <= 0:
+        print(
+            "[ICL] Warning: icl_rollout_render_rgb with icl_shard_max_episodes=0 and "
+            "icl_rollout_rgb_shard_max_episodes=0 — all RGB rollout episodes stay in RAM until training ends.",
+            flush=True,
+        )
 
     if args.checkpoint:
         agent.load_state_dict(torch.load(args.checkpoint))
@@ -564,10 +858,35 @@ if __name__ == "__main__":
         if args.icl_save_rollout_buffer and not args.evaluate:
             episode_done_after = torch.zeros((args.num_steps, args.num_envs), device=device)
             icl_meta_grid = np.full((args.num_steps, args.num_envs), None, dtype=object)
+        # One (S,N,H,W,3) buffer per rollout: avoids list-of-rows + np.stack copy and cuts allocator churn.
+        rollout_rgb_grid: Optional[np.ndarray] = None
+        _rh_pre = _icl_rgb_resize_hw(args)
+        if args.icl_save_rollout_buffer and not args.evaluate and args.icl_rollout_render_rgb:
+            if _rh_pre is not None:
+                rh = int(_rh_pre)
+                rollout_rgb_grid = np.zeros(
+                    (int(args.num_steps), int(args.num_envs), rh, rh, 3), dtype=np.uint8
+                )
         for step in range(0, args.num_steps):
             global_step += args.num_envs
             obs[step] = next_obs
             dones[step] = next_done
+            if args.icl_save_rollout_buffer and not args.evaluate and args.icl_rollout_render_rgb:
+                try:
+                    _fr = envs.render()
+                except Exception as _e:
+                    raise RuntimeError(
+                        "icl_rollout_render_rgb: envs.render() failed (need render_mode rgb_array on training env)"
+                    ) from _e
+                _rsz_rr = _icl_rgb_resize_hw(args)
+                _row = render_batch_to_rgb_list(_fr, int(args.num_envs), _rsz_rr)
+                row = np.stack(_row, axis=0)
+                if rollout_rgb_grid is None:
+                    h, w = int(row.shape[1]), int(row.shape[2])
+                    rollout_rgb_grid = np.zeros(
+                        (int(args.num_steps), int(args.num_envs), h, w, 3), dtype=np.uint8
+                    )
+                rollout_rgb_grid[step] = row
 
             # ALGO LOGIC: action logic
             with torch.no_grad():
@@ -579,38 +898,76 @@ if __name__ == "__main__":
             # TRY NOT TO MODIFY: execute the game and log data.
             next_obs, reward, terminations, truncations, infos = envs.step(clip_action(action))
             next_done = torch.logical_or(terminations, truncations).to(torch.float32)
-            rewards[step] = reward.view(-1) * args.reward_scale
+            r_step = reward.view(-1).float()
+            sb = float(args.success_reward_bonus)
+            if sb != 0.0 and "final_info" in infos:
+                fi = infos["final_info"]
+                dm = infos["_final_info"]
+                if isinstance(fi.get("episode"), dict):
+                    ep = fi["episode"]
+                    for e in range(args.num_envs):
+                        if bool(dm[e].item() if torch.is_tensor(dm) else dm[e]):
+                            if episode_success_from_batched_final_info(ep, e):
+                                r_step[e] += sb
+            # Learner signal (and ICL): (env + bonus on last step if success) * scale — not raw env reward.
+            rewards[step] = r_step * float(args.reward_scale)
             if args.icl_save_rollout_buffer and not args.evaluate:
                 episode_done_after[step] = next_done
 
             if "final_info" in infos:
                 final_info = infos["final_info"]
                 done_mask = infos["_final_info"]
-                for k, v in final_info["episode"].items():
-                    logger.add_scalar(f"train/{k}", v[done_mask].float().mean(), global_step)
+                if logger is not None and isinstance(final_info.get("episode"), dict):
+                    for k, v in final_info["episode"].items():
+                        logger.add_scalar(f"train/{k}", v[done_mask].float().mean(), global_step)
                 if icl_meta_grid is not None and isinstance(final_info.get("episode"), dict):
                     ep = final_info["episode"]
                     for e in range(args.num_envs):
                         if bool(
                             done_mask[e].item() if torch.is_tensor(done_mask) else done_mask[e]
                         ):
-                            icl_meta_grid[step, e] = episode_meta_from_final_info(ep, e)
+                            raw_meta = episode_meta_from_final_info(ep, e)
+                            succ = episode_success_from_batched_final_info(ep, e)
+                            icl_meta_grid[step, e] = scale_episode_meta_for_icl_export(
+                                raw_meta,
+                                reward_scale=float(args.reward_scale),
+                                success_reward_bonus=float(args.success_reward_bonus),
+                                success=succ,
+                            )
                 with torch.no_grad():
                     final_values[step, torch.arange(args.num_envs, device=device)[done_mask]] = (
                         agent.get_value(infos["final_observation"][done_mask]).view(-1)
                     )
         rollout_time = time.time() - rollout_time
         if args.icl_save_rollout_buffer and not args.evaluate:
+            # `rewards` above: same (bonus then scale) tensor as GAE/returns; stored as-is in shards / HDF5.
+            _rgb_grid = None
+            if args.icl_rollout_render_rgb:
+                if rollout_rgb_grid is None:
+                    raise RuntimeError("icl_rollout_render_rgb: RGB grid was never allocated")
+                _rgb_grid = rollout_rgb_grid
             append_ppo_rollout_to_episode_buffers(
                 obs.detach().cpu().numpy(),
                 actions.detach().cpu().numpy(),
                 rewards.detach().cpu().numpy(),
                 (episode_done_after.detach().cpu().numpy() > 0.5),
-                float(args.reward_scale),
                 icl_buffers,
                 icl_trajs,
                 episode_meta_grid=icl_meta_grid,
+                rgb_grid=_rgb_grid,
+                episode_keep_fraction=_save_frac,
             )
+            if sh_flush > 0:
+                _icl_flush_rollout_shards_incremental(
+                    icl_trajs,
+                    icl_rollout_shard_state,
+                    shard_max=sh_flush,
+                    ram_flush_every=int(args.icl_shard_ram_flush_episodes),
+                    end_of_run=False,
+                    icl_data_root=args.icl_data_root,
+                    env_id=args.env_id,
+                    image_hdf5_compression=str(args.icl_snapshot_hdf5_image_compression),
+                )
         # bootstrap value according to termination and truncation
         with torch.no_grad():
             next_value = agent.get_value(next_obs).reshape(1, -1)
@@ -757,17 +1114,17 @@ if __name__ == "__main__":
             "time/rollout_fps", args.num_envs * args.num_steps / rollout_time, global_step
         )
 
-        if snapshot_cenv is not None:
+        if snapshot_cenv is not None and not bool(args.icl_rollout_render_rgb):
             Nsnap = int(args.icl_image_snapshot_every_steps)
             boundary = (global_step // Nsnap) * Nsnap
             if boundary > 0 and boundary > last_icl_image_snap_boundary:
-                snap_path = icl_image_snapshot_path(args.icl_data_root, args.env_id, boundary)
                 _rsz_snap = _icl_rgb_resize_hw(args)
                 print(
                     f"[ICL image snapshot] start: step_boundary={boundary} global_step={global_step} "
                     f"episodes={args.icl_image_snapshot_episodes} max_steps={args.icl_image_snapshot_max_steps} "
                     f"num_envs={snapshot_cenv.num_envs} rgb_hw={_rsz_snap or 'native'} "
-                    f"out={snap_path.resolve()}",
+                    f"shard_cap={icl_image_snapshot_shard_cap} next_shard={icl_image_snap_shard_next:05d} "
+                    f"stem=trajectories_image_shard_*.h5",
                     flush=True,
                 )
                 agent.eval()
@@ -781,42 +1138,71 @@ if __name__ == "__main__":
                     snapshot_al,
                     snapshot_ah,
                     rgb_resize_hw=_rsz_snap,
+                    success_reward_bonus=float(args.success_reward_bonus),
+                    reward_scale=float(args.reward_scale),
                 )
                 t_snap1 = time.perf_counter()
                 print(
                     f"[ICL image snapshot] collection finished: episodes={len(snap_trajs)} "
-                    f"collect_s={t_snap1 - t_snap0:.2f} -> writing HDF5 "
-                    f"(image_compression={args.icl_snapshot_hdf5_image_compression})...",
+                    f"collect_s={t_snap1 - t_snap0:.2f} -> buffer/flush "
+                    f"(shard_cap={icl_image_snapshot_shard_cap} episodes, "
+                    f"compression={args.icl_snapshot_hdf5_image_compression})...",
                     flush=True,
                 )
-                save_trajectories_hdf5(
-                    snap_trajs,
-                    snap_path,
-                    sort_by_return=True,
-                    image_hdf5_compression=str(args.icl_snapshot_hdf5_image_compression),
+                icl_image_snapbuf.extend(snap_trajs)
+                t_w0 = time.perf_counter()
+                _shard_before = icl_image_snap_shard_next
+                icl_image_snap_shard_next = _icl_flush_image_snapshot_shards(
+                    icl_image_snapbuf,
+                    shard_max=icl_image_snapshot_shard_cap,
+                    icl_data_root=args.icl_data_root,
+                    env_id=args.env_id,
+                    image_compression=str(args.icl_snapshot_hdf5_image_compression),
+                    next_shard_index=icl_image_snap_shard_next,
                 )
-                t_snap2 = time.perf_counter()
+                t_w1 = time.perf_counter()
+                _n_flushed = icl_image_snap_shard_next - _shard_before
                 print(
                     f"[ICL image snapshot] done: recorded_episodes={len(snap_trajs)} "
                     f"step_boundary={boundary} global_step={global_step} "
-                    f"collect_s={t_snap1 - t_snap0:.2f} hdf5_s={t_snap2 - t_snap1:.2f} "
-                    f"total_s={t_snap2 - t_snap0:.2f}",
+                    f"rgb_buffer_episodes={len(icl_image_snapbuf)} "
+                    f"full_shards_written_this_round={_n_flushed} "
+                    f"collect_s={t_snap1 - t_snap0:.2f} flush_s={t_w1 - t_w0:.2f} "
+                    f"total_s={t_w1 - t_snap0:.2f}",
                     flush=True,
                 )
                 last_icl_image_snap_boundary = boundary
+
+    if snapshot_cenv is not None and icl_image_snapbuf and not bool(args.icl_rollout_render_rgb):
+        n_tail = len(icl_image_snapbuf)
+        p_tail = _icl_image_snapshot_shard_path(
+            args.icl_data_root, args.env_id, icl_image_snap_shard_next
+        )
+        t_tail0 = time.perf_counter()
+        save_trajectories_hdf5(
+            icl_image_snapbuf,
+            p_tail,
+            sort_by_return=True,
+            image_hdf5_compression=str(args.icl_snapshot_hdf5_image_compression),
+        )
+        t_tail1 = time.perf_counter()
+        print(
+            f"[ICL image snapshot shard] final partial episodes={n_tail} -> {p_tail.name} "
+            f"hdf5_s={t_tail1 - t_tail0:.2f}",
+            flush=True,
+        )
+        icl_image_snapbuf.clear()
 
     if not args.evaluate:
         if args.save_model:
             model_path = f"runs/{run_name}/final_ckpt.pt"
             torch.save(agent.state_dict(), model_path)
             print(f"model saved to {model_path}")
-        out_path = default_icl_export_path(args.icl_data_root, args.env_id)
-        to_save: list = []
+        out_path = _icl_monolith_export_path(args.icl_data_root, args.env_id)
         _rsz = _icl_rgb_resize_hw(args)
         icl_extra_notes: list[str] = []
         if args.icl_save_rollout_buffer:
             flush_episode_buffers(icl_buffers, icl_trajs)
-            to_save = list(icl_trajs)
         if args.icl_collect_episodes > 0:
             cenv = _make_rgb_collect_vector_env(args, args.icl_collect_episodes, tag=" collect")
             al = torch.from_numpy(cenv.single_action_space.low).to(device)
@@ -831,23 +1217,64 @@ if __name__ == "__main__":
                 al,
                 ah,
                 rgb_resize_hw=_rsz,
+                success_reward_bonus=float(args.success_reward_bonus),
+                reward_scale=float(args.reward_scale),
             )
             t_rgb1 = time.perf_counter()
-            to_save.extend(extra)
+            icl_trajs.extend(extra)
             cenv.close()
             icl_extra_notes.append(
                 f"rgb_episodes={len(extra)} rgb_hw={_rsz or 'native'} rgb_collect_s={t_rgb1 - t_rgb0:.2f}"
             )
-        if to_save:
+
+        if sh_flush > 0:
             t_h5_0 = time.perf_counter()
-            save_trajectories_hdf5(to_save, out_path)
-            t_h5_1 = time.perf_counter()
-            tail = " ".join(icl_extra_notes + [f"hdf5_s={t_h5_1 - t_h5_0:.2f}"])
-            print(f"[ICL] Saved {len(to_save)} trajectories to {out_path.resolve()} {tail}")
-        elif args.icl_save_rollout_buffer or args.icl_collect_episodes > 0:
-            print(
-                "[ICL] No trajectories to save (enable --icl-save-rollout-buffer or --icl-collect-episodes)."
+            _icl_flush_rollout_shards_incremental(
+                icl_trajs,
+                icl_rollout_shard_state,
+                shard_max=sh_flush,
+                ram_flush_every=int(args.icl_shard_ram_flush_episodes),
+                end_of_run=True,
+                icl_data_root=args.icl_data_root,
+                env_id=args.env_id,
+                image_hdf5_compression=str(args.icl_snapshot_hdf5_image_compression),
             )
+            t_h5_1 = time.perf_counter()
+            n_shard_files = _icl_rollout_shard_file_count(icl_rollout_shard_state)
+            if n_shard_files > 0:
+                _icl_write_shards_manifest(
+                    args.icl_data_root,
+                    args.env_id,
+                    sh_flush,
+                    n_shard_files,
+                )
+                tail = " ".join(icl_extra_notes + [f"flush_s={t_h5_1 - t_h5_0:.2f}"])
+                print(
+                    f"[ICL] Sharded export: {n_shard_files} file(s) under "
+                    f"{out_path.parent.resolve()}  {tail}",
+                    flush=True,
+                )
+            elif args.icl_save_rollout_buffer or args.icl_collect_episodes > 0:
+                print(
+                    "[ICL] No trajectories to save (enable --icl-save-rollout-buffer or --icl-collect-episodes).",
+                    flush=True,
+                )
+        else:
+            to_save = list(icl_trajs)
+            if to_save:
+                t_h5_0 = time.perf_counter()
+                save_trajectories_hdf5(
+                    to_save,
+                    out_path,
+                    image_hdf5_compression=str(args.icl_snapshot_hdf5_image_compression),
+                )
+                t_h5_1 = time.perf_counter()
+                tail = " ".join(icl_extra_notes + [f"hdf5_s={t_h5_1 - t_h5_0:.2f}"])
+                print(f"[ICL] Saved {len(to_save)} trajectories to {out_path.resolve()} {tail}")
+            elif args.icl_save_rollout_buffer or args.icl_collect_episodes > 0:
+                print(
+                    "[ICL] No trajectories to save (enable --icl-save-rollout-buffer or --icl-collect-episodes)."
+                )
         logger.close()
     if snapshot_cenv is not None:
         snapshot_cenv.close()

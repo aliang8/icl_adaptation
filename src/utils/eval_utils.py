@@ -9,6 +9,23 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 
+def uniform_subsample_int_indices(n: int, k: int) -> List[int]:
+    """Pick up to ``k`` distinct trial indices in ``[0, n - 1]``, spread uniformly (endpoints when ``n > k``).
+
+    Used to cap how many zero-shot **trial** columns are stitched into eval videos while still
+    running every trial for metrics and summary plots.
+    """
+    n = int(n)
+    k = int(k)
+    if n < 1 or k < 1:
+        return []
+    if n <= k:
+        return list(range(n))
+    pos = np.linspace(0, n - 1, num=k, dtype=np.float64)
+    idx = np.unique(np.rint(pos).astype(np.int64))
+    return [int(i) for i in sorted(idx.tolist())]
+
+
 def resolve_per_trial_eval_target_returns(
     eval_num_trials: int,
     eval_target_return: Optional[float],

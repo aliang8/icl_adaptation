@@ -22,7 +22,8 @@ dependencies = [
     "opencv-python>=4.5.0",
     "matplotlib>=3.5.0",
     "datasets>=4.5.0",
-    "einops"
+    "einops",
+    "h5py>=3.8.0",
 ]
 
 [project.optional-dependencies]

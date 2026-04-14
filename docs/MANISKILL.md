@@ -1,5 +1,13 @@
 # ManiSkill integration
 
+Episode return overview from a flat v2 `trajectories.h5` (needs `matplotlib`; from repo root): one PNG with histogram, sorted returns, cumulative success, file-order returns, and consecutive deltas.
+
+```bash
+uv run python scripts/maniskill/trajectory_returns_history.py datasets/maniskill/PickCube-v1/trajectories.h5
+```
+
+Writes `<stem>_returns_overview.png` next to the HDF5 (e.g. `trajectories_returns_overview.png`). Use `--min-traj-len L` (default 10) to keep only episodes with `len(rewards) >= L`, and `--bins` for the histogram.
+
 This repo can train **in-context (ICL) models** on trajectories generated in [ManiSkill](https://github.com/haosulab/ManiSkill) using the upstream **PPO** recipe, extended to export **`trajectories.h5`** (HDF5, gzip-compressed episodes) compatible with `get_icl_trajectory_dataset` / `train.py`.
 
 ## Install
@@ -30,7 +38,7 @@ Then use plain `python -m src.train ...` (no `uv run`). Eval uses `import mani_s
 
 State-only ICL (`data.use_vision=false`) is supported; vision eval for ManiSkill is not wired in `eval_viz` yet.
 
-For **PPO / `ppo_train_icldata.py` only**, you can skip `requirements_icl_train.txt` and set `PYTHONPATH` as above so `from src.data.maniskill_io import ...` resolves.
+For **PPO / `ppo_train_icldata.py` only**, you can skip `requirements_icl_train.txt` and set `PYTHONPATH` as above so `from src.data.ic_replay_buffer_hdf5 import ...` / `from src.data.maniskill_io import ...` resolve.
 
 Alternatively, `pip install -e . --no-deps` inside `.venv-maniskill` plus the two requirement files can work; avoid plain `pip install -e .` if it pulls a conflicting Gym stack. Keep ManiSkill and D4RL (`uv sync --extra d4rl`) in **different** envs.
 
@@ -106,13 +114,13 @@ Script: `scripts/maniskill/ppo_train_icldata.py` (upstream [`examples/baselines/
 
 Output: `datasets/maniskill/<env_id>/trajectories.h5` (override with `--icl-data-root`). The file uses **flat HDF5 v2**: a single time axis for `observations`, `actions`, `rewards`, `terminals`, plus `episode_starts` and `episode_lengths` (one entry per episode) and optional `episode_meta_json` per episode.
 
-- **`--icl-save-rollout-buffer` (default: True)** — stitches **every** on-policy PPO rollout (all training steps) into episode dicts: **state**, **actions**, **rewards** (env units; PPO `reward_scale` undone). **No RGB** (rendering each env step during training would be far too slow). Disable with `--no-icl-save-rollout-buffer`. When ManiSkill reports `final_info` / `episode` metrics, each finished episode also gets an **`episode_meta`** dict (e.g. `success_once`, `success_at_end`, `fail_once`, `fail_at_end`, env `return`, `episode_len`).
-- **`--icl-collect-episodes` (default: 0)** — optional **extra** rollouts with the **final** policy using `env.render()`, so those trajectories can include **`images`**. Appended into the main `trajectories.h5` when > 0.
-- **RGB during training** — `--icl-image-snapshot-every-steps N` (with `--icl-image-snapshot-episodes X`, default 8) writes separate snapshot `.h5` files whenever total **env steps** first cross each multiple of `N` (after that iteration’s PPO update):
+- **`--icl-save-rollout-buffer` (default: True)** — stitches **every** on-policy PPO rollout (all training steps) into episode dicts: **state**, **actions**, **rewards** (per-step values **as used by PPO**, i.e. after optional terminal `--success-reward-bonus` and `--reward-scale`). **No RGB** (rendering each env step during training would be far too slow). Disable with `--no-icl-save-rollout-buffer`. When ManiSkill reports `final_info` / `episode` metrics, each finished episode also gets an **`episode_meta`** dict (e.g. `success_once`, `success_at_end`, `fail_once`, `fail_at_end`, env `return`, `episode_len`).
+- **`--icl-collect-episodes` (default: 0)** — optional **extra** rollouts with the **final** policy using `env.render()`, so those trajectories can include **`images`**. Per-step **`rewards`** match PPO (terminal `--success-reward-bonus` then `--reward-scale` on every step). Appended into the main `trajectories.h5` when > 0.
+- **RGB during training** — `--icl-image-snapshot-every-steps N` (with `--icl-image-snapshot-episodes X`, default 8) **collects** RGB whenever total **env steps** first cross each multiple of `N` (after that iteration’s PPO update). Episodes are buffered and written only as sharded files:
 
-  `datasets/maniskill/<env_id>/image_snapshots/trajectories_step_XXXXXXXX.h5`
+  `datasets/maniskill/<env_id>/trajectories_image_shard_00000.h5`, …
 
-  The `XXXXXXXX` is the **step boundary** (e.g. `00050000` for the first snapshot at ≥50k steps). Each file contains `X` episodes with **state + RGB** (same schema as other ICL trajectories). At most **one** snapshot per training iteration (largest `N`-aligned boundary ≤ `global_step`). `train.py` resolves **`maniskill/<env_id>/trajectories.h5`**; to ICL-train on one snapshot file, copy or symlink it to that path (or merge files offline).
+  Set **`--icl-image-snapshot-shard-max-episodes K`**, or leave it at 0 and set **`--icl-shard-max-episodes K`** so RGB uses **`min(K, 1000)`** episodes per image shard (state shards can still use full `K`). Each collection adds up to `X` episodes with **state + RGB** (same schema as other ICL trajectories; **`rewards`** are PPO-scaled like the rollout buffer). At most **one** collection per training iteration (largest `N`-aligned boundary ≤ `global_step`). `train.py` discovers all flat v2 HDF5s under **`maniskill/<env_id>/`** (manifest, state shards, then monolithic `trajectories*.h5`, then image shards); override with **`data.trajectory_hdf5_paths`** if you need an explicit list.
 
 Very long runs produce **many** episodes in the main rollout buffer; the list is held in RAM until the end of training.
 
@@ -120,7 +128,7 @@ Very long runs produce **many** episodes in the main rollout buffer; the list is
 
 ```bash
 python scripts/maniskill/maniskill_trajectory_stats.py datasets/maniskill/PickCube-v1/trajectories.h5
-python scripts/maniskill/maniskill_trajectory_stats.py datasets/maniskill/PickCube-v1/image_snapshots/trajectories_step_*.h5
+python scripts/maniskill/maniskill_trajectory_stats.py datasets/maniskill/PickCube-v1/trajectories_image_shard_*.h5
 ```
 
 Example (fast task, rollout buffer only — state ICL):
@@ -133,7 +141,7 @@ python scripts/maniskill/ppo_train_icldata.py \
   --icl-data-root datasets
 ```
 
-RGB snapshots every 50k env steps (8 episodes each) **plus** optional final-policy episodes in `trajectories.h5`:
+RGB snapshots every 50k env steps (8 episodes per collection), sharded at 5000 episodes per file:
 
 ```bash
 python scripts/maniskill/ppo_train_icldata.py \
@@ -142,6 +150,7 @@ python scripts/maniskill/ppo_train_icldata.py \
   --total-timesteps 500_000 \
   --icl-image-snapshot-every-steps 50_000 \
   --icl-image-snapshot-episodes 8 \
+  --icl-image-snapshot-shard-max-episodes 5000 \
   --icl-collect-episodes 0 \
   --icl-data-root datasets
 ```
@@ -180,7 +189,7 @@ python src/train.py data=maniskill_pickcube paths.data_root=datasets \
 
 Adjust `experiment=...`, `model=...`, `paths.data_root`, etc. to match your setup. The `configs/data/maniskill_pickcube.yaml` preset sets `env_name`, horizon, and RTG scale; you can copy it for other tasks by changing `env_name` and paths.
 
-For several ManiSkill tasks, use separate `env_name` / data layouts per run, or **merge** episodes into one `trajectories.h5` offline if you want a single training pool.
+For several ManiSkill tasks, use separate `env_name` / data layouts per run. List shard paths explicitly in `data.trajectory_hdf5_paths` (see `configs/data/maniskill_pickcube.yaml`). Optional directory enumeration for tooling: `discover_ic_replay_buffer_paths` in `src/data/ic_replay_buffer_hdf5.py`.
 
 Trajectory keys match the rest of the codebase: `observations`, `actions`, `rewards`, `terminals`, optional **`episode_meta`**, and optionally `images` as a list of one `(T,H,W,3)` `uint8` array per rollout (same convention as VD4RL / dataset collate).
 

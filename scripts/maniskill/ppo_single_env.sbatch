@@ -37,6 +37,7 @@ TRACK_WANDB="${TRACK_WANDB:-0}"
 COLLECT_EP="${COLLECT_EP:-0}"
 SNAP_EVERY="${SNAP_EVERY:-0}"
 SNAP_EP="${SNAP_EP:-8}"
+SNAP_SHARD_MAX="${SNAP_SHARD_MAX:-10000}"
 ICL_ROOT="${ICL_ROOT:-datasets}"
 
 MANISKILL_VENV="${MANISKILL_VENV:-${REPO_ROOT}/.venv-maniskill}"
@@ -53,6 +54,7 @@ SNAP_ARGS=()
 if [ "${SNAP_EVERY}" != "0" ] && [ -n "${SNAP_EVERY}" ]; then
   SNAP_ARGS+=(--icl-image-snapshot-every-steps "${SNAP_EVERY}")
   SNAP_ARGS+=(--icl-image-snapshot-episodes "${SNAP_EP}")
+  SNAP_ARGS+=(--icl-image-snapshot-shard-max-episodes "${SNAP_SHARD_MAX}")
 fi
 COLLECT_ARGS=()
 if [ "${COLLECT_EP}" != "0" ] && [ -n "${COLLECT_EP}" ]; then

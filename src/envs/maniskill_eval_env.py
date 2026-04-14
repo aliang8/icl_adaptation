@@ -176,6 +176,7 @@ def make_maniskill_eval_env(
     import gymnasium as gym
 
     from mani_skill.utils.wrappers.flatten import FlattenActionSpaceWrapper
+    from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
 
     task = maniskill_task_id(env_name)
     sim = sim_backend
@@ -192,28 +193,58 @@ def make_maniskill_eval_env(
         "sim_backend": sim,
         "reconfiguration_freq": int(reconfiguration_freq),
     }
-    if render_mode is not None:
-        kw["render_mode"] = render_mode
     if reward_mode is not None and str(reward_mode).strip():
         kw["reward_mode"] = reward_mode
     if control_mode is not None and str(control_mode).strip():
         kw["control_mode"] = control_mode
 
-    last_err: Optional[BaseException] = None
     backends = [sim]
     if sim == "physx_cuda":
         backends.append("physx_cpu")
+
+    # ``render_mode=rgb_array`` still builds a SAPIEN RenderSystem that may require CUDA; with
+    # ``physx_cpu`` alone the same "cuda:0" error can persist. Last resort: CPU sim without rgb.
+    trial_kw: list[dict[str, Any]] = []
     for backend in backends:
+        d = {**kw, "sim_backend": backend}
+        if render_mode is not None:
+            d["render_mode"] = render_mode
+        trial_kw.append(d)
+    if render_mode is not None:
+        trial_kw.append({**kw, "sim_backend": "physx_cpu"})
+
+    last_err: Optional[BaseException] = None
+    tried: list[str] = []
+    for i, kw_try in enumerate(trial_kw):
+        tag = f"sim_backend={kw_try.get('sim_backend')!r}"
+        if kw_try.get("render_mode") is not None:
+            tag += f", render_mode={kw_try.get('render_mode')!r}"
+        else:
+            tag += ", render_mode=(none)"
+        tried.append(tag)
+        if i == len(trial_kw) - 1 and render_mode is not None and "render_mode" not in kw_try:
+            print(
+                "[ManiSkill eval] Retrying with state-only env (dropped rgb_array); "
+                "eval videos / vision frames may be empty this step.",
+                flush=True,
+            )
         try:
-            kw_try = {**kw, "sim_backend": backend}
             vec = gym.make(task, **kw_try)
             if isinstance(vec.action_space, gym.spaces.Dict):
                 vec = FlattenActionSpaceWrapper(vec)
+            vec = ManiSkillVectorEnv(
+                vec,
+                int(kw_try.get("num_envs", 1)),
+                ignore_terminations=bool(kw_try.get("ignore_terminations", False)),
+                auto_reset=bool(kw_try.get("auto_reset", True)),
+                record_metrics=True,
+            )
             return ManiSkillEvalAdapter(vec, state_obs_slice=state_obs_slice)
         except BaseException as e:
             last_err = e
     assert last_err is not None
     raise RuntimeError(
-        f"Failed to create ManiSkill env {task!r} for eval (tried sim backends {backends!r}). "
-        f"Set MANISKILL_EVAL_SIM=physx_cpu if CUDA/driver fails. Original: {last_err}"
+        f"Failed to create ManiSkill env {task!r} for eval. Tried: [{'; '.join(tried)}]. "
+        f"Set MANISKILL_EVAL_SIM=physx_cpu to skip GPU PhysX, or free VRAM / use a machine where "
+        f"SAPIEN can open cuda:0. Original: {last_err}"
     ) from last_err

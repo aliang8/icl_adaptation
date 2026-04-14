@@ -119,6 +119,10 @@ class DataConfig:
     image_size: Optional[List[int]] = None
     proprio_keys: Optional[List[str]] = None
     action_keys: Optional[List[str]] = None
+    # ManiSkill / ICL replay buffer: **required** non-empty list of shard ``.h5`` / ``.hdf5`` paths
+    # (order = concat order for eager loaders). Resolved via ``paths.data_root``, cwd, or absolute.
+    trajectory_hdf5_paths: Optional[List[str]] = None
+    # ICRT-MT length bounds; also ICL HDF5 load + AD timeline: keep episodes with T >= this
     min_trajectory_length: int = 10
     max_trajectory_length: int = 450
     # LIBERO-Cosmos
@@ -232,6 +236,9 @@ class ExperimentConfig:
     )
     # Cap how many rollouts/trials get frame capture + MP4 (None = all). Saves disk and W&B payload.
     num_eval_rollout_videos: Optional[int] = None
+    # Zero-shot only: max in-session trial columns in stitched eval video (uniform subsample of trial
+    # index). None = no cap. Summary plots and metrics always use every trial.
+    eval_video_max_trials: Optional[int] = 10
     # LIBERO: stitch primary and wrist side-by-side in eval videos when both exist.
     eval_render_both_views: bool = True
     # Eval ``env.reset(seed=...)`` pool (Gymnasium / ManiSkill). None or empty: ``run_rollouts_and_save_viz``

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Print summary statistics for ManiSkill ICL ``trajectories.h5`` (flat HDF5 v2).
 
-Loads via :func:`src.data.maniskill_io.load_trajectories_file`, which expands the flat file into
+Loads via :func:`src.data.ic_replay_buffer_hdf5.load_trajectories_file`, which expands the flat file into
 the usual list of per-episode dicts, so the summaries below are unchanged from the old layout.
 
 Optional: ``--sample-videos N`` writes up to ``N`` sample MP4s per file from trajectories that
@@ -254,7 +254,7 @@ def main() -> int:
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
 
-    from src.data.maniskill_io import load_trajectories_file
+    from src.data.ic_replay_buffer_hdf5 import load_trajectories_file
 
     for path in args.paths:
         path = path.resolve()

@@ -50,9 +50,11 @@ STEPS="${STEPS:-50_000_000}"
 # Set TRACK_WANDB=1 to log to W&B (default off so many-env loops do not spam runs).
 TRACK_WANDB="${TRACK_WANDB:-0}"
 COLLECT_EP="${COLLECT_EP:-0}"
-# Set SNAP_EVERY>0 for RGB snapshots under image_snapshots/ (trajectories_step_*.h5)
+# Set SNAP_EVERY>0 for RGB shards trajectories_image_shard_*.h5 in maniskill/<env_id>/.
+# SNAP_SHARD_MAX: episodes per snapshot HDF5 (default 10000). Also set ICL_SHARD_MAX to match if you shard state rollouts.
 SNAP_EVERY="${SNAP_EVERY:-0}"
 SNAP_EP="${SNAP_EP:-8}"
+SNAP_SHARD_MAX="${SNAP_SHARD_MAX:-10000}"
 ICL_ROOT="${ICL_ROOT:-datasets}"
 SBATCH_SCRIPT="${ROOT}/scripts/maniskill/ppo_single_env.sbatch"
 SLURM_LOG_DIR="${SLURM_LOG_DIR:-${ROOT}/slurm-logs}"
@@ -68,7 +70,7 @@ if [ "${SUBMIT_SLURM}" = "1" ]; then
   for env_id in "${ENVS[@]}"; do
     safe_name="ms_${env_id//[^A-Za-z0-9]/_}"
     safe_name="${safe_name:0:64}"
-    exp="ALL,REPO_ROOT=${ROOT},ENV_ID=${env_id},NUM_ENVS=${NUM_ENVS},STEPS=${STEPS},TRACK_WANDB=${TRACK_WANDB},COLLECT_EP=${COLLECT_EP},SNAP_EVERY=${SNAP_EVERY},SNAP_EP=${SNAP_EP},ICL_ROOT=${ICL_ROOT},MANISKILL_VENV=${MANISKILL_VENV}"
+    exp="ALL,REPO_ROOT=${ROOT},ENV_ID=${env_id},NUM_ENVS=${NUM_ENVS},STEPS=${STEPS},TRACK_WANDB=${TRACK_WANDB},COLLECT_EP=${COLLECT_EP},SNAP_EVERY=${SNAP_EVERY},SNAP_EP=${SNAP_EP},SNAP_SHARD_MAX=${SNAP_SHARD_MAX},ICL_ROOT=${ICL_ROOT},MANISKILL_VENV=${MANISKILL_VENV}"
     pending="${SLURM_LOG_DIR}/.pending-${safe_name}-$$.sbatch"
     {
       head -n 1 "${SBATCH_SCRIPT}"
@@ -115,6 +117,7 @@ for env_id in "${ENVS[@]}"; do
   if [ "${SNAP_EVERY}" != "0" ] && [ -n "${SNAP_EVERY}" ]; then
     SNAP_ARGS+=(--icl-image-snapshot-every-steps "${SNAP_EVERY}")
     SNAP_ARGS+=(--icl-image-snapshot-episodes "${SNAP_EP}")
+    SNAP_ARGS+=(--icl-image-snapshot-shard-max-episodes "${SNAP_SHARD_MAX}")
   fi
   COLLECT_ARGS=()
   if [ "${COLLECT_EP}" != "0" ] && [ -n "${COLLECT_EP}" ]; then
@@ -141,4 +144,4 @@ for env_id in "${ENVS[@]}"; do
 done
 
 echo "Done. State trajectories: ${ICL_ROOT}/maniskill/<env_id>/trajectories.h5"
-echo "RGB snapshots (if SNAP_EVERY set): ${ICL_ROOT}/maniskill/<env_id>/image_snapshots/"
+echo "RGB snapshot shards (if SNAP_EVERY set): ${ICL_ROOT}/maniskill/<env_id>/trajectories_image_shard_*.h5"

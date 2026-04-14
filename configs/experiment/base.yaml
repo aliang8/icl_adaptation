@@ -18,6 +18,8 @@ randomize_scene_between_trials: false
 save_eval_video: true  # set true to save eval rollout videos to viz/samples/step_XXX/videos/
 # null = record every rollout/trial; int = only first N (still run all rollouts for metrics)
 num_eval_rollout_videos: null
+# Zero-shot: max in-session trial columns in stitched eval video (uniform subsample). null = no cap; metrics/plots use every trial
+eval_video_max_trials: 10
 # LIBERO only: stitch primary|wrist in eval video. Gymnasium envs (HalfCheetah, etc.) use a single camera; train.py ignores this flag for non-LIBERO.
 eval_render_both_views: true
 run_action_compare_eval: false  # set true to save pred vs GT action plots to viz/action_compare/step_XXX/

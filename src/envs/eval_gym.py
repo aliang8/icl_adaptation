@@ -3,9 +3,42 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Optional, Tuple
+from typing import Any, Callable, Optional, Tuple
 
 import numpy as np
+
+
+class ManiSkillEvalEnvCache:
+    """Reuse one ManiSkill eval env across calls when the construction key is unchanged.
+
+    Periodic training eval otherwise builds and tears down PhysX/SAPIEN each step, which is slow
+    and can leak GPU/sim resources. :meth:`get_or_create` keeps a single env until the key changes
+    or :meth:`close` is called (e.g. after training).
+    """
+
+    def __init__(self) -> None:
+        self._env: Optional[Any] = None
+        self._key: Optional[tuple[Any, ...]] = None
+
+    def get_or_create(self, key: tuple[Any, ...], factory: Callable[[], Any]) -> Any:
+        if self._key != key:
+            self.close()
+            self._env = factory()
+            self._key = key
+        assert self._env is not None
+        return self._env
+
+    def close(self) -> None:
+        if self._env is None:
+            self._key = None
+            return
+        env = self._env
+        self._env = None
+        self._key = None
+        try:
+            env.close()
+        except BaseException as ex:
+            print(f"[ManiSkillEvalEnvCache] env.close() failed (ignored): {ex!r}", flush=True)
 
 # D4RL-era ids (e.g. HalfCheetah-v2) → Gymnasium MuJoCo v5 where shapes match.
 GYMNASIUM_EVAL_ENV_ALIASES = {

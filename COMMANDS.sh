@@ -123,11 +123,8 @@ CUDA_VISIBLE_DEVICES=3 ./.venv-maniskill/bin/python -m src.train \
   paths.data_root=/scr2/shared/icl_adaptation/datasets \
   --wandb
 
-# ManiSkill PickCube — same as RTG-only block but **pixels + DINOv2** (model=vla_dt). Training always reads
-# paths.data_root/maniskill/PickCube-v1/trajectories.h5 — merge snapshots into that path (backup old file first), e.g.:
-#   uv run python scripts/maniskill/maniskill_merge_trajectories.py \
-#     -o /scr2/shared/icl_adaptation/datasets/maniskill/PickCube-v1/trajectories.h5 \
-#     /scr2/shared/icl_adaptation/datasets/maniskill/PickCube-v1/image_snapshots
+# ManiSkill PickCube — same as RTG-only block but **pixels + DINOv2** (model=vla_dt). Training discovers
+# all flat HDF5 shards under paths.data_root/maniskill/PickCube-v1/ (icl_shards_manifest.json or globs).
 export PYTHONPATH="${PWD}${PYTHONPATH:+:$PYTHONPATH}"
 ./.venv-maniskill/bin/python -m src.train \
   --override data=[base,maniskill_pickcube] \
@@ -160,12 +157,21 @@ export PYTHONPATH="${PWD}${PYTHONPATH:+:$PYTHONPATH}"
 
 # AD (state-only): concat timeline over trials; K = data.horizon; model.max_length >= K.
 # num_eval_rollouts = independent eval sessions for metric variance only, not context width.
+#
+# Lazy HDF5 AD: with ManiSkill + data.context_style=algorithm_distillation, src.train uses
+# ICReplayBufferDataset (src/data/ic_replay_buffer_dataset.py): trajectories_shard_*.h5 listed in YAML under
+#   ${MANISKILL_ICL_DATA_ROOT}/maniskill/PickCube-v1/
+# are discovered and read on demand (no full trajectories load). icl_shards_manifest.json is optional
+# (merge tooling); training does not require it.
 export PYTHONPATH="${PWD}${PYTHONPATH:+:$PYTHONPATH}"
+MANISKILL_ICL_DATA_ROOT="${MANISKILL_ICL_DATA_ROOT:-/scr2/shared/icl_adaptation/datasets}"
+# Local shards example: MANISKILL_ICL_DATA_ROOT="${PWD}/datasets"
 ./.venv-maniskill/bin/python -m src.train \
   --override data=[base,maniskill_pickcube] \
   experiment.max_steps=100000 \
   data.batch_size=32 \
   data.context_style=algorithm_distillation \
+  data.lazy_dataset=true \
   data.num_context_trajectories=0 \
   data.randomize_num_context_trajectories=false \
   data.use_vision=false \
@@ -181,5 +187,5 @@ export PYTHONPATH="${PWD}${PYTHONPATH:+:$PYTHONPATH}"
   model.query_loss_only=false \
   optim.lr=1e-4 \
   system.run_name=maniskill-pickcube_dt_state_ad \
-  paths.data_root=/scr2/shared/icl_adaptation/datasets \
+  paths.data_root="${MANISKILL_ICL_DATA_ROOT}" \
   --wandb

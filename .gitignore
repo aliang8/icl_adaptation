@@ -57,3 +57,7 @@ unsloth_compiled_cache/*
 .venv-maniskill/
 .venv-maniskill-icldata/
 runs/*
+
+*.txt
+uv.lock
+*.ipynb

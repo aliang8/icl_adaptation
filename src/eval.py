@@ -326,6 +326,9 @@ def main() -> None:
             num_eval_rollout_videos=OmegaConf.select(
                 cfg, "experiment.num_eval_rollout_videos", default=None
             ),
+            eval_video_max_trials=OmegaConf.select(
+                cfg, "experiment.eval_video_max_trials", default=10
+            ),
             d4rl_score_ref=d4rl_score_ref,
             eval_scene_seeds=eval_scene_seeds_list,
             randomize_scene_between_trials=randomize_scene_between_trials,

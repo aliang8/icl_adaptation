@@ -1,7 +1,9 @@
 """
-AD dataset: episodes with length ``== max_episode_steps`` only; then the lowest-return subset (capped
+AD dataset: episodes with length ``>= min_traj_len`` (default 10); then the lowest-return subset (capped
 by ``ALGORITHM_DISTILLATION_TOP_N_EPISODES``) is concatenated low→high by sum of rewards (reversed if
 ``context_sort_ascending`` is false). Sample ``data.horizon`` windows along that timeline.
+
+``max_episode_steps`` still sets model / padding horizon; episode lengths in the timeline may vary.
 
 Set ``model.max_length`` ≥ train ``horizon`` and optional eval ``query_history_length``.
 ``sequence_token_layout=state_action_reward``; query ``rtg`` is zeros for collate.
@@ -19,7 +21,7 @@ from src.data.dataset import ICLTrajectoryDatasetBase, PromptArrays, _empty_prom
 from src.data.trajectories import trajectory_return
 
 # Max number of lowest-return (after length filter) episodes concatenated into the AD timeline.
-ALGORITHM_DISTILLATION_TOP_N_EPISODES = 30000
+ALGORITHM_DISTILLATION_TOP_N_EPISODES = 50000
 
 
 class AlgorithmDistillationTrajectoryDataset(ICLTrajectoryDatasetBase):
@@ -40,12 +42,14 @@ class AlgorithmDistillationTrajectoryDataset(ICLTrajectoryDatasetBase):
         context_sort_ascending: bool = True,
         context_sampling: str = "random",
         trajectory_contexts: Optional[Dict[int, np.ndarray]] = None,
+        min_traj_len: int = 10,
         **kwargs: Any,
     ):
         kwargs = dict(kwargs)
         kwargs["num_context_trajectories"] = 0
         kwargs["lazy_dataset"] = True
         kwargs.setdefault("randomize_num_context_trajectories", False)
+        self.min_traj_len = int(min_traj_len)
         super().__init__(
             trajectories=trajectories,
             horizon=horizon,
@@ -86,18 +90,18 @@ class AlgorithmDistillationTrajectoryDataset(ICLTrajectoryDatasetBase):
 
     def _build_ad_timeline(self) -> None:
         trs_all = self.trajectories
-        mes = int(self.max_episode_steps)
+        mmin = int(self.min_traj_len)
         kept_indices: List[int] = []
         for i, t in enumerate(trs_all):
             T = int(np.asarray(t["rewards"], dtype=np.float32).reshape(-1).shape[0])
-            if T == mes:
+            if T >= mmin:
                 kept_indices.append(i)
         if len(kept_indices) < len(trs_all):
             log.info(
-                "AlgorithmDistillation: kept {}/{} trajectories with length == max_episode_steps={}",
+                "AlgorithmDistillation: kept {}/{} trajectories with length >= min_traj_len={}",
                 len(kept_indices),
                 len(trs_all),
-                mes,
+                mmin,
             )
         trs = [trs_all[i] for i in kept_indices]
         n = len(trs)
@@ -157,9 +161,9 @@ class AlgorithmDistillationTrajectoryDataset(ICLTrajectoryDatasetBase):
             t = trs[pos_in_filtered]
             rew = np.asarray(t["rewards"], dtype=np.float32).reshape(-1)
             T = int(rew.shape[0])
-            if T != mes:
+            if T < mmin:
                 raise RuntimeError(
-                    f"AD timeline: internal error, expected T={mes} after filter, got T={T}"
+                    f"AD timeline: internal error, expected T>={mmin} after filter, got T={T}"
                 )
             obs = np.asarray(t["observations"], dtype=np.float32)
             act = np.asarray(t["actions"], dtype=np.float32)

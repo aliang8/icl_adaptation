@@ -1,619 +1,83 @@
 """
-Build trajectory dicts compatible with ``ICLTrajectoryDataset`` / ``get_icl_trajectory_dataset``.
+ManiSkill-specific helpers for ICL trajectory export and rollouts.
 
-Expected keys per trajectory:
-  - observations: (T, state_dim) float32  (ManiSkill state vector)
-  - actions: (T, act_dim) float32
-  - rewards: (T,) float32
-  - terminals: (T,) float32  (1.0 on last step of episode, else 0.0)
-  - images: optional list of one ``(T, H, W, 3)`` uint8 RGB array (VD4RL / ICRT convention)
-  - episode_meta: optional dict of scalar episode metrics when available (e.g. ManiSkill
-    ``success_once``, ``success_at_end``, ``fail_once``, ``fail_at_end``, ``return``, ``episode_len``)
+The shared **replay buffer** on-disk format (HDF5 read/write/append, PPO buffer stitching, RGB batching)
+is in :mod:`src.data.ic_replay_buffer_hdf5`. This module adds:
 
-**On-disk format:** **HDF5** (``.h5``) with a single flat time axis: ``observations``, ``actions``,
-``rewards``, ``terminals`` shaped ``(total_timesteps, ...)``, plus ``episode_starts`` and
-``episode_lengths`` (``int64``, length ``num_episodes``) and ``episode_meta_json`` (variable-length UTF-8,
-one string per episode, possibly empty). If any episode has RGB, ``images_view_*`` datasets share the same
-time axis; episodes without RGB are stored as zero-filled frames so shapes stay aligned.
+- :func:`resolve_maniskill_trajectory_paths` → resolves ``data.trajectory_hdf5_paths`` under
+  ``data_root/maniskill/<task>/`` (no automatic shard discovery; list must be set in config);
+- Gymnasium / ManiSkill ``final_info`` → ``episode_meta`` helpers;
+- :func:`collect_episodes_vector_env` for vectorized ManiSkill rollouts.
+
+Replay buffer I/O lives in :mod:`src.data.ic_replay_buffer_hdf5`; this module is ManiSkill conveniences only.
 """
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Union
 
 import numpy as np
 import torch
-from tqdm import tqdm
 
-import h5py
-
-import torch.nn.functional as F
-
-from loguru import logger as log
-
-from src.data.trajectories import sort_trajectories_by_return, trajectory_return
-
-HDF5_TRAJ_FILE_ATTR = "icl_adaptation_maniskill_trajectories"
-HDF5_TRAJ_VERSION = 2
-
-# Episode metrics from ManiSkill / Gymnasium; bool or 0/1 after JSON round-trip.
-_BOOLISH_EPISODE_META_KEYS = frozenset(
-    {"success_once", "success_at_end", "fail_once", "fail_at_end"}
+from src.data.ic_replay_buffer_hdf5 import (
+    finalize_trajectory_dict,
+    render_batch_to_rgb_list,
 )
 
-# Row chunk size along the flat time axis (timesteps per HDF5 chunk).
-_H5_FLAT_CHUNK_ROWS = 8192
 
-
-def _h5_chunks_1d(total: int) -> tuple[int, ...]:
-    r = min(_H5_FLAT_CHUNK_ROWS, max(1, int(total)))
-    return (r,)
-
-
-def _h5_chunks_2d(total: int, feat: int) -> tuple[int, int]:
-    r = min(_H5_FLAT_CHUNK_ROWS, max(1, int(total)))
-    return (r, int(feat))
-
-
-def _h5_chunks_4d(total: int, h: int, w: int, c: int) -> tuple[int, int, int, int]:
-    r = min(256, max(1, int(total)))
-    return (r, int(h), int(w), int(c))
-
-
-def _flat_h5_kw_1d(total: int) -> Dict[str, Any]:
-    return dict(compression="gzip", compression_opts=4, chunks=_h5_chunks_1d(total))
-
-
-def _flat_h5_kw_2d(total: int, feat: int) -> Dict[str, Any]:
-    return dict(compression="gzip", compression_opts=4, chunks=_h5_chunks_2d(total, feat))
-
-
-def _image_view_dataset_kwargs(
-    arr_shape: tuple[int, int, int, int],
-    compression: str,
+def resolve_maniskill_trajectory_paths(
+    data_root: Union[str, Path],
+    env_id: str,
+    trajectory_hdf5_paths: Optional[Sequence[str]] = None,
     *,
-    gzip_level: int = 4,
-) -> Dict[str, Any]:
-    """Kwargs for ``create_dataset`` on ``(T,H,W,C)`` uint8 image stacks."""
-    t, h, w, c = (int(arr_shape[0]), int(arr_shape[1]), int(arr_shape[2]), int(arr_shape[3]))
-    chunks = _h5_chunks_4d(t, h, w, c)
-    key = str(compression).strip().lower()
-    if key in ("none", "off", "false", "0"):
-        return {"chunks": chunks}
-    if key == "lzf":
-        return {"compression": "lzf", "chunks": chunks}
-    if key == "gzip":
-        return {
-            "compression": "gzip",
-            "compression_opts": int(gzip_level),
-            "chunks": chunks,
-        }
-    raise ValueError(
-        f"image_hdf5_compression must be 'gzip', 'lzf', or 'none'; got {compression!r}"
-    )
-
-
-def _episode_meta_to_attr(meta: Dict[str, Any]) -> str:
-    return json.dumps(meta, default=str)
-
-
-def _episode_meta_from_attr(raw: Any) -> Dict[str, Any]:
-    if raw is None:
-        return {}
-    if isinstance(raw, bytes):
-        s = raw.decode("utf-8")
-    else:
-        s = str(raw)
-    out = json.loads(s)
-    return out if isinstance(out, dict) else {}
-
-
-def _terminals_for_traj(t: Dict[str, Any]) -> np.ndarray:
-    term = t.get("terminals")
-    if term is None:
-        term = t.get("dones")
-    if term is None:
-        T = int(np.asarray(t["rewards"]).shape[0])
-        term = np.zeros(T, dtype=np.float32)
-        term[-1] = 1.0
-    return np.asarray(term, dtype=np.float32).reshape(-1)
-
-
-def save_trajectories_hdf5(
-    trajectories: List[Dict[str, Any]],
-    out_path: Path,
-    *,
-    sort_by_return: bool = True,
-    image_hdf5_compression: str = "gzip",
-    image_gzip_level: int = 4,
-) -> None:
-    """Write trajectory list to flat HDF5 (v2): one time axis + ``episode_starts`` / ``episode_lengths``.
-
-    ``image_hdf5_compression``: ``gzip`` (default, smaller), ``lzf`` (faster writes), or ``none``
-    (fastest / largest). Scalar datasets keep gzip for compatibility.
+    repo_root: Optional[Path] = None,
+) -> List[Path]:
     """
-    out_path = Path(out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    tr: List[Dict[str, Any]] = list(trajectories)
-    if sort_by_return and tr:
-        tr = sort_trajectories_by_return(tr, ascending=False)
+    Flat v2 ``.h5`` paths for a ManiSkill task id (e.g. ``PickCube-v1``).
 
-    if not tr:
-        with h5py.File(out_path, "w") as f:
-            f.attrs["format"] = HDF5_TRAJ_FILE_ATTR
-            f.attrs["version"] = HDF5_TRAJ_VERSION
-            f.attrs["num_episodes"] = 0
-            f.attrs["total_timesteps"] = 0
-            z = np.zeros((0,), dtype=np.int64)
-            f.create_dataset("episode_starts", data=z)
-            f.create_dataset("episode_lengths", data=z)
-            f.create_dataset("observations", data=np.zeros((0, 1), dtype=np.float32))
-            f.create_dataset("actions", data=np.zeros((0, 1), dtype=np.float32))
-            f.create_dataset("rewards", data=np.zeros((0,), dtype=np.float32))
-            f.create_dataset("terminals", data=np.zeros((0,), dtype=np.float32))
-            dt = h5py.special_dtype(vlen=str)
-            f.create_dataset("episode_meta_json", shape=(0,), dtype=dt)
-        return
-
-    lengths = [int(np.asarray(t["observations"]).shape[0]) for t in tr]
-    episode_lengths = np.asarray(lengths, dtype=np.int64)
-    starts = np.zeros(len(tr), dtype=np.int64)
-    if len(tr) > 1:
-        starts[1:] = np.cumsum(episode_lengths[:-1])
-    total_t = int(episode_lengths.sum())
-
-    obs_list = [np.asarray(t["observations"], dtype=np.float32) for t in tr]
-    act_list = [np.asarray(t["actions"], dtype=np.float32) for t in tr]
-    rew_list = [np.asarray(t["rewards"], dtype=np.float32).reshape(-1) for t in tr]
-    term_list = [_terminals_for_traj(t) for t in tr]
-
-    obs_all = np.concatenate(obs_list, axis=0)
-    act_all = np.concatenate(act_list, axis=0)
-    rew_all = np.concatenate(rew_list, axis=0)
-    term_all = np.concatenate(term_list, axis=0)
-    if obs_all.shape[0] != total_t or act_all.shape[0] != total_t:
-        raise ValueError("observations/actions length mismatch vs episode lengths")
-
-    img_views: List[np.ndarray] = []
-    has_any_img = any(isinstance(t.get("images"), list) and len(t["images"]) > 0 for t in tr)
-    if has_any_img:
-        ref_i = next(
-            i
-            for i, t in enumerate(tr)
-            if isinstance(t.get("images"), list) and len(t["images"]) > 0
-        )
-        ref = tr[ref_i]
-        n_view = len(ref["images"])
-        hwc_list: List[tuple[int, int, int]] = []
-        for v in range(n_view):
-            a = np.asarray(ref["images"][v], dtype=np.uint8)
-            if a.ndim != 4 or a.shape[-1] != 3:
-                raise ValueError(f"images[{v}] must be (T, H, W, 3) uint8, got {a.shape}")
-            hwc_list.append((int(a.shape[1]), int(a.shape[2]), int(a.shape[3])))
-        for i, t in enumerate(tr):
-            T = lengths[i]
-            imgs = t.get("images")
-            if isinstance(imgs, list) and len(imgs) > 0:
-                if len(imgs) != n_view:
-                    raise ValueError(f"Episode {i}: expected {n_view} image views, got {len(imgs)}")
-                for v in range(n_view):
-                    a = np.asarray(imgs[v], dtype=np.uint8)
-                    h, w, c = hwc_list[v]
-                    if a.shape[0] != T or tuple(a.shape[1:]) != (h, w, c):
-                        raise ValueError(
-                            f"Episode {i} view {v}: shape {a.shape} vs length {T} / HWC ({h},{w},{c})"
-                        )
-        for v in range(n_view):
-            h, w, c = hwc_list[v]
-            chunks: List[np.ndarray] = []
-            for i, t in enumerate(tr):
-                T = lengths[i]
-                imgs = t.get("images")
-                if isinstance(imgs, list) and len(imgs) == n_view:
-                    chunks.append(np.asarray(imgs[v], dtype=np.uint8))
-                else:
-                    chunks.append(np.zeros((T, h, w, c), dtype=np.uint8))
-            img_views.append(np.concatenate(chunks, axis=0))
-
-    meta_strings: List[str] = []
-    for t in tr:
-        em = t.get("episode_meta")
-        if isinstance(em, dict) and em:
-            meta_strings.append(_episode_meta_to_attr(em))
-        else:
-            meta_strings.append("")
-
-    with h5py.File(out_path, "w") as f:
-        f.attrs["format"] = HDF5_TRAJ_FILE_ATTR
-        f.attrs["version"] = HDF5_TRAJ_VERSION
-        f.attrs["num_episodes"] = len(tr)
-        f.attrs["total_timesteps"] = total_t
-        f.create_dataset("episode_starts", data=starts)
-        f.create_dataset("episode_lengths", data=episode_lengths)
-        f.create_dataset("observations", data=obs_all, **_flat_h5_kw_2d(*obs_all.shape))
-        f.create_dataset("actions", data=act_all, **_flat_h5_kw_2d(*act_all.shape))
-        f.create_dataset("rewards", data=rew_all, **_flat_h5_kw_1d(total_t))
-        f.create_dataset("terminals", data=term_all, **_flat_h5_kw_1d(total_t))
-        dt = h5py.special_dtype(vlen=str)
-        meta_ds = f.create_dataset("episode_meta_json", shape=(len(tr),), dtype=dt)
-        for i, s in enumerate(meta_strings):
-            meta_ds[i] = s
-        for v, arr in enumerate(img_views):
-            img_kw = _image_view_dataset_kwargs(
-                tuple(arr.shape),
-                image_hdf5_compression,
-                gzip_level=image_gzip_level,
-            )
-            f.create_dataset(f"images_view_{v}", data=arr, **img_kw)
-
-
-def load_trajectories_hdf5(path: Path) -> List[Dict[str, Any]]:
-    """Load episodes from flat ``save_trajectories_hdf5`` v2 file into a list of trajectory dicts."""
-    path = Path(path)
-    out: List[Dict[str, Any]] = []
-    with h5py.File(path, "r") as f:
-        if f.attrs.get("format") != HDF5_TRAJ_FILE_ATTR:
-            raise ValueError(f"{path}: not a ManiSkill ICL trajectory file (missing format attr)")
-        ver = int(f.attrs.get("version", 0))
-        if ver != HDF5_TRAJ_VERSION:
-            raise ValueError(f"{path}: expected HDF5 version {HDF5_TRAJ_VERSION}, got {ver}")
-        for name in (
-            "episode_starts",
-            "episode_lengths",
-            "observations",
-            "actions",
-            "rewards",
-            "terminals",
-        ):
-            if name not in f:
-                raise ValueError(f"{path}: missing dataset {name!r}")
-        starts = np.asarray(f["episode_starts"], dtype=np.int64).reshape(-1)
-        lens = np.asarray(f["episode_lengths"], dtype=np.int64).reshape(-1)
-        n_ep = int(starts.shape[0])
-        if lens.shape[0] != n_ep:
-            raise ValueError(f"{path}: episode_starts and episode_lengths length mismatch")
-        obs = f["observations"]
-        act = f["actions"]
-        rew = f["rewards"]
-        term = f["terminals"]
-        total_t = int(obs.shape[0])
-        if (
-            int(act.shape[0]) != total_t
-            or int(rew.shape[0]) != total_t
-            or int(term.shape[0]) != total_t
-        ):
-            raise ValueError(f"{path}: flat array length mismatch")
-        if n_ep == 0:
-            return []
-        if int(starts[0]) != 0:
-            raise ValueError(f"{path}: episode_starts[0] must be 0, got {int(starts[0])}")
-        if int(lens.sum()) != total_t:
-            raise ValueError(f"{path}: sum(episode_lengths) != total_timesteps")
-        for i in range(n_ep - 1):
-            if int(starts[i] + lens[i]) != int(starts[i + 1]):
-                raise ValueError(f"{path}: episode_starts not consecutive at episode {i}")
-
-        meta_ds = f["episode_meta_json"] if "episode_meta_json" in f else None
-        view_keys = sorted(
-            (k for k in f.keys() if k.startswith("images_view_")),
-            key=lambda x: int(str(x).split("_")[-1]),
-        )
-
-        obs_full = np.asarray(obs, dtype=np.float32)
-        act_full = np.asarray(act, dtype=np.float32)
-        rew_full = np.asarray(rew, dtype=np.float32).reshape(-1)
-        term_full = np.asarray(term, dtype=np.float32).reshape(-1)
-        img_full = [np.asarray(f[k], dtype=np.uint8) for k in view_keys] if view_keys else []
-
-        for i in range(n_ep):
-            s = int(starts[i])
-            ln = int(lens[i])
-            e = s + ln
-            d: Dict[str, Any] = {
-                "observations": obs_full[s:e].copy(),
-                "actions": act_full[s:e].copy(),
-                "rewards": rew_full[s:e].copy(),
-                "terminals": term_full[s:e].copy(),
-            }
-            if meta_ds is not None:
-                raw = meta_ds[i]
-                if isinstance(raw, bytes):
-                    raw_s = raw.decode("utf-8")
-                else:
-                    raw_s = str(raw)
-                if raw_s:
-                    meta = _episode_meta_from_attr(raw_s)
-                    if meta:
-                        d["episode_meta"] = meta
-            if img_full:
-                d["images"] = [im[s:e].copy() for im in img_full]
-            out.append(d)
-    return out
-
-
-def load_trajectories_file(
-    path: Union[str, Path],
-    *,
-    episode_length_eq: Optional[int] = None,
-    log_summary: bool = False,
-) -> List[Dict[str, Any]]:
-    """Load ManiSkill trajectory bundle from ``.h5`` / ``.hdf5`` (flat v2 only).
-
-    If ``episode_length_eq`` is set, keep only trajectories whose reward length equals that value
-    (typical AD use: ``max_episode_steps``). When ``log_summary`` is true, logs a formatted summary
-    before and after filtering (if any).
+    ``trajectory_hdf5_paths`` must be a non-empty list (e.g. from ``data.trajectory_hdf5_paths`` in
+    YAML). Each entry is resolved with :func:`src.data.ic_replay_buffer_hdf5.resolve_trajectory_hdf5_path_entries`
+    (absolute path, ``cwd``, ``data_root / entry``, or under ``<data_root>/maniskill/<env_id>/``).
+    If ``repo_root`` is set, also tries ``<repo_root>/datasets/<entry>`` so local shards under the
+    repo ``datasets/`` tree are found when ``paths.data_root`` points elsewhere (e.g. shared NFS).
     """
-    p = Path(path)
-    suf = p.suffix.lower()
-    if suf not in (".h5", ".hdf5"):
-        raise ValueError(f"Unsupported trajectory file type: {p} (expected .h5 or .hdf5)")
-    tr = load_trajectories_hdf5(p)
-    hint = str(p)
-    if log_summary:
-        log.info(
-            "{}\n{}",
-            f"ManiSkill trajectory bundle (raw): {p.name}",
-            format_maniskill_trajectory_summary(tr, source_hint=hint),
-        )
-    if episode_length_eq is not None:
-        tr, n_before, n_after = filter_trajectories_episode_length_eq(tr, int(episode_length_eq))
-        log.info(
-            "ManiSkill length filter: kept {}/{} episodes with T == {}",
-            n_after,
-            n_before,
-            int(episode_length_eq),
-        )
-        if log_summary:
-            log.info(
-                "{}\n{}",
-                f"ManiSkill trajectory bundle (after T=={int(episode_length_eq)}): {p.name}",
-                format_maniskill_trajectory_summary(tr, source_hint=hint),
-            )
-    return tr
-
-
-def episode_length_from_trajectory(t: Dict[str, Any]) -> int:
-    """Episode length ``T`` from ``rewards`` (fallback ``observations``)."""
-    r = t.get("rewards")
-    if r is not None:
-        return int(np.asarray(r, dtype=np.float32).reshape(-1).shape[0])
-    o = t.get("observations")
-    if o is not None:
-        return int(np.asarray(o, dtype=np.float32).shape[0])
-    raise ValueError("trajectory missing rewards and observations")
-
-
-def filter_trajectories_episode_length_eq(
-    trajectories: List[Dict[str, Any]],
-    target_length: int,
-) -> Tuple[List[Dict[str, Any]], int, int]:
-    """Keep episodes with ``T == target_length``. Returns ``(filtered, n_before, n_after)``."""
-    n_before = len(trajectories)
-    tl = int(target_length)
-    out: List[Dict[str, Any]] = []
-    for t in trajectories:
-        if episode_length_from_trajectory(t) == tl:
-            out.append(t)
-    return out, n_before, len(out)
-
-
-def _collect_episode_meta_scalars(
-    em: Dict[str, Any],
-    meta_bool: Dict[str, List[float]],
-    meta_num: Dict[str, List[float]],
-) -> None:
-    for k, v in em.items():
-        if isinstance(v, (bool, np.bool_)):
-            meta_bool.setdefault(k, []).append(float(bool(v)))
-            continue
-        if (
-            k in _BOOLISH_EPISODE_META_KEYS
-            and isinstance(v, (int, np.integer, float, np.floating))
-            and not isinstance(v, bool)
-        ):
-            fv = float(v)
-            if fv in (0.0, 1.0):
-                meta_bool.setdefault(k, []).append(fv)
-                continue
-        if isinstance(v, (int, np.integer)) and not isinstance(v, bool):
-            meta_num.setdefault(k, []).append(float(v))
-            continue
-        if isinstance(v, (float, np.floating)):
-            meta_num.setdefault(k, []).append(float(v))
-
-
-def format_maniskill_trajectory_summary(
-    trajs: List[Dict[str, Any]],
-    *,
-    source_hint: str = "",
-) -> str:
-    """
-    Human-readable stats: counts, length / return distribution, RGB presence, ``episode_meta``
-    aggregates (success rates, numeric means).
-    """
-    n = len(trajs)
-    lines: List[str] = []
-    if source_hint:
-        lines.append(f"  source: {source_hint}")
-    if n == 0:
-        lines.append("  (empty)")
-        return "\n".join(lines)
-
-    lens: List[int] = []
-    rets: List[float] = []
-    n_img = 0
-    img_shape: Optional[Tuple[int, ...]] = None
-    obs_dim: Optional[int] = None
-    act_dim: Optional[int] = None
-    n_meta = 0
-    meta_bool: Dict[str, List[float]] = {}
-    meta_num: Dict[str, List[float]] = {}
-
-    for t in trajs:
-        o = t.get("observations")
-        a = t.get("actions")
-        r = t.get("rewards")
-        if o is None or a is None or r is None:
-            continue
-        oa = np.asarray(o, dtype=np.float32)
-        aa = np.asarray(a, dtype=np.float32)
-        lens.append(int(oa.shape[0]))
-        rets.append(trajectory_return(t))
-        if obs_dim is None:
-            obs_dim = int(oa.shape[-1]) if oa.ndim >= 2 else int(oa.size)
-        if act_dim is None:
-            act_dim = int(aa.shape[-1]) if aa.ndim >= 2 else int(aa.size)
-        imgs = t.get("images")
-        if isinstance(imgs, list) and len(imgs) > 0:
-            n_img += 1
-            if img_shape is None:
-                img_shape = tuple(np.asarray(imgs[0]).shape)
-        em = t.get("episode_meta")
-        if isinstance(em, dict) and em:
-            n_meta += 1
-            _collect_episode_meta_scalars(em, meta_bool, meta_num)
-
-    if not lens:
-        lines.append("  (no valid trajectories: missing obs/actions/rewards)")
-        return "\n".join(lines)
-
-    la = np.asarray(lens, dtype=np.float64)
-    ra = np.asarray(rets, dtype=np.float64)
-    lines.append(f"  episodes:           {len(lens)}")
-    lines.append(
-        f"  episode length:     mean={la.mean():.2f}  std={la.std():.2f}  "
-        f"min={int(la.min())}  max={int(la.max())}"
-    )
-    lines.append(
-        f"  return (sum r):      mean={ra.mean():.6g}  std={ra.std():.6g}  "
-        f"min={ra.min():.6g}  max={ra.max():.6g}"
-    )
-    if obs_dim is not None:
-        lines.append(f"  state_dim:          {obs_dim}")
-    if act_dim is not None:
-        lines.append(f"  action_dim:         {act_dim}")
-    lines.append(f"  with images:        {n_img}/{len(lens)}")
-    if img_shape is not None:
-        lines.append(f"  image shape (1st):  {img_shape}")
-    lines.append(f"  with episode_meta:  {n_meta}/{len(lens)}")
-    if n_meta < len(lens):
-        lines.append(f"  episode_meta missing: {len(lens) - n_meta}/{len(lens)}")
-
-    if meta_bool:
-        lines.append("  episode_meta (boolean / 0-1):")
-        for k in sorted(meta_bool.keys()):
-            vals = np.asarray(meta_bool[k], dtype=np.float64)
-            lines.append(
-                f"    {k:20s}  true_rate={vals.mean():.4f}  (n={len(vals)} episodes with key)"
-            )
-
-    if meta_num:
-        lines.append("  episode_meta (numeric):")
-        for k in sorted(meta_num.keys()):
-            vals = np.asarray(meta_num[k], dtype=np.float64)
-            lines.append(
-                f"    {k:20s}  mean={vals.mean():.4f}  std={vals.std():.4f}  "
-                f"min={vals.min():.4f}  max={vals.max():.4f}  (n={len(vals)})"
-            )
-
-    return "\n".join(lines)
-
-
-def summarize_maniskill_trajectories(
-    trajs: List[Dict[str, Any]],
-    *,
-    title: str = "ManiSkill trajectories",
-    source_hint: str = "",
-) -> None:
-    """Log :func:`format_maniskill_trajectory_summary` under ``title``."""
-    log.info("{}\n{}", title, format_maniskill_trajectory_summary(trajs, source_hint=source_hint))
-
-
-def _assert_trajectories_compatible_for_merge(trajs: List[Dict[str, Any]]) -> None:
-    """Require consistent state/action dims and matching image view shapes when RGB is present."""
-    obs_d: Optional[int] = None
-    act_d: Optional[int] = None
-    img_layout: Optional[Tuple[int, Tuple[Tuple[int, int, int], ...]]] = None
-    for i, t in enumerate(trajs):
-        o = np.asarray(t["observations"], dtype=np.float32)
-        a = np.asarray(t["actions"], dtype=np.float32)
-        od = int(o.shape[-1]) if o.ndim >= 2 else int(o.size)
-        ad = int(a.shape[-1]) if a.ndim >= 2 else int(a.size)
-        if obs_d is None:
-            obs_d, act_d = od, ad
-        elif od != obs_d or ad != act_d:
-            raise ValueError(
-                f"Episode {i}: expected state_dim={obs_d} action_dim={act_d}, got {od}, {ad}"
-            )
-        imgs = t.get("images")
-        if not isinstance(imgs, list) or not imgs:
-            continue
-        n_view = len(imgs)
-        hwc_tuples: List[Tuple[int, int, int]] = []
-        for v in range(n_view):
-            im = np.asarray(imgs[v], dtype=np.uint8)
-            if im.ndim != 4 or int(im.shape[-1]) != 3:
-                raise ValueError(f"Episode {i} view {v}: expected (T,H,W,3) uint8, got {im.shape}")
-            hwc_tuples.append((int(im.shape[1]), int(im.shape[2]), int(im.shape[3])))
-        layout = (n_view, tuple(hwc_tuples))
-        if img_layout is None:
-            img_layout = layout
-        elif layout != img_layout:
-            raise ValueError(
-                f"Episode {i}: image layout {layout} != {img_layout} "
-                "(cannot merge different resolutions or view counts)"
-            )
-
-
-def merge_maniskill_trajectory_hdf5(
-    input_paths: Sequence[Union[str, Path]],
-    out_path: Union[str, Path],
-    *,
-    sort_by_return: bool = True,
-    image_hdf5_compression: str = "gzip",
-    image_gzip_level: int = 4,
-) -> Tuple[int, int]:
-    """
-    Load multiple flat v2 ManiSkill ICL ``.h5`` files (same format as ``save_trajectories_hdf5``),
-    concatenate episodes in argument order, optionally sort by return, and write a single HDF5.
-
-    Episodes without RGB in some files are fine if at least one file has images: missing RGB is
-    stored as zeros (same as ``save_trajectories_hdf5``). All non-empty image episodes must share
-    the same view count and (H, W, C).
-
-    Returns:
-        ``(num_episodes, total_timesteps)``.
-    """
-    merged: List[Dict[str, Any]] = []
-    for p in tqdm(input_paths, desc="Loading trajectories", unit="file"):
-        path = Path(p)
-        if not path.is_file():
-            raise FileNotFoundError(f"Not a file: {path}")
-        part = load_trajectories_hdf5(path)
-        merged.extend(part)
-    if merged:
-        _assert_trajectories_compatible_for_merge(merged)
-    save_trajectories_hdf5(
-        merged,
-        Path(out_path),
-        sort_by_return=sort_by_return,
-        image_hdf5_compression=image_hdf5_compression,
-        image_gzip_level=image_gzip_level,
-    )
-    if not merged:
-        return 0, 0
-    lengths = [int(np.asarray(t["observations"]).shape[0]) for t in merged]
-    return len(merged), int(sum(lengths))
-
-
-def resolve_maniskill_trajectory_path(data_root: Union[str, Path], env_id: str) -> Path:
-    """``<data_root>/maniskill/<env_id>/trajectories_state.h5``."""
-    root = Path(data_root)
+    root = Path(data_root).expanduser().resolve()
     safe = env_id.replace("/", "_").replace(" ", "_")
-    return root / "maniskill" / safe / "trajectories_state.h5"
+    task_dir = root / "maniskill" / safe
+    if not trajectory_hdf5_paths:
+        raise ValueError(
+            "ManiSkill training requires a non-empty data.trajectory_hdf5_paths list "
+            f"(flat v2 .h5 shards). Example relative to paths.data_root:\n"
+            f"  - maniskill/{safe}/trajectories_shard_00000.h5\n"
+            f"  - maniskill/{safe}/trajectories_shard_00001.h5\n"
+            f"  ...\n"
+            f"Expected data under: {task_dir}"
+        )
+    from src.data.ic_replay_buffer_hdf5 import resolve_trajectory_hdf5_path_entries
 
+    extras: tuple[Path, ...] = ()
+    if repo_root is not None:
+        extras = (Path(repo_root).expanduser().resolve() / "datasets",)
+    return resolve_trajectory_hdf5_path_entries(
+        trajectory_hdf5_paths,
+        data_root=root,
+        search_dirs=(task_dir, root),
+        extra_roots=extras,
+    )
+
+
+def resolve_maniskill_trajectory_path(
+    data_root: Union[str, Path],
+    env_id: str,
+    trajectory_hdf5_paths: Sequence[str],
+    *,
+    repo_root: Optional[Path] = None,
+) -> Path:
+    """First path from :func:`resolve_maniskill_trajectory_paths`."""
+    return resolve_maniskill_trajectory_paths(
+        data_root, env_id, trajectory_hdf5_paths, repo_root=repo_root
+    )[0]
 
 def episode_meta_from_final_info(
     final_info_episode: Dict[str, Any],
@@ -656,152 +120,75 @@ def episode_meta_from_final_info(
     return meta
 
 
-def _finalize_traj(
-    obs_l: List[np.ndarray],
-    act_l: List[np.ndarray],
-    rew_l: List[float],
-    rgb_l: List[Optional[np.ndarray]],
-    episode_meta: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    T = len(obs_l)
-    if T == 0:
-        raise ValueError("empty episode")
-    terminals = np.zeros(T, dtype=np.float32)
-    terminals[-1] = 1.0
-    out: Dict[str, Any] = {
-        "observations": np.stack(obs_l, axis=0).astype(np.float32),
-        "actions": np.stack(act_l, axis=0).astype(np.float32),
-        "rewards": np.asarray(rew_l, dtype=np.float32).reshape(-1),
-        "terminals": terminals,
-    }
-    if rgb_l and all(x is not None for x in rgb_l):
-        rgb = np.stack([np.asarray(x, dtype=np.uint8) for x in rgb_l], axis=0)
-        if rgb.ndim == 4 and rgb.shape[-1] == 3:
-            out["images"] = [rgb]
-    if episode_meta is not None:
-        out["episode_meta"] = dict(episode_meta)
-    return out
-
-
-def append_ppo_rollout_to_episode_buffers(
-    obs_np: np.ndarray,
-    actions_np: np.ndarray,
-    rewards_np: np.ndarray,
-    done_after_np: np.ndarray,
+def scale_episode_meta_for_icl_export(
+    meta: Dict[str, Any],
+    *,
     reward_scale: float,
-    buffers: List[Dict[str, List]],
-    out_complete: List[Dict[str, Any]],
-    episode_meta_grid: Optional[np.ndarray] = None,
-) -> None:
+    success_reward_bonus: float,
+    success: bool,
+) -> Dict[str, Any]:
     """
-    Stitch one PPO rollout block ``(num_steps, num_envs, ...)`` into episode dicts.
+    Adjust env ``episode`` scalars so they match the **same** shaping as PPO / HDF5 step rewards:
+    add optional terminal ``success_reward_bonus`` to cumulative return when ``success``, then
+    multiply by ``reward_scale``. Also scales mean ``reward`` by ``reward_scale`` (terminal bonus is
+    not re-distributed into the mean).
 
-    ``done_after_np[t, e]`` is True iff env ``e`` ended the episode on step ``t`` (after
-    ``env.step``). ``rewards_np`` is as stored in PPO (often scaled); we divide by
-    ``reward_scale`` when exporting so ``rewards`` match env units when scale ≠ 0.
-
-    Does not record RGB (training rollouts do not render); trajectories are state-only.
-
-    ``episode_meta_grid`` optional ``(S, N)`` ``dtype=object`` array: at each step/env where an
-    episode ends, the cell may hold a dict from ``episode_meta_from_final_info``; otherwise ``None``.
+    Typical keys from Gymnasium / ManiSkill ``infos[\"final_info\"][\"episode\"]``: ``return``,
+    ``r`` (duplicate total), ``reward`` (often mean return per step), lengths / flags unchanged.
     """
-    if obs_np.ndim < 2 or actions_np.ndim < 2:
-        raise ValueError("obs_np and actions_np need at least (S, N, ...)")
-    S, N = int(obs_np.shape[0]), int(obs_np.shape[1])
-    if rewards_np.shape != (S, N) or done_after_np.shape != (S, N):
-        raise ValueError("rewards_np and done_after_np must be (S, N)")
-    if episode_meta_grid is not None:
-        em = np.asarray(episode_meta_grid, dtype=object)
-        if em.shape != (S, N):
-            raise ValueError(f"episode_meta_grid shape {em.shape} != {(S, N)}")
-        episode_meta_grid = em
-    if len(buffers) != N:
-        raise ValueError(f"buffers length {len(buffers)} != num_envs {N}")
+    if not meta:
+        return {}
     rs = float(reward_scale)
-    rdiv = rs if abs(rs) > 1e-12 else 1.0
+    bonus = float(success_reward_bonus) if success else 0.0
 
-    for e in range(N):
-        b = buffers[e]
-        for t in range(S):
-            o = np.asarray(obs_np[t, e], dtype=np.float32).reshape(-1)
-            a = np.asarray(actions_np[t, e], dtype=np.float32).reshape(-1)
-            rw = float(rewards_np[t, e]) / rdiv
-            b["obs"].append(o)
-            b["act"].append(a)
-            b["rew"].append(rw)
-            if bool(done_after_np[t, e]):
-                if b["obs"]:
-                    em = None
-                    if episode_meta_grid is not None:
-                        cell = episode_meta_grid[t, e]
-                        if isinstance(cell, dict):
-                            em = dict(cell)
-                        else:
-                            em = {}
-                    out_complete.append(
-                        _finalize_traj(b["obs"], b["act"], b["rew"], [], episode_meta=em)
-                    )
-                b["obs"] = []
-                b["act"] = []
-                b["rew"] = []
+    def _is_real(x: Any) -> bool:
+        return isinstance(x, (int, float, np.integer, np.floating)) and not isinstance(x, bool)
 
-
-def _render_batch_to_rgb_list(
-    frame: Any, n_envs: int, rgb_resize_hw: Optional[int]
-) -> List[Optional[np.ndarray]]:
-    """Split ``env.render()`` output into ``n_envs`` (H,W,3) uint8 arrays; optional square resize."""
-    rgb = frame
-    if isinstance(rgb, torch.Tensor):
-        rgb = rgb.detach().cpu().numpy()
-    if rgb is None:
-        return [None] * n_envs
-    rgb = np.asarray(rgb)
-    if rgb.ndim == 3:
-        if n_envs != 1:
-            raise ValueError(f"Render is (H,W,C) but n_envs={n_envs} (expected 1)")
-        rows = [rgb]
-    elif rgb.ndim == 4:
-        if int(rgb.shape[0]) != n_envs:
-            raise ValueError(f"Render batch {rgb.shape[0]} != n_envs {n_envs}")
-        rows = [rgb[i] for i in range(n_envs)]
-    else:
-        raise ValueError(f"Unexpected render shape {rgb.shape}")
-    out: List[Optional[np.ndarray]] = []
-    for row in rows:
-        x = np.asarray(row, dtype=np.uint8)
-        if rgb_resize_hw is not None and rgb_resize_hw > 0:
-            x = _resize_rgb_uint8_to_square(x, int(rgb_resize_hw))
-        out.append(x)
+    out = dict(meta)
+    raw_total: Optional[float] = None
+    if "return" in out and _is_real(out["return"]):
+        raw_total = float(out["return"])
+    elif "r" in out and _is_real(out["r"]):
+        raw_total = float(out["r"])
+    if raw_total is not None:
+        scaled_total = (raw_total + bonus) * rs
+        if "return" in out and _is_real(out.get("return")):
+            out["return"] = float(scaled_total)
+        if "r" in out and _is_real(out.get("r")):
+            out["r"] = float(scaled_total)
+    if "reward" in out and _is_real(out["reward"]):
+        out["reward"] = float(out["reward"]) * rs
     return out
 
 
-def _resize_rgb_uint8_to_square(rgb: np.ndarray, hw: int) -> np.ndarray:
-    """Down/upscale RGB uint8 (H,W,3) to (hw,hw,3) for smaller HDF5 / faster IO."""
-    if hw <= 0 or rgb is None or not isinstance(rgb, np.ndarray):
-        return rgb
-    if rgb.ndim != 3 or int(rgb.shape[-1]) != 3:
-        return rgb
-    h, w = int(rgb.shape[0]), int(rgb.shape[1])
-    if h == hw and w == hw:
-        return rgb
-    t = torch.from_numpy(rgb.astype(np.float32) / 255.0).permute(2, 0, 1).unsqueeze(0)
-    t = F.interpolate(t, size=(hw, hw), mode="bilinear", align_corners=False)
-    out = (t.squeeze(0).permute(1, 2, 0) * 255.0).clamp(0, 255).to(torch.uint8).cpu().numpy()
-    return np.asarray(out, dtype=np.uint8)
-
-
-def flush_episode_buffers(
-    buffers: List[Dict[str, List]],
-    out_complete: List[Dict[str, Any]],
-) -> None:
-    """Finalize any in-progress segments (e.g. end of training)."""
-    for b in buffers:
-        if b["obs"]:
-            out_complete.append(_finalize_traj(b["obs"], b["act"], b["rew"], []))
-            b["obs"] = []
-            b["act"] = []
-            b["rew"] = []
-
+def episode_success_from_batched_final_info(final_info_episode: Dict[str, Any], env_idx: int) -> bool:
+    """True iff ManiSkill batched ``infos[\"final_info\"][\"episode\"]`` marks success for env ``env_idx``."""
+    if not isinstance(final_info_episode, dict):
+        return False
+    for key in ("success_once", "success_at_end", "success"):
+        if key not in final_info_episode:
+            continue
+        v = final_info_episode[key]
+        try:
+            if torch.is_tensor(v):
+                if env_idx >= int(v.shape[0]):
+                    continue
+                x = v[env_idx]
+                if x.numel() != 1:
+                    continue
+                return bool(x.item()) if x.dtype == torch.bool else bool(float(x.item()) > 0.5)
+            if isinstance(v, np.ndarray):
+                if env_idx >= int(v.shape[0]):
+                    continue
+                x = np.asarray(v[env_idx])
+                if x.ndim != 0 and x.size != 1:
+                    continue
+                return bool(x.reshape(-1)[0])
+            if isinstance(v, (bool, np.bool_)):
+                return bool(v)
+        except (IndexError, RuntimeError, ValueError, TypeError):
+            continue
+    return False
 
 def collect_episodes_vector_env(
     env: Any,
@@ -812,6 +199,9 @@ def collect_episodes_vector_env(
     action_space_low: torch.Tensor,
     action_space_high: torch.Tensor,
     rgb_resize_hw: Optional[int] = None,
+    *,
+    success_reward_bonus: float = 0.0,
+    reward_scale: float = 1.0,
 ) -> List[Dict[str, Any]]:
     """
     Roll out ``num_episodes`` completed episodes on a ``ManiSkillVectorEnv``, deterministic policy.
@@ -822,6 +212,10 @@ def collect_episodes_vector_env(
 
     If ``rgb_resize_hw`` is set (e.g. 256), each frame is resized before storage when needed; if the env
     human-render camera already matches (see PPO ``human_render_camera_configs``), this is a no-op.
+
+    If ``success_reward_bonus`` is non-zero, that amount is added to the **last** stored step reward
+    when ``final_info`` reports success for that env (same semantics as PPO ``--success-reward-bonus``).
+    Then every stored step reward is multiplied by ``reward_scale`` (default 1.0) so HDF5 matches PPO.
     """
     agent.eval()
     n_envs = int(getattr(env, "num_envs", 1))
@@ -843,7 +237,7 @@ def collect_episodes_vector_env(
     while len(trajectories) < num_episodes:
         try:
             frame = env.render()
-            rgb_rows = _render_batch_to_rgb_list(frame, n_envs, rgb_resize_hw)
+            rgb_rows = render_batch_to_rgb_list(frame, n_envs, rgb_resize_hw)
         except Exception:
             rgb_rows = [None] * n_envs
 
@@ -872,14 +266,29 @@ def collect_episodes_vector_env(
 
             if len(trajectories) < num_episodes:
                 ep_meta = None
+                ep_success = False
                 if isinstance(infos, dict) and "final_info" in infos:
                     fi = infos["final_info"]
                     if isinstance(fi, dict) and "episode" in fi:
                         ep_meta = episode_meta_from_final_info(fi["episode"], e)
+                        ep_success = episode_success_from_batched_final_info(fi["episode"], e)
+                sb = float(success_reward_bonus)
+                if sb != 0.0 and buffers[e]["rew"] and ep_success:
+                    buffers[e]["rew"][-1] = float(buffers[e]["rew"][-1]) + sb
+                rsf = float(reward_scale)
+                if buffers[e]["rew"]:
+                    buffers[e]["rew"] = [float(x) * rsf for x in buffers[e]["rew"]]
+                if ep_meta is not None:
+                    ep_meta = scale_episode_meta_for_icl_export(
+                        ep_meta,
+                        reward_scale=rsf,
+                        success_reward_bonus=float(success_reward_bonus),
+                        success=ep_success,
+                    )
                 try:
                     b = buffers[e]
                     trajectories.append(
-                        _finalize_traj(
+                        finalize_trajectory_dict(
                             b["obs"],
                             b["act"],
                             b["rew"],
@@ -901,22 +310,3 @@ def collect_episodes_vector_env(
             obs, _ = env.reset(options=dict(env_idx=idx))
 
     return trajectories[:num_episodes]
-
-
-def default_icl_export_path(icl_data_root: str, env_id: str) -> Path:
-    """``<icl_data_root>/maniskill/<env_id>/trajectories_state.h5`` (flat env_id, safe for paths)."""
-    safe = env_id.replace("/", "_").replace(" ", "_")
-    return Path(icl_data_root) / "maniskill" / safe / "trajectories_state.h5"
-
-
-def icl_image_snapshots_dir(icl_data_root: str, env_id: str) -> Path:
-    """Directory for periodic RGB snapshot pickles: ``.../maniskill/<env_id>/image_snapshots/``."""
-    safe = env_id.replace("/", "_").replace(" ", "_")
-    return Path(icl_data_root) / "maniskill" / safe / "image_snapshots"
-
-
-def icl_image_snapshot_path(icl_data_root: str, env_id: str, train_global_step: int) -> Path:
-    """``image_snapshots/trajectories_step_XXXXXXXX.h5`` (8-digit step boundary)."""
-    d = icl_image_snapshots_dir(icl_data_root, env_id)
-    d.mkdir(parents=True, exist_ok=True)
-    return d / f"trajectories_step_{int(train_global_step):08d}.h5"

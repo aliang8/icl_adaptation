@@ -247,6 +247,22 @@ def _vd4rl_split_list(data_cfg) -> list:
     return [str(single)]
 
 
+def _trajectory_hdf5_paths_from_cfg(data_cfg) -> Optional[List[str]]:
+    """
+    ``data.trajectory_hdf5_paths`` (list of strings): flat v2 ``.h5`` inputs for ManiSkill ICL.
+
+    None / empty is invalid for ``ManiSkill/`` — set explicit shard paths in the data config.
+    """
+    raw = OmegaConf.select(data_cfg, "trajectory_hdf5_paths", default=None)
+    if raw is None:
+        return None
+    cont = OmegaConf.to_container(raw, resolve=True)
+    if not isinstance(cont, (list, tuple)) or len(cont) == 0:
+        return None
+    out = [str(x).strip() for x in cont if str(x).strip()]
+    return out or None
+
+
 def validate_dataset_paths(env_name: str, paths, data_cfg) -> None:
     """Fail fast at startup if required dataset paths are missing."""
     if env_name == "ICRT-MT":
@@ -260,19 +276,30 @@ def validate_dataset_paths(env_name: str, paths, data_cfg) -> None:
     elif env_name in LIBERO_SUITES:
         log.info("LIBERO: dataset at data_dir/LIBERO-Cosmos-Policy/data/ (episode_index)")
     elif env_name.startswith("ManiSkill/"):
-        from src.data.maniskill_io import resolve_maniskill_trajectory_path
+        from src.data.maniskill_io import resolve_maniskill_trajectory_paths
 
         ms_task = env_name.split("/", 1)[1]
-        p = resolve_maniskill_trajectory_path(paths.data_root, ms_task)
-        if not p.is_file():
-            d = p.parent
-            raise FileNotFoundError(
-                f"ManiSkill trajectories not found under {d} "
-                "(expected trajectories.h5).\n"
-                "Generate with: python scripts/maniskill/ppo_train_icldata.py --env-id "
-                f"{ms_task} ... (dedicated ManiSkill venv; see docs/MANISKILL.md)"
+        explicit = _trajectory_hdf5_paths_from_cfg(data_cfg)
+        try:
+            traj_paths = resolve_maniskill_trajectory_paths(
+                paths.data_root, ms_task, explicit, repo_root=paths.repo_root
             )
-        log.info("ManiSkill dataset found: {}", p)
+        except (FileNotFoundError, ValueError) as e:
+            d = Path(paths.data_root) / "maniskill" / ms_task.replace("/", "_").replace(" ", "_")
+            raise type(e)(
+                f"{e}\n"
+                "Export shards with: python scripts/maniskill/ppo_train_icldata.py --env-id "
+                f"{ms_task} ... (see docs/MANISKILL.md), then set data.trajectory_hdf5_paths to those "
+                f"files (see configs/data/maniskill_pickcube.yaml). Expected layout under: {d}"
+            ) from e
+        for p in traj_paths:
+            if not p.is_file():
+                raise FileNotFoundError(f"ManiSkill trajectory path missing: {p}")
+        log.info(
+            "ManiSkill dataset: {} HDF5 file(s): {}",
+            len(traj_paths),
+            ", ".join(str(x) for x in traj_paths[:6]) + (" …" if len(traj_paths) > 6 else ""),
+        )
     elif env_name == "VD4RL":
         for split in _vd4rl_split_list(data_cfg):
             p = (
@@ -869,6 +896,7 @@ def main():
     trajectories = []
     prompt_per_task = []
     task_instructions_from_loader = None
+    prebuilt_dataset = None
 
     if env_name == "HalfCheetah-v2":
         from src.data.d4rl_loader import load_halfcheetah_trajectories
@@ -886,18 +914,39 @@ def main():
             )
 
     if env_name.startswith("ManiSkill/"):
-        from src.data.maniskill_io import resolve_maniskill_trajectory_path
-        from src.data.maniskill_loader import load_maniskill_trajectories
+        from src.data.maniskill_io import resolve_maniskill_trajectory_paths
+        from src.data.ic_replay_buffer_hdf5 import load_ic_replay_buffer_bundle
 
         ms_task = env_name.split("/", 1)[1]
-        traj_path = resolve_maniskill_trajectory_path(paths.data_root, ms_task)
+        explicit = _trajectory_hdf5_paths_from_cfg(data_cfg)
+        traj_paths = resolve_maniskill_trajectory_paths(
+            paths.data_root, ms_task, explicit, repo_root=paths.repo_root
+        )
         _ms_ctx = str(data_cfg.context_style).strip().lower()
         _ms_ad = _ms_ctx in ("algorithm_distillation", "ad", "ad_timeline")
-        trajectories, prompt_per_task = load_maniskill_trajectories(
-            str(traj_path),
-            episode_length_eq=int(data_cfg.max_episode_steps) if _ms_ad else None,
-            log_summary=True,
-        )
+        if _ms_ad:
+            from src.data.ic_replay_buffer_dataset import ICReplayBufferDataset
+
+            prebuilt_dataset = ICReplayBufferDataset(
+                traj_paths,
+                horizon=int(data_cfg.horizon),
+                rtg_scale=float(data_cfg.rtg_scale),
+                device=device,
+                context_dim=int(data_cfg.context_dim),
+                min_traj_len=int(data_cfg.min_trajectory_length),
+                context_sort_ascending=bool(data_cfg.context_sort_ascending),
+                use_vision=bool(data_cfg.use_vision),
+                seed=int(data_cfg.seed),
+                max_training_examples=int(data_cfg.max_training_examples),
+            )
+            state_dim = int(prebuilt_dataset.state_dim)
+            action_dim = int(prebuilt_dataset.act_dim)
+        else:
+            trajectories, prompt_per_task = load_ic_replay_buffer_bundle(
+                traj_paths,
+                min_episode_length=None,
+                log_summary=True,
+            )
         if bool(data_cfg.use_vision):
             from src.data.maniskill_state_filter import (
                 apply_maniskill_vision_proprio_to_bundle,
@@ -906,7 +955,11 @@ def main():
             )
 
             _ms_task = maniskill_task_from_env_name(env_name)
-            if vision_proprio_slice_for_task(_ms_task) is not None:
+            if prebuilt_dataset is not None:
+                log.warning(
+                    "ManiSkill AD lazy loader: skipping proprio-only state trimming in loader path."
+                )
+            elif vision_proprio_slice_for_task(_ms_task) is not None:
                 trajectories, prompt_per_task = apply_maniskill_vision_proprio_to_bundle(
                     trajectories, prompt_per_task, env_name
                 )
@@ -919,14 +972,15 @@ def main():
                     "ManiSkill use_vision: no proprio trim layout for {}; using full state vector",
                     _ms_task,
                 )
-        state_dim = int(trajectories[0]["observations"].shape[1])
-        action_dim = int(trajectories[0]["actions"].shape[1])
+        if prebuilt_dataset is None:
+            state_dim = int(trajectories[0]["observations"].shape[1])
+            action_dim = int(trajectories[0]["actions"].shape[1])
         log.info(
-            "Loaded {} ManiSkill trajectories from {} (state_dim={}, action_dim={})",
-            len(trajectories),
-            traj_path,
+            "Loaded ManiSkill data from {} file(s) (state_dim={}, action_dim={}, lazy_ad={})",
+            len(traj_paths),
             state_dim,
             action_dim,
+            bool(prebuilt_dataset is not None),
         )
 
     if env_name == "ICRT-MT":
@@ -1063,64 +1117,68 @@ def main():
         state_mean = in_context_result.state_mean
         state_std = in_context_result.state_std
 
-    if in_context_result is None and not trajectories:
+    if in_context_result is None and prebuilt_dataset is None and not trajectories:
         log.warning("No dataset found at {}", data_dir.resolve())
         return
 
     if in_context_result is None:
-        total_plen = resolved_max_total_prompt_length(data_cfg)
-        if data_cfg.max_total_prompt_length is None:
-            log.info(
-                "data.max_total_prompt_length unset -> using {} "
-                "(max_episode_steps * num_context_trajectories)",
-                total_plen,
-            )
-        total_epi_per_task = max(1, len(trajectories) // max(1, data_cfg.num_train_tasks))
-        # One shared pool (ManiSkill, single-split VD4RL, etc.) but many task_id buckets: replicate
-        # so prompt_trajectories_per_task[task_id] exists for every traj_idx (see dataset._get_one_sample).
-        if trajectories and prompt_per_task:
-            max_task_id = (len(trajectories) - 1) // total_epi_per_task
-            need_slots = max_task_id + 1
-            if len(prompt_per_task) == 1 and need_slots > 1:
-                pool0 = prompt_per_task[0]
-                prompt_per_task = [pool0 for _ in range(need_slots)]
+        if prebuilt_dataset is not None:
+            dataset = prebuilt_dataset
+        else:
+            total_plen = resolved_max_total_prompt_length(data_cfg)
+            if data_cfg.max_total_prompt_length is None:
                 log.info(
-                    "Replicated single prompt pool -> {} task slots (task_id 0..{}; "
-                    "total_epi_per_task={})",
-                    need_slots,
-                    max_task_id,
-                    total_epi_per_task,
+                    "data.max_total_prompt_length unset -> using {} "
+                    "(max_episode_steps * num_context_trajectories)",
+                    total_plen,
                 )
-        dataset = get_icl_trajectory_dataset(
-            trajectories=trajectories,
-            horizon=data_cfg.horizon,
-            max_episode_steps=data_cfg.max_episode_steps,
-            rtg_scale=float(data_cfg.rtg_scale),
-            device=device,
-            prompt_trajectories_per_task=prompt_per_task,
-            context_dim=data_cfg.context_dim,
-            state_dim=state_dim,
-            act_dim=action_dim,
-            prompt_length=data_cfg.prompt_length,
-            total_epi_per_task=total_epi_per_task,
-            num_context_trajectories=data_cfg.num_context_trajectories,
-            randomize_num_context_trajectories=data_cfg.randomize_num_context_trajectories,
-            context_sort_ascending=data_cfg.context_sort_ascending,
-            context_sampling=data_cfg.context_sampling,
-            max_total_prompt_length=total_plen,
-            max_prompt_trajectory_length=data_cfg.max_prompt_trajectory_length,
-            context_subsample_strategy=data_cfg.context_subsample_strategy,
-            context_style=data_cfg.context_style,
-            lazy_dataset=data_cfg.lazy_dataset,
-            max_training_examples=data_cfg.max_training_examples,
-            task_instructions=task_instructions_from_loader
-            if task_instructions_from_loader is not None
-            else data_cfg.task_instructions,
-            seed=data_cfg.seed,
-            query_history_length=data_cfg.query_history_length,
-            use_vision=data_cfg.use_vision,
-            image_keys=data_cfg.image_keys or [],
-        )
+            total_epi_per_task = max(1, len(trajectories) // max(1, data_cfg.num_train_tasks))
+            # One shared pool (ManiSkill, single-split VD4RL, etc.) but many task_id buckets: replicate
+            # so prompt_trajectories_per_task[task_id] exists for every traj_idx (see dataset._get_one_sample).
+            if trajectories and prompt_per_task:
+                max_task_id = (len(trajectories) - 1) // total_epi_per_task
+                need_slots = max_task_id + 1
+                if len(prompt_per_task) == 1 and need_slots > 1:
+                    pool0 = prompt_per_task[0]
+                    prompt_per_task = [pool0 for _ in range(need_slots)]
+                    log.info(
+                        "Replicated single prompt pool -> {} task slots (task_id 0..{}; "
+                        "total_epi_per_task={})",
+                        need_slots,
+                        max_task_id,
+                        total_epi_per_task,
+                    )
+            dataset = get_icl_trajectory_dataset(
+                trajectories=trajectories,
+                horizon=data_cfg.horizon,
+                max_episode_steps=data_cfg.max_episode_steps,
+                min_traj_len=int(data_cfg.min_trajectory_length),
+                rtg_scale=float(data_cfg.rtg_scale),
+                device=device,
+                prompt_trajectories_per_task=prompt_per_task,
+                context_dim=data_cfg.context_dim,
+                state_dim=state_dim,
+                act_dim=action_dim,
+                prompt_length=data_cfg.prompt_length,
+                total_epi_per_task=total_epi_per_task,
+                num_context_trajectories=data_cfg.num_context_trajectories,
+                randomize_num_context_trajectories=data_cfg.randomize_num_context_trajectories,
+                context_sort_ascending=data_cfg.context_sort_ascending,
+                context_sampling=data_cfg.context_sampling,
+                max_total_prompt_length=total_plen,
+                max_prompt_trajectory_length=data_cfg.max_prompt_trajectory_length,
+                context_subsample_strategy=data_cfg.context_subsample_strategy,
+                context_style=data_cfg.context_style,
+                lazy_dataset=data_cfg.lazy_dataset,
+                max_training_examples=data_cfg.max_training_examples,
+                task_instructions=task_instructions_from_loader
+                if task_instructions_from_loader is not None
+                else data_cfg.task_instructions,
+                seed=data_cfg.seed,
+                query_history_length=data_cfg.query_history_length,
+                use_vision=data_cfg.use_vision,
+                image_keys=data_cfg.image_keys or [],
+            )
     state_mean = dataset.state_mean
     state_std = dataset.state_std
     log.info("Dataset size: {} segments, state_mean/std computed", len(dataset))
@@ -1235,6 +1293,8 @@ def main():
         save_dir=save_dir,
     )
 
+    ms_eval_env_cache_holder: dict[str, Any] = {}
+
     def eval_fn(step):
         exp_e = cfg.experiment
         num_rollouts = int(exp_e.num_eval_rollouts)
@@ -1337,6 +1397,14 @@ def main():
 
             _tid = maniskill_task_from_env_name(str(eval_rollout_env))
             ms_state_slice = vision_proprio_slice_for_task(_tid)
+        if str(eval_rollout_env).startswith("ManiSkill/"):
+            if "cache" not in ms_eval_env_cache_holder:
+                from src.envs.eval_gym import ManiSkillEvalEnvCache
+
+                ms_eval_env_cache_holder["cache"] = ManiSkillEvalEnvCache()
+            _ms_eval_env_cache = ms_eval_env_cache_holder["cache"]
+        else:
+            _ms_eval_env_cache = None
         # inference_mode: no autograd graph. Without this, rollout chains ~max_episode_steps forwards
         # via actions_t = cat(..., action) and retains the full graph -> CUDA OOM.
         was_training = model.training
@@ -1380,6 +1448,9 @@ def main():
                     query_window=eval_query_window,
                     minari_halfcheetah_dataset_id=minari_halfcheetah_id,
                     num_eval_rollout_videos=exp_e.num_eval_rollout_videos,
+                    eval_video_max_trials=OmegaConf.select(
+                        cfg, "experiment.eval_video_max_trials", default=10
+                    ),
                     d4rl_score_ref=d4rl_score_ref,
                     maniskill_sim_backend=ms_sim
                     if str(eval_rollout_env).startswith("ManiSkill/")
@@ -1393,6 +1464,7 @@ def main():
                     maniskill_state_obs_slice=ms_state_slice,
                     eval_scene_seeds=eval_scene_seeds_list,
                     randomize_scene_between_trials=randomize_scene_between_trials,
+                    maniskill_eval_env_cache=_ms_eval_env_cache,
                 )
                 if cfg.experiment.run_action_compare_eval and dataset.trajectories:
                     action_metrics = run_action_compare_eval(
@@ -1421,16 +1493,21 @@ def main():
         dataset.task_instructions or [],
         use_precomputed_embeddings=cfg.data.use_precomputed_embeddings,
     )
-    final_step, best_metric = trainer.run_training(
-        train_loader=loader,
-        global_step_start=global_step_start,
-        best_metric_start=best_metric_start,
-        step_fn=train_step_fn,
-        eval_fn=eval_fn,
-        state_mean=state_mean,
-        state_std=state_std,
-        export_dir=export_dir,
-    )
+    try:
+        final_step, best_metric = trainer.run_training(
+            train_loader=loader,
+            global_step_start=global_step_start,
+            best_metric_start=best_metric_start,
+            step_fn=train_step_fn,
+            eval_fn=eval_fn,
+            state_mean=state_mean,
+            state_std=state_std,
+            export_dir=export_dir,
+        )
+    finally:
+        _ms_c = ms_eval_env_cache_holder.pop("cache", None)
+        if _ms_c is not None:
+            _ms_c.close()
     write_metrics_summary(
         run_dir,
         {

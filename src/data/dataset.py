@@ -1157,10 +1157,11 @@ def get_icl_trajectory_dataset(
 ) -> ICLTrajectoryDatasetBase:
     """Return dataset class selected by ``context_style``."""
     style = str(context_style).strip().lower()
+    min_traj_len = int(kwargs.pop("min_traj_len", 10))
     if style == "full_trajectory":
         return FullTrajectoryICLTrajectoryDataset(**kwargs)
     if style in ("algorithm_distillation", "ad", "ad_timeline"):
         from src.data.algorithm_distillation_dataset import AlgorithmDistillationTrajectoryDataset
 
-        return AlgorithmDistillationTrajectoryDataset(**kwargs)
+        return AlgorithmDistillationTrajectoryDataset(min_traj_len=min_traj_len, **kwargs)
     return SubsampledICLTrajectoryDataset(**kwargs)
