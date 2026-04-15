@@ -4,6 +4,7 @@
 # points at a shared copy that is missing shards).
 #
 # python scripts/maniskill/ppo_train_icldata.py --env-id PickCube-v1 ... --icl-data-root <same as paths.data_root>
+# Vision: PPO shards are usually one camera (images_view_0 only) → set model.num_views=1 (see COMMANDS.sh).
 # python src/train.py data=maniskill_pickcube model.use_vision=true data.use_vision=true ...
 
 defaults:
@@ -15,8 +16,8 @@ trajectory_hdf5_paths:
   - maniskill/PickCube-v1/trajectories_shard_00000.h5
   - maniskill/PickCube-v1/trajectories_shard_00001.h5
   - maniskill/PickCube-v1/trajectories_shard_00002.h5
-  - maniskill/PickCube-v1/trajectories_shard_00003.h5
-  - maniskill/PickCube-v1/trajectories_shard_00004.h5
+  # - maniskill/PickCube-v1/trajectories_shard_00003.h5
+  # - maniskill/PickCube-v1/trajectories_shard_00004.h5
 rtg_scale: 1.0
 horizon: 20
 max_episode_steps: 50
@@ -26,3 +27,6 @@ maniskill_reward_mode: normalized_dense
 maniskill_control_mode: pd_joint_delta_pos
 use_vision: false
 use_precomputed_embeddings: false
+# When use_vision=true with lazy replay-buffer training, train cannot infer (H,W) from trajectories.
+# Match PPO export: default ``--icl-rgb-resize-hw`` is 128 (see ``ppo_train_icldata.py``).
+image_size: [128, 128]

@@ -621,8 +621,31 @@ def run_rollouts_and_save_viz(
             state_mean_t = state_mean_t.detach().cpu().numpy()
         if isinstance(state_std_t, torch.Tensor):
             state_std_t = state_std_t.detach().cpu().numpy()
-        state_mean_t = np.asarray(state_mean_t, dtype=np.float32)
-        state_std_t = np.asarray(state_std_t, dtype=np.float32)
+        state_mean_t = np.asarray(state_mean_t, dtype=np.float32).reshape(-1)
+        state_std_t = np.asarray(state_std_t, dtype=np.float32).reshape(-1)
+        # ManiSkill + use_vision: eval env projects flat state to proprio+tcp (e.g. 42 -> 26 for PickCube).
+        # If dataset stats were computed on the full vector, align them to env.observation_space.
+        if maniskill_state_obs_slice is not None:
+            try:
+                obs_d = int(env.observation_space.shape[0])
+            except Exception:
+                obs_d = -1
+            if obs_d > 0 and int(state_mean_t.shape[-1]) != obs_d:
+                if int(state_mean_t.shape[-1]) > obs_d:
+                    sl = maniskill_state_obs_slice
+                    prev_d = int(state_mean_t.shape[-1])
+                    state_mean_t = np.asarray(state_mean_t[sl], dtype=np.float32).reshape(-1)
+                    state_std_t = np.asarray(state_std_t[sl], dtype=np.float32).reshape(-1)
+                    print(
+                        f"[eval] Sliced state_mean/state_std with maniskill_state_obs_slice {sl.start}:{sl.stop} "
+                        f"to match env obs dim {obs_d} (stats were length {prev_d})",
+                        flush=True,
+                    )
+                else:
+                    raise RuntimeError(
+                        f"Eval state normalization mismatch: state_mean length {state_mean_t.shape[-1]} "
+                        f"< env observation dim {obs_d} with maniskill_state_obs_slice set."
+                    )
 
         per_trial_eval_G_zs: Optional[List[Optional[float]]] = None
         _lay_m = model._sequence_token_layout

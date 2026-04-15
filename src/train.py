@@ -924,6 +924,16 @@ def main():
         )
         _ms_ctx = str(data_cfg.context_style).strip().lower()
         _ms_ad = _ms_ctx in ("algorithm_distillation", "ad", "ad_timeline")
+        from src.data.maniskill_state_filter import (
+            apply_maniskill_vision_proprio_to_bundle,
+            maniskill_task_from_env_name,
+            vision_proprio_slice_for_task,
+        )
+
+        _ms_task = maniskill_task_from_env_name(env_name)
+        _ms_obs_slice = (
+            vision_proprio_slice_for_task(_ms_task) if bool(data_cfg.use_vision) else None
+        )
         if _ms_ad:
             from src.data.ic_replay_buffer_dataset import ICReplayBufferDataset
 
@@ -938,6 +948,7 @@ def main():
                 use_vision=bool(data_cfg.use_vision),
                 seed=int(data_cfg.seed),
                 max_training_examples=int(data_cfg.max_training_examples),
+                observation_slice=_ms_obs_slice,
             )
             state_dim = int(prebuilt_dataset.state_dim)
             action_dim = int(prebuilt_dataset.act_dim)
@@ -948,28 +959,28 @@ def main():
                 log_summary=True,
             )
         if bool(data_cfg.use_vision):
-            from src.data.maniskill_state_filter import (
-                apply_maniskill_vision_proprio_to_bundle,
-                maniskill_task_from_env_name,
-                vision_proprio_slice_for_task,
-            )
-
-            _ms_task = maniskill_task_from_env_name(env_name)
-            if prebuilt_dataset is not None:
-                log.warning(
-                    "ManiSkill AD lazy loader: skipping proprio-only state trimming in loader path."
-                )
-            elif vision_proprio_slice_for_task(_ms_task) is not None:
-                trajectories, prompt_per_task = apply_maniskill_vision_proprio_to_bundle(
-                    trajectories, prompt_per_task, env_name
-                )
+            if prebuilt_dataset is None:
+                if _ms_obs_slice is not None:
+                    trajectories, prompt_per_task = apply_maniskill_vision_proprio_to_bundle(
+                        trajectories, prompt_per_task, env_name
+                    )
+                    log.info(
+                        "ManiSkill use_vision: state trimmed to proprio + tcp_pose only (task {})",
+                        _ms_task,
+                    )
+                else:
+                    log.warning(
+                        "ManiSkill use_vision: no proprio trim layout for {}; using full state vector",
+                        _ms_task,
+                    )
+            elif _ms_obs_slice is not None:
                 log.info(
-                    "ManiSkill use_vision: state trimmed to proprio + tcp_pose only (task {})",
+                    "ManiSkill use_vision: lazy AD applies proprio + tcp_pose state slice (task {})",
                     _ms_task,
                 )
             else:
                 log.warning(
-                    "ManiSkill use_vision: no proprio trim layout for {}; using full state vector",
+                    "ManiSkill use_vision: no proprio trim layout for {}; lazy AD uses full state",
                     _ms_task,
                 )
         if prebuilt_dataset is None:

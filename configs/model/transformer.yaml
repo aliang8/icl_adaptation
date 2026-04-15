@@ -20,8 +20,22 @@ transformer_backbone: gpt2
 llama_model_name: null
 use_vision: false
 use_language: false
-num_views: 2
+# If true, fuse instruction embedding into state (VLA); default false
+use_language_input: false
+num_views: 1
 image_embed_dim: 256
+# Vision encoder (used when use_vision=true): patch | crossmae | dinov2 | dinov3 | paligemma
+vision_encoder_type: patch
+vision_encoder_pool: true
+vision_encoder_attention_pool: false
+freeze_vision_encoder: false
+vision_encoder_chunk_size: 8
+vision_encoder_img_size: null
+# When data.use_precomputed_embeddings=true, set dim (e.g. 1536); else null
+precomputed_vision_embed_dim: null
+vision_proprio_attention_fusion: true
+# null -> derived from condition_rtg / data.context_style in train
+sequence_token_layout: null
 # ICRT-style: only compute action loss on query segment (default true)
 query_loss_only: false
 # Heads / inputs (match schema + build_model common dict)

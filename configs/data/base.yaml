@@ -9,7 +9,7 @@ prompt_length: 5
 # DT RTG: cumsum(raw env rewards) / rtg_scale (step rewards unchanged in trajectories).
 rtg_scale: 1.0
 batch_size: 128
-num_workers: 0
+num_workers: 8
 num_tasks: 50
 num_train_tasks: 45
 max_episode_steps: 200

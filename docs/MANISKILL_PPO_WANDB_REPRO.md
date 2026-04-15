@@ -146,9 +146,7 @@ uv run python scripts/maniskill/run_ppo_wandb_repro.py \
      --icl-shard-ram-flush-episodes 4096 \
      --icl-shard-max-episodes 50000 \
      --icl-rollout-render-rgb \
-     --icl-rgb-resize-hw 128 \
-     --reward-scale 3 \
-     --success-reward-bonus 5
+     --icl-rgb-resize-hw 128
 ```
 
 **One seed:** pass **`--seed <int>`** on **`run_ppo_wandb_repro.py`** (before **`--`**). Omit **`--seed`** to run every seed listed in the JSON (official table-top runs use **`1788`**, **`4796`**, **`9351`**). Anything after **`--`** is forwarded only to **`ppo_train_icldata.py`**.

@@ -14,6 +14,9 @@ for window placement.
 
 **Startup:** :meth:`_build_index` still scans episodes (for ``min_traj_len``, return stats, and
 state mean/std) with one file handle open per shard.
+
+Optional ``observation_slice`` (e.g. ManiSkill vision: proprio + tcp only) is applied to every
+state read so ``state_dim`` / normalization match image-only training.
 """
 
 from __future__ import annotations
@@ -63,6 +66,7 @@ class ICReplayBufferDataset(Dataset):
         seed: int,
         max_training_examples: int = 500_000,
         top_n_episodes: int = 50_000,
+        observation_slice: Optional[slice] = None,
     ) -> None:
         self.paths = [Path(p).expanduser().resolve() for p in hdf5_paths]
         self.horizon = int(horizon)
@@ -73,6 +77,7 @@ class ICReplayBufferDataset(Dataset):
         self.min_traj_len = int(min_traj_len)
         self.context_sort_ascending = bool(context_sort_ascending)
         self.use_vision = bool(use_vision)
+        self._obs_slice: Optional[slice] = observation_slice
         self._seed = int(seed)
         self._max_examples = int(max_training_examples)
         self.total_prompt_len = 0
@@ -102,6 +107,30 @@ class ICReplayBufferDataset(Dataset):
         self.return_avg = 0.0
 
         self._build_index(int(top_n_episodes))
+        # ``_init_image_layout`` may leave HDF5 files open; workers pickle the dataset, and h5py
+        # files are not picklable. Close here so each worker re-opens via ``_open_files_for_pid``.
+        self._close_files()
+
+    def __getstate__(self) -> Dict[str, Any]:
+        d = self.__dict__.copy()
+        d["_open_files"] = None
+        d["_open_pid"] = None
+        return d
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self._open_files = None
+        self._open_pid = None
+
+    def _apply_obs_slice(self, obs: np.ndarray) -> np.ndarray:
+        if self._obs_slice is None:
+            return obs
+        o = np.asarray(obs)
+        if o.shape[-1] < self._obs_slice.stop:
+            raise ValueError(
+                f"observations last dim {o.shape[-1]} < observation_slice.stop {self._obs_slice.stop}"
+            )
+        return np.asarray(o[..., self._obs_slice], dtype=o.dtype)
 
     def _open_files_for_pid(self) -> List[h5py.File]:
         pid = os.getpid()
@@ -159,13 +188,20 @@ class ICReplayBufferDataset(Dataset):
                         raise ValueError(f"{p}: missing dataset {name!r}")
                 obs = f["observations"]
                 act = f["actions"]
-                if state_dim is None:
-                    state_dim = int(obs.shape[1])
-                    act_dim = int(act.shape[1])
-                elif state_dim != int(obs.shape[1]) or act_dim != int(act.shape[1]):
+                raw_obs_d = int(obs.shape[1])
+                probe = np.asarray(obs[0:1], dtype=np.float64)
+                sliced_d = int(self._apply_obs_slice(probe).shape[-1])
+                if self._obs_slice is not None and raw_obs_d < int(self._obs_slice.stop):
                     raise ValueError(
-                        f"Inconsistent dims across files: expected ({state_dim}, {act_dim}), "
-                        f"got ({int(obs.shape[1])}, {int(act.shape[1])}) at {p}"
+                        f"{p}: observations dim {raw_obs_d} < observation_slice.stop {self._obs_slice.stop}"
+                    )
+                if state_dim is None:
+                    state_dim = sliced_d
+                    act_dim = int(act.shape[1])
+                elif sliced_d != state_dim or act_dim != int(act.shape[1]):
+                    raise ValueError(
+                        f"Inconsistent dims across files: expected state_dim={state_dim}, act_dim={act_dim}, "
+                        f"got (sliced_state={sliced_d}, act={int(act.shape[1])}) at {p}"
                     )
                 T_file = int(obs.shape[0])
                 file_totals.append(T_file)
@@ -192,7 +228,7 @@ class ICReplayBufferDataset(Dataset):
                     eps.append(_EpisodeRef(file_idx=file_idx, start=ss, length=T, ret=rr))
                     all_returns.append(rr)
 
-                    ob = np.asarray(obs[ss : ss + T], dtype=np.float64)
+                    ob = self._apply_obs_slice(np.asarray(obs[ss : ss + T], dtype=np.float64))
                     if sum_obs is None:
                         sum_obs = np.zeros(ob.shape[1], dtype=np.float64)
                         sum_sq_obs = np.zeros(ob.shape[1], dtype=np.float64)
@@ -271,7 +307,7 @@ class ICReplayBufferDataset(Dataset):
         files = self._open_files_for_pid()
         hf = files[file_idx]
         e = int(g) + int(tlen)
-        obs = np.asarray(hf["observations"][g:e], dtype=np.float32)
+        obs = self._apply_obs_slice(np.asarray(hf["observations"][g:e], dtype=np.float32))
         act = np.asarray(hf["actions"][g:e], dtype=np.float32)
         rew = np.asarray(hf["rewards"][g:e], dtype=np.float32).reshape(-1, 1)
         term = np.asarray(hf["terminals"][g:e], dtype=np.float32)

@@ -189,3 +189,28 @@ MANISKILL_ICL_DATA_ROOT="${MANISKILL_ICL_DATA_ROOT:-/scr2/shared/icl_adaptation/
   system.run_name=maniskill-pickcube_dt_state_ad \
   paths.data_root="${MANISKILL_ICL_DATA_ROOT}" \
   --wandb
+
+./.venv-maniskill/bin/python -m src.train \
+  --override data=[base,maniskill_pickcube] \
+  experiment.max_steps=100000 \
+  data.batch_size=32 \
+  data.context_style=algorithm_distillation \
+  data.lazy_dataset=true \
+  data.num_context_trajectories=0 \
+  data.randomize_num_context_trajectories=false \
+  data.use_vision=true \
+  data.query_history_length=100 \
+  experiment.eval_every_steps=1000 \
+  experiment.eval_num_trials=10 \
+  experiment.num_eval_rollouts=3 \
+  data.rtg_scale=1.0 \
+  data.horizon=100 \
+  model.max_length=100 \
+  model.use_vision=true \
+  model.num_views=1 \
+  model.use_language=false \
+  model.query_loss_only=false \
+  optim.lr=1e-4 \
+  system.run_name=maniskill-pickcube_dt_pixel_ad \
+  paths.data_root="${MANISKILL_ICL_DATA_ROOT}" \
+  --wandb
